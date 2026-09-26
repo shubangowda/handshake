@@ -1,6 +1,6 @@
-// Mirrors the backend Pydantic models (hil_version 0.2).
-// Fields marked "PROPOSED" are not in the backend yet — they are the frontend's
-// suggested additions and should be confirmed with the backend owner.
+// Mirrors handshake/models.py (hil_version 0.2) field for field.
+// Everything below the "API-only" line is NOT in models.py: it is the extra JSON the
+// HTTP API adds around those models (see docs/API.md, the single source of truth).
 
 export type ConstraintOperator =
   | "eq" | "neq" | "lt" | "lte" | "gt" | "gte"
@@ -59,6 +59,7 @@ export interface DeliveryPolicy {
   max_shipping_source: ValueSource;
 }
 
+/** No per-field `source` in models.py, so the UI labels these "Default". */
 export interface TermsPolicy {
   no_subscription: boolean;
   no_membership: boolean;
@@ -67,6 +68,7 @@ export interface TermsPolicy {
   no_forced_account_creation: boolean;
 }
 
+/** No per-field `source` in models.py, so the UI labels these "Default". */
 export interface MerchantPolicy {
   allow: string[];
   deny: string[];
@@ -91,7 +93,7 @@ export interface InstrumentPolicy {
   fixed_by_contract: boolean;
 }
 
-/** Fields shared by drafts and signed contracts. */
+/** Fields shared by ContractDraft and Contract. */
 interface ContractBody {
   id: string;
   hil_version: string;
@@ -115,40 +117,14 @@ interface ContractBody {
 
 export type ContractDraft = ContractBody;
 
-/**
- * PROPOSED: prepaid funds for a contract. The user pays the hard cap when signing;
- * on purchase the total is captured and the rest refunded; with no purchase, all of it is refunded.
- */
-export interface Funding {
-  status: "held" | "captured" | "refunded";
-  amount_held: number;
-  amount_captured: number;
-  amount_refunded: number;
-  funded_at: string;
-  settled_at: string | null;
-}
-
 export interface Contract extends ContractBody {
   status: ContractStatus;
-  funding?: Funding | null;
   agent_key: string | null;
   signed_at: string;
   contract_hash: string;
   signature: string;
   previous_contract_id: string | null;
 }
-
-/** Draft as the frontend shows it: CompilerOutput flattened onto the draft. */
-export interface DraftRecord extends ContractDraft {
-  status: "draft";
-  assumptions: string[];
-  clarifications_needed: string[];
-  compiler_notes: string[];
-  /** PROPOSED: drafts created by editing a signed contract point back at it. */
-  previous_contract_id: string | null;
-}
-
-export type ContractRecord = Contract | DraftRecord;
 
 export interface MerchantIdentity {
   name: string;
@@ -172,6 +148,28 @@ export interface LineItem {
   attributes: Record<string, unknown>;
 }
 
+export interface DeliveryProposal {
+  promised_by: string | null;
+  carrier: string | null;
+  tracking_available: boolean;
+  verified: boolean;
+  evidence: string | null;
+}
+
+export interface ReturnTerms {
+  returnable: boolean | null;
+  return_window_days: number | null;
+  restocking_fee: number | null;
+  evidence: string | null;
+}
+
+export interface RecurringBilling {
+  detected: boolean;
+  interval: string | null;
+  amount: number | null;
+  description: string | null;
+}
+
 export interface TransactionProposal {
   id: string;
   contract_id: string;
@@ -184,27 +182,31 @@ export interface TransactionProposal {
   discounts: number;
   total: number;
   currency: string;
-  recurring_billing: { detected: boolean; interval: string | null; amount: number | null; description: string | null };
+  recurring_billing: RecurringBilling;
   addons_detected: boolean;
   membership_detected: boolean;
-  delivery: { promised_by: string | null; carrier: string | null; tracking_available: boolean; verified: boolean; evidence: string | null } | null;
+  delivery: DeliveryProposal | null;
+  return_terms: ReturnTerms | null;
+  extracted_attributes: Record<string, unknown>;
   source_url: string | null;
   extracted_at: string;
+  extractor_ids: string[];
   extractors_agreed: boolean;
   evidence: Record<string, unknown>;
 }
 
 export interface ConstraintResult {
   constraint: string;
-  /** PROPOSED: stable field key + human label so the UI never parses `constraint`. */
-  field?: string;
-  label?: string;
   verdict: ConstraintVerdict;
   expected?: unknown;
   actual?: unknown;
   reason: string;
   severity: ConstraintSeverity;
   evidence?: Record<string, unknown> | null;
+  /** API-only (added when the API serializes a decision): stable field key. */
+  field: string;
+  /** API-only: human label. The UI shows this and never parses `constraint`. */
+  label: string;
 }
 
 export interface ValidationDecision {
@@ -216,12 +218,19 @@ export interface ValidationDecision {
   evaluated_at: string;
 }
 
-/** PROPOSED: how a human decision on an UNVERIFIABLE purchase is recorded. */
-export interface EscalationResolution {
-  action: "approve" | "reject";
-  resolved_at: string;
-  /** Which unverifiable results the user explicitly accepted. They stay UNVERIFIABLE. */
-  accepted_constraints: string[];
+export interface Credential {
+  id: string;
+  contract_id: string;
+  proposal_id: string;
+  merchant_name: string;
+  merchant_id: string | null;
+  max_amount: number;
+  currency: string;
+  single_use: boolean;
+  status: CredentialStatus;
+  created_at: string;
+  expires_at: string;
+  provider_reference: string | null;
 }
 
 export interface Purchase {
@@ -238,7 +247,6 @@ export interface Purchase {
   created_at: string;
   completed_at: string | null;
   error: string | null;
-  resolution?: EscalationResolution | null;
 }
 
 export type EvidenceEventType =
@@ -247,10 +255,7 @@ export type EvidenceEventType =
   | "validation_started" | "validation_completed"
   | "purchase_blocked" | "purchase_escalated" | "purchase_authorized"
   | "credential_created" | "credential_used"
-  | "payment_completed" | "payment_mismatch"
-  // PROPOSED
-  | "escalation_approved" | "escalation_rejected"
-  | "contract_funded" | "funds_refunded" | "purchase_declined";
+  | "payment_completed" | "payment_mismatch";
 
 export interface EvidenceEvent {
   id: string;
@@ -259,17 +264,235 @@ export interface EvidenceEvent {
   event_type: EvidenceEventType;
   timestamp: string;
   message: string;
-  data: Record<string, unknown>;
+  data: EvidenceData;
 }
 
-/** PROPOSED: PurchaseStatusResponse + the proposal, so the UI can show what the agent attempted. */
+export interface CandidateProduct {
+  name: string;
+  merchant: string;
+  price: number;
+  currency: string;
+  sponsored: boolean;
+  affiliate: boolean;
+  url: string | null;
+  attributes: Record<string, unknown>;
+}
+
+export interface SelectionReport {
+  contract_id: string;
+  selected_candidate: CandidateProduct;
+  candidates: CandidateProduct[];
+  reasoning_summary: string;
+  created_at: string;
+}
+
+export interface CreateContractDraftRequest { intent: string }
+export interface SignContractRequest { draft_id: string; agent_key?: string | null; signature?: string | null }
+export interface PurchaseRequest { contract_id: string; checkout_url: string; selection_report?: SelectionReport | null }
+export interface PurchaseStatusResponse { purchase_id: string; status: PurchaseStatus; decision: ValidationDecision | null }
+
+export interface CompilerOutput {
+  draft: ContractDraft;
+  assumptions: string[];
+  clarifications_needed: string[];
+  compiler_notes: string[];
+}
+
+// =====================================================================
+// API-only shapes (NOT in models.py). Defined by docs/API.md.
+// =====================================================================
+
+/** API-only: evidence `data`. `kind` is the precise subtype for steps models.py has no event_type for. */
+export type EvidenceKind =
+  | "payment_requested" | "payment_request_uncertain" | "simulated_provider_approval" | "payment_approved"
+  | "payment_denied" | "payment_expired" | "checkout_revalidated" | "checkout_changed"
+  | "credential_ready" | "credential_released" | "payment_submitted" | "payment_outcome_unknown"
+  | "receipt_verified" | "receipt_mismatch" | "purchase_declined" | "contract_amended"
+  | "draft_edited" | "agent_action_denied" | "extraction_failed";
+
+export interface EvidenceData {
+  // `string & {}` keeps autocomplete for known kinds while allowing new ones the backend adds later.
+  kind?: EvidenceKind | (string & {});
+  human_approval?: boolean;
+  human_rejection?: boolean;
+  [key: string]: unknown;
+}
+
+/** API-only: a draft as GET /drafts returns it (ContractDraft flattened with compiler metadata). */
+export interface DraftRecord extends ContractDraft {
+  status: "draft";
+  assumptions: string[];
+  /** Lint problems are prefixed with "lint: ". */
+  clarifications_needed: string[];
+  compiler_notes: string[];
+  /** Drafts created by amending a signed contract point back at it. */
+  previous_contract_id: string | null;
+  /** Set once this draft has been signed. */
+  signed_contract_id: string | null;
+  review_url: string;
+  /** Lint errors that prevent signing (without the "lint: " prefix). */
+  blocking_issues: string[];
+  /** Only on the POST /drafts/compile response. */
+  compiler_source?: "openai" | "fixture";
+}
+
+/** API-only: the live hash/signature check GET /contracts/{id} returns. */
+export interface ContractVerification {
+  valid: boolean;
+  hash_matches?: boolean;
+  signature_matches?: boolean;
+  [key: string]: unknown;
+}
+
+/** A signed contract plus (API-only) its verification, which api.ts attaches from GET /contracts/{id}. */
+export type SignedContract = Contract & { verification?: ContractVerification | null };
+
+export type ContractRecord = SignedContract | DraftRecord;
+
+/** API-only: one row of GET /contracts. */
+export interface ContractListItem {
+  id: string;
+  kind: "draft" | "contract";
+  status: ContractStatus;
+  goal: string;
+  created_at: string;
+  signed_at: string | null;
+  signed_contract_id: string | null;
+  draft_id: string | null;
+}
+
+/** API-only: GET /contracts/{id}. */
+export type ContractResponse =
+  | { kind: "contract"; id: string; status: ContractStatus; draft_id: string | null; contract: Contract; verification: ContractVerification }
+  | { kind: "draft"; id: string; status: "draft"; signed_contract_id: string | null; draft: ContractDraft; verification: null;
+      assumptions: string[]; clarifications_needed: string[]; compiler_notes: string[] };
+
+/** API-only: the payment state machine. */
+export type PaymentState =
+  | "awaiting_approval" | "approved" | "revalidating" | "credential_ready" | "paying" | "paid" | "completed"
+  | "denied" | "expired" | "checkout_changed" | "failed" | "unknown";
+
+/** API-only: PurchaseDetail.payment. Never contains card data (at most last4). */
+export interface PaymentInfo {
+  state: PaymentState;
+  provider: "stub" | "link_test";
+  provider_label: string;
+  approval_url: string | null;
+  provider_reference: string | null;
+  amount: number;
+  pay_amount: number;
+  currency: string;
+  last4: string | null;
+  credential_released: boolean;
+  order_id: string | null;
+  receipt: Record<string, unknown> | null;
+  last_error: string | null;
+  updated_at: string | null;
+}
+
+/** API-only: the hint for what happens next. */
+export type NextAction =
+  | "wait_for_user_decision" | "wait_for_user_link_approval" | "wait_for_revalidation"
+  | "get_payment_credential_and_pay" | "wait_for_payment" | "wait_for_merchant_order"
+  | "wait_for_order_verification" | "wait_for_reconciliation" | "blocked_no_action"
+  | "request_purchase_again" | "completed" | "wait";
+
+/** API-only: how a human decided an escalation (approve/reject) or declined an authorized purchase. */
+export interface Resolution {
+  action: "approve" | "reject" | "decline";
+  resolved_at: string | null;
+  /** Constraint names of the unverifiable results the user accepted. They stay UNVERIFIABLE. */
+  accepted_constraints: string[];
+  note: string | null;
+}
+
+/** API-only: the credential summary (never the card). */
+export interface CredentialSummary {
+  credential_id: string;
+  merchant_name: string;
+  merchant_id: string | null;
+  max_amount: number;
+  currency: string;
+  single_use: boolean;
+  status: CredentialStatus;
+  expires_at: string;
+}
+
+/** API-only: every purchase response (GET /purchases/{id}, approve, reject, ...). */
 export interface PurchaseDetail {
+  purchase_id: string;
+  status: PurchaseStatus;
+  decision: ValidationDecision | null;
+  contract_id: string;
+  proposal_id: string | null;
+  credential: CredentialSummary | null;
+  summary: string;
+  idempotent_replay: boolean;
   purchase: Purchase;
   proposal: TransactionProposal | null;
-  decision: ValidationDecision | null;
+  payment: PaymentInfo | null;
+  payment_state: PaymentState | null;
+  approval_url: string | null;
+  resolution: Resolution | null;
+  next_action: NextAction;
+  review_url: string;
 }
 
-/** Editable subset of a draft. */
+/** API-only: GET /evidence/{purchase_id}. */
+export interface EvidenceBundle {
+  purchase: Purchase;
+  status: PurchaseStatus;
+  summary: string;
+  contract: Contract | Record<string, unknown>;
+  contract_verification: ContractVerification;
+  proposal: TransactionProposal | null;
+  proposal_raw_payload: unknown;
+  decision: ValidationDecision | null;
+  credential: CredentialSummary | null;
+  ledger_intact: boolean;
+  events: EvidenceEvent[];
+}
+
+/** API-only: GET /health. */
+export interface Health {
+  status: string;
+  database: string;
+  payment_mode: "stub" | "link_test";
+  payment_label: string;
+  credential_mode: string;
+  compiler_mode: "fixture" | "openai";
+}
+
+/** API-only: POST /auth/demo-login. */
+export interface DemoLogin {
+  token: string;
+  token_type: "bearer";
+  email: string;
+  role: "user";
+  /** Unix time in SECONDS (unlike the ISO strings elsewhere in the API). */
+  expires_at: number;
+  demo_auth: true;
+}
+
+/** API-only: GET /oauth/device?user_code= (the /connect approval screen). */
+export interface DeviceAuthorization {
+  user_code: string;
+  client_id: string;
+  client_name: string | null;
+  status: "pending" | "approved" | "denied" | "consumed" | (string & {});
+  expires_at: string;
+  permissions: string[];
+  never: string[];
+}
+
+/** API-only: POST /oauth/device/approve and /deny. */
+export interface DeviceDecision {
+  user_code: string;
+  status: string;
+  client_id: string;
+}
+
+/** API-only: PATCH /drafts/{id} body. Send only the keys that changed; unknown keys are refused. */
 export interface DraftPatch {
   goal?: string;
   target?: number | null;
@@ -277,4 +500,12 @@ export interface DraftPatch {
   max_shipping?: number | null;
   deliver_by?: string | null;
   constraints?: Constraint[];
+}
+
+/** API-only: the one error shape every route uses. */
+export interface ApiErrorBody {
+  error: string;
+  message: string;
+  details?: Record<string, unknown>;
+  error_description?: string;
 }

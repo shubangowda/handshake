@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import GlyphPortal from "@/components/ui/glyph-portal";
+import { USE_MOCKS } from "@/lib/api";
 import { ArrowRight, FileSignature, Bot, ShieldCheck, Handshake } from "lucide-react";
 
 const FALLBACK = '"Arial Black", Arial, sans-serif';
@@ -26,7 +27,7 @@ function usePortalFont() {
 const STEPS = [
   { icon: FileSignature, title: "You sign a contract", body: "Plain English, not JSON. Max spend, size, delivery, no subscriptions. Anything Handshake guessed is flagged before you sign." },
   { icon: Bot, title: "Your agent shops", body: "It can browse anywhere, but it never holds your card. It can only propose a checkout." },
-  { icon: ShieldCheck, title: "Handshake checks the checkout", body: "Every line is compared to what you signed. If it all passes, a single-use card is issued. Any failure blocks it. If Handshake can't verify something, it asks you." },
+  { icon: ShieldCheck, title: "Handshake checks the checkout", body: "Every line is compared to what you signed. If it all passes, you approve the payment in Link and a single-use card pays it. Any failure blocks it. If Handshake can't verify something, it asks you." },
 ];
 
 export default function Home() {
@@ -85,15 +86,16 @@ export default function Home() {
               <Link href="/login" className="inline-flex h-11 items-center gap-2 rounded-lg bg-white px-5 text-sm font-semibold text-[#0b3b2a] hover:bg-white/90">
                 Get started <ArrowRight className="size-4" />
               </Link>
-              <Link href="/contracts/draft_shoes01" className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/40 px-5 text-sm font-medium text-white hover:bg-white/10">
+              {/* The sample ids only exist in the mock store. */}
+              {USE_MOCKS && <Link href="/contracts/draft_shoes01" className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/40 px-5 text-sm font-medium text-white hover:bg-white/10">
                 Review a sample contract
-              </Link>
+              </Link>}
               <Link href="/contracts" className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/40 px-5 text-sm font-medium text-white hover:bg-white/10">
                 Contracts dashboard
               </Link>
-              <Link href="/purchases/purchase_blocked" className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/40 px-5 text-sm font-medium text-white hover:bg-white/10">
+              {USE_MOCKS && <Link href="/purchases/purchase_blocked" className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/40 px-5 text-sm font-medium text-white hover:bg-white/10">
                 Watch it stop a bad merchant
-              </Link>
+              </Link>}
             </div>
           </div>
         </GlyphPortal>

@@ -5,18 +5,18 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { AppHeader } from "@/components/handshake/app-header";
-import { FundsPanel } from "@/components/handshake/funds";
-import { PaymentDialog } from "@/components/handshake/payment-dialog";
+import { SignDialog } from "@/components/handshake/sign-dialog";
 import { ContractSheet, contractRows } from "@/components/handshake/contract-sheet";
 import { EditDraftDialog } from "@/components/handshake/edit-draft-dialog";
 import { StatusBadge, SourceTag, SeverityTag } from "@/components/handshake/tags";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { amendContract, getContract, listPurchasesForContract, revokeContract, signContract, updateDraft } from "@/lib/api";
+import { ApiError, amendContract, getContract, listPurchasesForContract, revokeContract, signContract, updateDraft } from "@/lib/api";
 import { FIELD_LABELS, describeConstraint, formatDate, formatTime, isDraft, money, relativeExpiry, shortId } from "@/lib/format";
-import type { Contract, ContractRecord, DraftPatch, PurchaseDetail } from "@/lib/types";
+import { paymentLabel } from "@/lib/status";
+import type { ContractRecord, DraftPatch, PurchaseDetail, SignedContract } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { ArrowLeft, ArrowRight, GitBranch, PenLine, ShieldCheck, Sparkles, TriangleAlert } from "lucide-react";
+import { ArrowLeft, ArrowRight, GitBranch, OctagonX, PenLine, ShieldAlert, ShieldCheck, TriangleAlert } from "lucide-react";
 
 function flatRows(c: ContractRecord) {
   const r = contractRows(c);
@@ -51,14 +51,16 @@ function VersionDiff({ from, to }: { from: ContractRecord; to: ContractRecord })
   );
 }
 
-function InferredPanel({ contract: c }: { contract: ContractRecord & { assumptions?: string[] } }) {
+function InferredPanel({ contract: c }: { contract: ContractRecord & { assumptions?: string[]; clarifications_needed?: string[] } }) {
   const inferred = [
     ...(c.spend.hard_cap_source !== "user" ? [{ label: "Maximum total", value: money(c.spend.hard_cap_all_in), source: c.spend.hard_cap_source }] : []),
     ...c.constraints.filter((k) => k.source !== "user").map((k) => ({ label: FIELD_LABELS[k.field], value: describeConstraint(k), source: k.source })),
     ...(c.delivery && c.delivery.max_shipping_source !== "user" ? [{ label: "Shipping", value: `≤ ${money(c.delivery.max_shipping)}`, source: c.delivery.max_shipping_source }] : []),
   ];
   const assumptions = c.assumptions ?? [];
-  if (!inferred.length && !assumptions.length) return null;
+  // "lint: " entries are blocking issues (shown separately); the rest are the compiler's open questions.
+  const questions = (c.clarifications_needed ?? []).filter((q) => !q.startsWith("lint: "));
+  if (!inferred.length && !assumptions.length && !questions.length) return null;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn-soft p-4 sm:p-5">
       <h2 className="flex items-center gap-2 font-semibold text-warn"><TriangleAlert className="size-4" />Inferred by Handshake</h2>
@@ -75,6 +77,41 @@ function InferredPanel({ contract: c }: { contract: ContractRecord & { assumptio
           {assumptions.map((a) => <li key={a}>{a}</li>)}
         </ul>
       )}
+      {questions.length > 0 && (
+        <>
+          <p className="mt-3 text-sm font-medium">Handshake wasn&apos;t sure about</p>
+          <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-foreground/80">{questions.map((q) => <li key={q}>{q}</li>)}</ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** The backend re-checks the stored contract's hash and signature on every read. */
+function Verification({ contract: c }: { contract: SignedContract }) {
+  const v = c.verification;
+  if (!v) return null;
+  return (
+    <div className={cn("flex items-start gap-3 rounded-xl border p-4 text-sm", v.valid ? "bg-card" : "border-fail/40 bg-fail-soft text-fail")}>
+      {v.valid ? <ShieldCheck className="mt-0.5 size-4 shrink-0 text-pass" /> : <ShieldAlert className="mt-0.5 size-4 shrink-0" />}
+      <div>
+        <p className="font-semibold">{v.valid ? "Signature valid" : "Signature NOT valid"}</p>
+        <p className={cn(v.valid ? "text-muted-foreground" : "")}>
+          {v.valid
+            ? "Handshake re-checked this contract's hash and signature just now. It is exactly what you signed."
+            : `This contract no longer matches what you signed (hash ${v.hash_matches ? "matches" : "differs"}, signature ${v.signature_matches ? "matches" : "differs"}). Purchases against it are blocked.`}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function BlockingIssues({ issues }: { issues: string[] }) {
+  if (!issues.length) return null;
+  return (
+    <div className="rounded-xl border border-fail/40 bg-fail-soft p-4 text-sm text-fail sm:p-5">
+      <h2 className="flex items-center gap-2 font-semibold"><OctagonX className="size-4" />Fix before signing</h2>
+      <ul className="mt-2 list-disc space-y-1 pl-5">{issues.map((b) => <li key={b}>{b}</li>)}</ul>
     </div>
   );
 }
@@ -102,15 +139,20 @@ export default function ContractPage() {
   const [confirmSign, setConfirmSign] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Blocking issues a sign attempt returned (409 draft_has_blocking_issues), until the draft reloads.
+  const [signIssues, setSignIssues] = useState<string[] | null>(null);
 
   const load = useCallback(async () => {
     try {
       const c = await getContract(id);
+      // A signed draft lives on as a record; show the contract it became instead.
+      if (isDraft(c) && c.signed_contract_id) { router.replace(`/contracts/${c.signed_contract_id}`); return; }
       setContract(c);
+      setSignIssues(null);
       setPrevious(c.previous_contract_id ? await getContract(c.previous_contract_id).catch(() => null) : null);
       setPurchases(isDraft(c) ? [] : await listPurchasesForContract(c.id));
     } catch (e) { setError((e as Error).message); }
-  }, [id]);
+  }, [id, router]);
   // load() only sets state after awaiting the API.
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { load(); }, [load]);
@@ -119,20 +161,27 @@ export default function ContractPage() {
   if (!contract) return <><AppHeader /><main className="mx-auto w-full max-w-3xl px-4 py-10"><div className="h-96 animate-pulse rounded-xl bg-muted" /></main></>;
 
   const draft = isDraft(contract) ? contract : null;
+  const signed = draft ? null : (contract as SignedContract);
+  const blockingIssues = signIssues ?? draft?.blocking_issues ?? [];
 
-  /** Runs after the card form is filled. Errors keep the payment dialog open. */
+  /** Runs from the review dialog. Errors keep the dialog open; blocking issues are shown in it. */
   async function sign() {
     try {
-      const signed = await signContract(contract!.id);
-      toast.success("Signed and paid", { description: `${money(signed.spend.hard_cap_all_in)} is held until your agent finds a match.` });
-      router.replace(`/contracts/${signed.id}`);
-    } catch (e) { toast.error((e as Error).message); throw e; }
+      const c = await signContract(contract!.id);
+      setConfirmSign(false);
+      toast.success("Contract signed", { description: `Your agent may now buy within these terms, up to ${money(c.spend.hard_cap_all_in)} all-in.` });
+      router.replace(`/contracts/${c.id}`);
+    } catch (e) {
+      const issues = e instanceof ApiError && e.code === "draft_has_blocking_issues" ? e.details.blocking_issues : null;
+      if (Array.isArray(issues)) setSignIssues(issues.map(String));
+      else toast.error((e as Error).message);
+    }
   }
   async function revoke() {
     setBusy(true);
     try {
-      const c = await revokeContract(contract!.id);
-      toast("Contract revoked", { description: c.funding ? `${money(c.funding.amount_refunded)} refunded to your card.` : "Your agent can no longer use it." });
+      await revokeContract(contract!.id);
+      toast("Contract revoked", { description: "Your agent can no longer use it." });
       await load();
     }
     catch (e) { toast.error((e as Error).message); } finally { setBusy(false); setConfirmRevoke(false); }
@@ -143,9 +192,12 @@ export default function ContractPage() {
     catch (e) { toast.error((e as Error).message); setBusy(false); }
   }
   async function save(patch: DraftPatch) {
-    const d = await updateDraft(contract!.id, patch);
-    setContract(d);
-    toast.success("Draft updated");
+    try {
+      const d = await updateDraft(contract!.id, patch);
+      setContract(d);
+      setSignIssues(null);
+      toast.success("Draft updated");
+    } catch (e) { toast.error((e as Error).message); throw e; }
   }
 
   return (
@@ -157,22 +209,23 @@ export default function ContractPage() {
         <div className="mt-4 flex flex-wrap items-center gap-3">
           <StatusBadge status={contract.status} />
           <span className="text-sm text-muted-foreground">
-            {draft ? "Not signed. Your agent can't use this yet." : contract.status === "active" ? `Your agent may use this · ${relativeExpiry(contract.expires_at).toLowerCase()}` : `Signed ${formatDate((contract as Contract).signed_at)} at ${formatTime((contract as Contract).signed_at)}`}
+            {draft ? "Not signed. Your agent can't use this yet." : contract.status === "active" ? `Your agent may use this · ${relativeExpiry(contract.expires_at).toLowerCase()}` : `Signed ${formatDate(signed!.signed_at)} at ${formatTime(signed!.signed_at)}`}
           </span>
         </div>
 
         <div className="mt-6 space-y-5">
           {draft && previous && <VersionDiff from={previous} to={draft} />}
+          {draft && <BlockingIssues issues={blockingIssues} />}
           {draft && <InferredPanel contract={draft} />}
+          {signed && <Verification contract={signed} />}
           <Legend />
-          {!draft && <FundsPanel funding={(contract as Contract).funding} />}
           <ContractSheet contract={contract} />
 
           {!draft && (
             <div className="flex flex-wrap items-center gap-3">
               {contract.status === "active" && <Button variant="outline" onClick={amend} disabled={busy}><PenLine />Edit (creates new version)</Button>}
               {contract.status === "active" && contract.revocable && <Button variant="destructive" onClick={() => setConfirmRevoke(true)} disabled={busy}>Revoke</Button>}
-              <span className="ml-auto font-mono text-[11px] text-muted-foreground">#{shortId(contract.id)} · {(contract as Contract).contract_hash.slice(0, 19)}</span>
+              <span className="ml-auto font-mono text-[11px] text-muted-foreground">#{shortId(contract.id)} · {signed!.contract_hash.slice(0, 19)}</span>
             </div>
           )}
 
@@ -180,16 +233,23 @@ export default function ContractPage() {
             <section>
               <h2 className="mb-2 font-semibold">Purchase attempts</h2>
               <ul className="divide-y rounded-xl border bg-card">
-                {purchases.map(({ purchase: p, proposal, decision }) => (
-                  <li key={p.id}>
-                    <Link href={`/purchases/${p.id}`} className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-muted/50">
-                      <span>{proposal?.line_items[0]?.name} <span className="text-muted-foreground">· {p.merchant_name}</span></span>
-                      <span className={cn("font-mono text-xs font-bold uppercase", decision?.verdict === "pass" ? "text-pass" : decision?.verdict === "fail" ? "text-fail" : "text-warn")}>
-                        {p.status} · {money(proposal?.total)}
-                      </span>
-                    </Link>
-                  </li>
-                ))}
+                {purchases.map((d) => {
+                  const { purchase: p, proposal, decision } = d;
+                  const pay = paymentLabel(d);
+                  return (
+                    <li key={p.id}>
+                      <Link href={`/purchases/${p.id}`} className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-muted/50">
+                        <span className="min-w-0">
+                          {proposal?.line_items[0]?.name ?? "Checkout not read"} <span className="text-muted-foreground">· {p.merchant_name ?? "unknown merchant"}</span>
+                          {pay && <span className="block text-xs text-muted-foreground">Payment: {pay}</span>}
+                        </span>
+                        <span className={cn("shrink-0 font-mono text-xs font-bold uppercase", p.status === "completed" || decision?.verdict === "pass" ? "text-pass" : p.status === "blocked" || p.status === "failed" ? "text-fail" : "text-warn")}>
+                          {p.status} · {money(proposal?.total)}
+                        </span>
+                      </Link>
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           )}
@@ -200,11 +260,11 @@ export default function ContractPage() {
         <div className="fixed inset-x-0 bottom-0 z-20 border-t bg-background/95 backdrop-blur">
           <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3">
             <p className="text-sm text-muted-foreground">
-              You pay <span className="font-semibold text-foreground tabular-nums">{money(draft.spend.hard_cap_all_in)}</span> now · unused money is refunded
+              Up to <span className="font-semibold text-foreground tabular-nums">{money(draft.spend.hard_cap_all_in)}</span> all-in · nothing is charged when you sign
             </p>
             <div className="flex gap-2">
               <Button variant="outline" size="lg" onClick={() => setEditing(true)}><PenLine />Edit contract</Button>
-              <Button size="lg" onClick={() => setConfirmSign(true)} className="bg-brand text-brand-foreground hover:bg-brand/90"><ShieldCheck />Sign &amp; pay {money(draft.spend.hard_cap_all_in)}</Button>
+              <Button size="lg" onClick={() => setConfirmSign(true)} className="bg-brand text-brand-foreground hover:bg-brand/90"><ShieldCheck />Review &amp; sign</Button>
             </div>
           </div>
         </div>
@@ -212,35 +272,14 @@ export default function ContractPage() {
 
       {draft && <EditDraftDialog key={draft.id + JSON.stringify(draft.spend)} draft={draft} open={editing} onOpenChange={setEditing} onSave={save} />}
 
-      <PaymentDialog
-        open={confirmSign}
-        onOpenChange={setConfirmSign}
-        amount={contract.spend.hard_cap_all_in}
-        title={`Sign & pay ${money(contract.spend.hard_cap_all_in)}`}
-        submitLabel={`Sign & pay ${money(contract.spend.hard_cap_all_in)}`}
-        onPay={sign}
-        description={<>
-          Your agent may buy <b>{contract.goal.toLowerCase()}</b> for up to <b>{money(contract.spend.hard_cap_all_in)}</b> all-in,
-          {contract.single_use ? " once" : " repeatedly"}, until {formatDate(contract.expires_at)}. Anything outside these terms is blocked.
-        </>}
-      >
-        <ul className="space-y-1.5 rounded-lg border p-3 text-sm">
-          <li><b>{money(contract.spend.hard_cap_all_in)}</b> is held by Handshake now.</li>
-          <li>When a match is found, you approve it with one tap. The unspent amount is refunded.</li>
-          <li>If nothing is found before it expires, or you revoke it, you get it all back.</li>
-        </ul>
-        {draft && contract.constraints.some((k) => k.source !== "user") && (
-          <p className="flex items-start gap-2 rounded-lg bg-warn-soft p-3 text-sm text-warn"><Sparkles className="mt-0.5 size-4 shrink-0" />This includes values Handshake inferred. They&apos;re highlighted in the contract.</p>
-        )}
-      </PaymentDialog>
+      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} open={confirmSign} onOpenChange={setConfirmSign} onSign={sign} />}
 
       <Dialog open={confirmRevoke} onOpenChange={setConfirmRevoke}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Revoke this contract?</DialogTitle>
             <DialogDescription>
-              Your agent immediately loses permission to buy {contract.goal.toLowerCase()}.
-              {(contract as Contract).funding?.status === "held" && <> The {money((contract as Contract).funding!.amount_held)} you paid is refunded to your card.</>} This can&apos;t be undone.
+              Your agent immediately loses permission to buy {contract.goal.toLowerCase()}. Any payment still waiting for your approval is cancelled. This can&apos;t be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

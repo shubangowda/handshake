@@ -8,6 +8,13 @@ const ICON = {
   unverifiable: { Icon: CircleHelp, cls: "bg-warn text-white", word: "UNVERIFIED", text: "text-warn" },
 } as const;
 
+/** expected/actual/evidence can be any JSON; always render them as plain text. */
+export function showValue(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
 /** Intent diff: what the contract said vs. what checkout showed, one row per constraint. */
 export function VerdictRows({ results, acceptedByUser = [] }: { results: ConstraintResult[]; acceptedByUser?: string[] }) {
   // Failures first, then unverifiable, then passes — the problem is always on top.
@@ -26,10 +33,11 @@ export function VerdictRows({ results, acceptedByUser = [] }: { results: Constra
             <span className={cn("mt-0.5 grid size-6 place-items-center rounded-full", cls)}><Icon className="size-3.5" strokeWidth={3} /></span>
             <div className="min-w-0">
               <div className="flex flex-wrap items-baseline gap-x-3">
-                <span className="font-medium">{r.label ?? r.constraint}</span>
+                {/* The API labels every result; the UI never parses `constraint`. */}
+                <span className="font-medium">{r.label}</span>
                 <span className={cn("text-sm tabular-nums", r.verdict === "fail" ? "font-semibold text-fail" : "text-muted-foreground")}>
-                  {String(r.actual ?? "—")}
-                  {r.expected != null && <span className="text-muted-foreground"> · contract: {String(r.expected)}</span>}
+                  {showValue(r.actual)}
+                  {r.expected != null && <span className="text-muted-foreground"> · contract: {showValue(r.expected)}</span>}
                 </span>
               </div>
               {r.verdict !== "pass" && <p className={cn("mt-0.5 text-sm", text)}>{r.reason}</p>}

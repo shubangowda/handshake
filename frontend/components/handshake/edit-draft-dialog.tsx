@@ -42,17 +42,25 @@ export function EditDraftDialog({ draft, open, onOpenChange, onSave }: {
   async function save() {
     if (error) return;
     setSaving(true);
+    // Send only what changed: the backend marks every key it receives as "you said it" (source: user).
+    const patch: DraftPatch = {};
+    if (targetN !== draft.spend.target) patch.target = targetN;
+    if (capN !== draft.spend.hard_cap_all_in) patch.hard_cap_all_in = capN;
+    let constraintsChanged = false;
     const constraints = draft.constraints.map((c, i) => {
       const changed = values[i] !== valueToText(c.value);
+      constraintsChanged ||= changed;
       return changed ? { ...c, value: textToValue(values[i], c.value), source: "user" as const } : c;
     });
-    const patch: DraftPatch = { target: targetN, hard_cap_all_in: capN, constraints };
+    if (constraintsChanged) patch.constraints = constraints;
     if (draft.delivery) {
-      patch.max_shipping = num(shipping);
+      const ship = num(shipping);
+      if (ship !== draft.delivery.max_shipping) patch.max_shipping = ship;
       const prev = toDateInput(draft.delivery.deliver_by);
       if (deliverBy !== prev) patch.deliver_by = deliverBy ? new Date(`${deliverBy}T20:00:00`).toISOString() : null;
     }
-    try { await onSave(patch); onOpenChange(false); } finally { setSaving(false); }
+    if (!Object.keys(patch).length) { setSaving(false); onOpenChange(false); return; }
+    try { await onSave(patch); onOpenChange(false); } catch { /* the page shows the error; keep the dialog open */ } finally { setSaving(false); }
   }
 
   return (

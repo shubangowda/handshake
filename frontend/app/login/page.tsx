@@ -1,13 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { writeSession } from "@/lib/session";
+import { demoLogin } from "@/lib/api";
+import { readSession, safeNext, writeSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
 import {
   ArrowLeft, ArrowRight, Check, Footprints, Handshake, Headphones, Home as HomeIcon,
@@ -69,42 +70,62 @@ function StepDots({ step }: { step: 1 | 2 }) {
 }
 
 export default function LoginPage() {
+  return (
+    <main className="grid flex-1 lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
+      <BrandPanel />
+      {/* useSearchParams (for ?next=) needs a Suspense boundary so the page can still prerender. */}
+      <Suspense fallback={<section />}>
+        <LoginForm />
+      </Suspense>
+    </main>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
+  // Where to go after login, e.g. /connect?code=... when an agent's login link sent the user here.
+  const next = safeNext(useSearchParams().get("next"));
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [step, setStep] = useState<1 | 2>(1);
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [touched, setTouched] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
   const [interests, setInterests] = useState<string[]>([]);
   const [budget, setBudget] = useState<string | null>(null);
 
   const emailError = !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && "Enter a valid email";
-  const passwordError = password.length < 8 && "At least 8 characters";
 
   async function submitCredentials(e: FormEvent) {
     e.preventDefault();
     setTouched(true);
-    if (emailError || passwordError) return;
+    if (emailError) return;
     setBusy(true);
-    await new Promise((r) => setTimeout(r, 500)); // PLACEHOLDER: real auth call goes here.
-    setBusy(false);
-    setPassword("");
+    setLoginError(null);
+    try {
+      // DEMO AUTH: POST /auth/demo-login trades an email for a token. No password.
+      const login = await demoLogin(email);
+      // expires_at arrives as Unix seconds; the session keeps an ISO string.
+      writeSession({ email: login.email, token: login.token, expires_at: new Date(login.expires_at * 1000).toISOString(), interests: [], budget: null });
+    } catch (err) {
+      setLoginError((err as Error).message);
+      return;
+    } finally { setBusy(false); }
+    // Someone mid-task (e.g. connecting an agent) goes straight back; onboarding can wait.
+    if (next !== "/contracts") { toast.success("Signed in"); router.replace(next); return; }
     setStep(2);
   }
 
   function finish(skip = false) {
-    writeSession({ email, interests: skip ? [] : interests, budget: skip ? null : budget });
+    const s = readSession();
+    if (s) writeSession({ ...s, interests: skip ? [] : interests, budget: skip ? null : budget });
     toast.success(mode === "signup" ? "Account created" : "Welcome back");
-    router.push("/contracts");
+    router.push(next);
   }
 
   const toggle = (id: string) => setInterests((xs) => (xs.includes(id) ? xs.filter((x) => x !== id) : [...xs, id]));
 
   return (
-    <main className="grid flex-1 lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
-      <BrandPanel />
-
       <section className="flex items-center justify-center px-4 py-10 sm:px-8">
         <div className="w-full max-w-md">
           <StepDots step={step} />
@@ -116,35 +137,23 @@ export default function LoginPage() {
                 {mode === "signin" ? "Sign in to see what your agent is allowed to buy." : "Set the rules once. Let your agent do the shopping."}
               </p>
 
-              <Button type="button" variant="outline" size="lg" className="mt-6 w-full"
-                onClick={() => toast("Google sign-in isn't connected yet", { description: "Use email for now." })}>
-                <svg viewBox="0 0 24 24" className="size-4" aria-hidden><path fill="#4285F4" d="M22.5 12.3c0-.8-.1-1.5-.2-2.2H12v4.2h5.9a5 5 0 0 1-2.2 3.3v2.7h3.5c2.1-1.9 3.3-4.7 3.3-8z" /><path fill="#34A853" d="M12 23c3 0 5.5-1 7.3-2.7l-3.5-2.7c-1 .7-2.3 1.1-3.8 1.1-2.9 0-5.4-2-6.3-4.6H2.1v2.8A11 11 0 0 0 12 23z" /><path fill="#FBBC05" d="M5.7 14.1a6.6 6.6 0 0 1 0-4.2V7.1H2.1a11 11 0 0 0 0 9.8l3.6-2.8z" /><path fill="#EA4335" d="M12 5.4c1.6 0 3.1.6 4.2 1.7l3.1-3.1A11 11 0 0 0 2.1 7.1l3.6 2.8C6.6 7.4 9.1 5.4 12 5.4z" /></svg>
-                Continue with Google
-              </Button>
+              <p className="mt-6 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm font-medium text-warn">
+                Demo login (no password; to be replaced by passkeys/OAuth)
+              </p>
 
-              <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground"><span className="h-px flex-1 bg-border" />or with email<span className="h-px flex-1 bg-border" /></div>
-
-              <div className="grid gap-4">
+              <div className="mt-6 grid gap-4">
                 <div className="grid gap-1.5">
                   <Label htmlFor="email">Email</Label>
                   <Input id="email" type="email" autoComplete="email" placeholder="you@example.com" className="h-10"
                     value={email} onChange={(e) => setEmail(e.target.value)} aria-invalid={touched && !!emailError} />
                   {touched && emailError && <p className="text-xs text-fail">{emailError}</p>}
                 </div>
-                <div className="grid gap-1.5">
-                  <div className="flex items-baseline justify-between">
-                    <Label htmlFor="password">Password</Label>
-                    {mode === "signin" && <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => toast("Password reset isn't set up yet")}>Forgot?</button>}
-                  </div>
-                  <Input id="password" type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} className="h-10"
-                    value={password} onChange={(e) => setPassword(e.target.value)} aria-invalid={touched && !!passwordError} />
-                  {touched && passwordError && <p className="text-xs text-fail">{passwordError}</p>}
-                </div>
               </div>
 
               <Button type="submit" size="lg" disabled={busy} className="mt-6 h-10 w-full bg-brand text-brand-foreground hover:bg-brand/90">
                 {busy ? "One sec…" : mode === "signin" ? "Sign in" : "Create account"}<ArrowRight />
               </Button>
+              {loginError && <p className="mt-3 rounded-lg bg-fail-soft p-3 text-sm text-fail">{loginError}</p>}
 
               <p className="mt-6 text-center text-sm text-muted-foreground">
                 {mode === "signin" ? "New to Handshake? " : "Already have an account? "}
@@ -195,9 +204,8 @@ export default function LoginPage() {
             </div>
           )}
 
-          <p className="mt-10 text-center text-xs text-muted-foreground">Demo sign-in. No real account is created yet.</p>
+          <p className="mt-10 text-center text-xs text-muted-foreground">Demo login: anyone who types an email gets a session. No real account is created.</p>
         </div>
       </section>
-    </main>
   );
 }

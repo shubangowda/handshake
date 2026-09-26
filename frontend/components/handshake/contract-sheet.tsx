@@ -63,7 +63,7 @@ export function contractRows(c: ContractRecord) {
     ...(c.delivery.max_shipping != null ? [{ label: "Shipping", value: `≤ ${money(c.delivery.max_shipping, cur)}`, source: c.delivery.max_shipping_source, severity: "hard" as const }] : []),
   ] : [];
 
-  // TermsPolicy has no per-field source in the backend yet; shown as Handshake defaults.
+  // TermsPolicy and MerchantPolicy have no `source` field in models.py, so these rows are labeled "Default".
   const terms: Row[] = [
     { label: "Subscription", value: c.terms.no_subscription ? "Not allowed" : "Allowed", source: "default", severity: "hard" },
     { label: "Membership", value: c.terms.no_membership ? "Not allowed" : "Allowed", source: "default", severity: "hard" },
@@ -71,6 +71,7 @@ export function contractRows(c: ContractRecord) {
     ...(c.terms.min_return_days != null ? [{ label: "Returns", value: `At least ${c.terms.min_return_days} days`, source: "default" as const, severity: "hard" as const }] : []),
     { label: "Seller", value: SELLER_LABELS[c.merchants.seller_requirement], source: "default", severity: "hard" },
     { label: "New merchants", value: c.merchants.new_merchant === "escalate" ? "Ask me first" : c.merchants.new_merchant === "deny" ? "Blocked" : "Allowed", source: "default", severity: "escalating" },
+    ...(c.merchants.allow.length ? [{ label: "Only buy from", value: c.merchants.allow.join(", ") }] : []),
     ...(c.merchants.deny.length ? [{ label: "Never buy from", value: c.merchants.deny.join(", ") }] : []),
   ];
 

@@ -4,46 +4,71 @@ Next.js 16, TypeScript, Tailwind v4, shadcn/ui (Base UI) and lucide-react.
 
 ```bash
 npm install
-npm run dev          # http://localhost:3000, uses mock data
+npm run dev          # mock data by default, no backend needed
 ```
 
-To use the FastAPI backend instead of mocks:
+## Running against the backend
+
+The backend is the FastAPI app in `../handshake` (routes and shapes: [`../docs/API.md`](../docs/API.md)).
+The frontend reads two settings, and nothing else decides where it connects:
+
+| Variable | Meaning |
+|---|---|
+| `NEXT_PUBLIC_API_URL` | Base URL of the backend. Required when mocks are off; if it's missing the app shows a configuration error instead of guessing. |
+| `NEXT_PUBLIC_USE_MOCKS` | `false` talks to the backend. `true` (or unset) uses the in-memory mock store. |
+
+Put them in `.env.local` (git-ignored). `scripts/dev.py` writes it for you; otherwise copy the template:
 
 ```bash
-NEXT_PUBLIC_USE_MOCKS=false NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
+cp .env.example .env.local   # then edit, and restart npm run dev
 ```
+
+`NEXT_PUBLIC_*` values are baked in when `next dev`/`next build` starts, so restart after changing them.
+
+Sign in with the **demo login** (email only, no password; to be replaced by passkeys/OAuth). It calls `POST /auth/demo-login` and keeps the token in `localStorage` (`lib/session.ts`). Every request sends `Authorization: Bearer <token>`; a 401 clears the session and returns to `/login?next=<where you were>`.
+
+The header shows which payment rail the backend uses (`GET /health`): **Stripe Link: TEST MODE** or **Simulated provider**. In mock mode it shows **Mock data**.
 
 ## Screens
 
 | Route | What it shows |
 |---|---|
 | `/` | Landing page with the Glyph Portal scroll effect ("HANDSHAKE") that opens into the pitch |
-| `/contracts` | Dashboard with tabs: Pending (match found, waiting for your one-tap approval), Active, Draft, Used, Rejected (revoked or expired, with the reason on each card), plus links to the demo scenarios |
-| `/contracts/draft_shoes01` | Contract review: plain-English contract, the "Inferred by Handshake" panel, edit, and sign |
-| `/contracts/:id` (signed) | Contract, revoke, "Edit (creates new version)" and its purchase attempts |
-| `/purchases/purchase_pending` | Passed every check. Approve (paid from held funds, rest refunded) or "Not this one" |
-| `/purchases/purchase_pass` | Authorized purchase, with the check-by-check comparison and timeline |
-| `/purchases/purchase_blocked` | Malicious merchant: $149.72 against a $135 cap, plus a hidden add-on |
-| `/purchases/purchase_escalated` | UNVERIFIABLE seller, with Reject / Approve exception |
+| `/login` | Demo login, then the optional interests step. Honors `?next=` (skips onboarding when you were mid-task) |
+| `/contracts` | "Describe what to buy" box (compiles a draft via `POST /drafts/compile`; the offline compiler only understands the Pegasus 41 demo request), plus tabs: Pending (a purchase waiting for your payment approval), Active, Draft, Used, Rejected (revoked or expired) |
+| `/contracts/:draftId` | Contract review: plain-English contract, "Inferred by Handshake", blocking issues, Edit, and "Review & sign" (restates the all-in cap, deadline, merchant rules and key constraints; disabled while blocking issues exist) |
+| `/contracts/:id` (signed) | Contract, signature verification, Revoke, "Edit (creates new version)", and purchase attempts with their payment state |
+| `/purchases/:id` | The agent's attempt: progression (Replay replays it from the evidence), the payment panel, check-by-check comparison, checkout breakdown, and activity. Polls every 2.5 s until the purchase is finished |
+| `/connect?code=USER-CODE` | Where an agent's (MCP) login link lands: which agent is asking, what it may and may never do, Approve / Deny |
 
-Purchase pages animate the agent's progress (Searching → … → Authorized/Blocked/Needs you). Use **Replay** during the demo.
+On a purchase page:
+
+- **Passed every check**: "Approve in Link" opens Link's approval page in a new tab (`link_test` mode). In `stub` mode the button is "Simulated provider approval" (stands in for Link's approval tap). "Not this one" declines while the payment hasn't started.
+- **Payment progression**, in plain words: Awaiting your Link approval → Rechecking checkout → Card released to agent / Paying → Paid → Completed (with order id and last4). Side exits: declined in Link, expired, checkout changed after approval (nothing paid), failed, and "Checking with the merchant".
+- **Escalated** (something couldn't be verified) needs two separate consents: 1. accept the exception in Handshake, 2. then approve the payment in Link.
+
+Mock mode keeps demo fixtures at `/contracts/draft_shoes01` and `/purchases/purchase_pending|purchase_pass|purchase_blocked|purchase_escalated`, linked from the dashboard. The mock payment advances one step per poll so the progression is visible.
 
 ## Layout
 
-- `lib/types.ts`: TypeScript copies of the backend Pydantic models. Additions the backend doesn't have yet are marked `PROPOSED`.
+- `lib/types.ts`: TypeScript copies of `handshake/models.py`, field for field. Shapes the API adds around them (DraftRecord, PurchaseDetail, PaymentInfo, Health, ...) are below an "API-only" line.
 - `lib/api.ts`: **the only file that talks to the backend.** Uses an in-memory mock store when `USE_MOCKS` is on.
+- `lib/session.ts`: the demo session (token + email).
+- `lib/status.ts`: dashboard grouping and payment-state wording.
 - `lib/mock-data.ts`: demo fixtures. Times are relative to now.
-- `components/handshake/*`: app components.
+- `components/handshake/*`: app components (`payment-status.tsx` is the payment panel, `sign-dialog.tsx` the review-and-sign dialog).
 - `components/ui/*`: shadcn primitives and the vendored `glyph-portal.tsx` (MIT, keep its license header).
 
-## Open questions for the backend (Shuban)
+## Resolved (was "Open questions for the backend")
 
-1. **How an exception is represented.** Frontend assumes `POST /purchases/:id/resolve {action: "approve"|"reject"}`. It stores `purchase.resolution` and emits `escalation_approved` / `escalation_rejected` events. The decision's verdict stays `unverifiable`.
-2. **`GET /purchases/:id` should include `proposal`** so the UI can show what the agent tried to buy.
-3. **`ConstraintResult` needs `field` and `label`** so the UI doesn't have to parse the `constraint` string.
-4. **`TermsPolicy` and `MerchantPolicy` have no `source`.** The UI shows them as "Default" for now.
-5. **Drafts:** frontend assumes `GET /drafts` and `GET /drafts/:id`, returning a `ContractDraft` with the `CompilerOutput` assumptions flattened in.
-6. **Editing:** frontend assumes `PATCH /drafts/:id` and `POST /contracts/:id/amend`. The new draft has `previous_contract_id`, and signing it revokes the old version.
-7. `POST /contracts/:id/sign` is called with the draft id.
-8. **Prepaid funds:** the user pays the contract's maximum total when signing (`Contract.funding`, PROPOSED). When the user approves a match, the total is taken from the held money and the rest is refunded. If the contract is revoked or expires, or a new version replaces it, everything is refunded. The frontend assumes `POST /purchases/:id/approve` and `POST /purchases/:id/decline`. Stripe fits this with a PaymentIntent using `capture_method: "manual"`: hold the maximum at signing, capture the actual total on approval, and the rest is released automatically. The card form in `components/handshake/payment-dialog.tsx` is a placeholder and never sends card data anywhere.
-9. **Pending and Rejected are frontend-only groups** (see `lib/status.ts`). Pending means the contract is active and has an `authorized` purchase waiting for approval. Rejected means the contract is revoked or expired.
+All answered by [`docs/API.md`](../docs/API.md):
+
+1. **Exceptions**: `POST /purchases/:id/approve` or `/reject`. The decision keeps its `unverifiable` verdict; `PurchaseDetail.resolution` records who accepted which checks. Approving an exception does not pay: the payment still needs approval in Link.
+2. **`proposal`** is included in every purchase response (`PurchaseDetail`).
+3. **`ConstraintResult.field` and `label`** are always present in API responses (added when the API serializes a decision; not in models.py).
+4. **`TermsPolicy` and `MerchantPolicy` have no `source` field**, so the UI still shows them as "Default".
+5. **Drafts**: `GET /drafts` and `GET /drafts/:id` return a DraftRecord (ContractDraft flattened with the compiler metadata, plus `review_url`, `blocking_issues`, `signed_contract_id`). New: `POST /drafts/compile`.
+6. **Editing**: `PATCH /drafts/:id` (send only changed keys) and `POST /contracts/:id/amend`. Signing the new draft revokes the old version.
+7. **Signing**: `POST /contracts/:id/sign {draft_id}`. `409 draft_has_blocking_issues` carries `details.blocking_issues`.
+8. **Prepaid funds are gone.** Nothing is charged at signing. Each purchase is paid separately after the user approves it in Link (or the simulated provider in stub mode). No held funds, no refunds. Declining is `POST /purchases/:id/reject` on an authorized purchase whose payment hasn't started.
+9. **Pending** is now based on the purchase's `payment_state === "awaiting_approval"`, because the backend marks a single-use contract `used` while a purchase holds it. **Rejected** means the contract is revoked or expired.

@@ -1,12 +1,11 @@
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-import type { Contract, ContractRecord, PurchaseDetail } from "@/lib/types";
+import type { ContractRecord, PurchaseDetail } from "@/lib/types";
 import { isDraft, money, relativeExpiry } from "@/lib/format";
 import { rejectionReason, type DisplayStatus } from "@/lib/status";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "./tags";
-import { fundsSummary } from "./funds";
-import { Ban, Check, Clock, GitBranch, Landmark, Sparkles } from "lucide-react";
+import { Ban, Check, Clock, GitBranch, Sparkles } from "lucide-react";
 
 function inferredCount(c: ContractRecord) {
   return c.constraints.filter((k) => k.source !== "user").length
@@ -14,18 +13,19 @@ function inferredCount(c: ContractRecord) {
     + (c.delivery && c.delivery.max_shipping_source !== "user" ? 1 : 0);
 }
 
-export function ContractCard({ contract: c, status, pending, onApprove, approving }: {
+export function ContractCard({ contract: c, status, pending, onApprove, approving, approveLabel = "Approve in Link" }: {
   contract: ContractRecord;
   status: DisplayStatus;
-  /** The purchase waiting for approval, when status is "pending". */
+  /** The purchase whose payment is waiting for the user's approval, when status is "pending". */
   pending?: PurchaseDetail;
   onApprove?: (p: PurchaseDetail) => void;
   approving?: boolean;
+  /** "Approve in Link", or "Simulated provider approval" when the backend runs the stub provider. */
+  approveLabel?: string;
 }) {
   const rejected = status === "rejected";
   const draft = isDraft(c);
   const reason = rejectionReason(c);
-  const funds = draft ? null : fundsSummary((c as Contract).funding);
   const ReasonIcon = c.status === "expired" ? Clock : Ban;
   return (
     // The title link stretches over the whole card; the Approve button sits above it.
@@ -37,7 +37,7 @@ export function ContractCard({ contract: c, status, pending, onApprove, approvin
     )}>
       {reason && (
         <p className="-mx-5 -mt-5 flex items-center gap-1.5 rounded-t-xl border-b border-fail/15 bg-fail-soft px-5 py-2 text-xs font-medium text-fail">
-          <ReasonIcon className="size-3.5 shrink-0" />{reason}{funds && <> · {funds}</>}
+          <ReasonIcon className="size-3.5 shrink-0" />{reason}
         </p>
       )}
       <div className="flex items-start justify-between gap-3">
@@ -58,16 +58,15 @@ export function ContractCard({ contract: c, status, pending, onApprove, approvin
             <p className="text-muted-foreground">{pending.proposal.merchant.name} · <span className="font-semibold text-foreground tabular-nums">{money(pending.proposal.total)}</span></p>
           </div>
           <Button className="relative z-10 w-full bg-brand text-brand-foreground hover:bg-brand/90" size="lg" disabled={approving} onClick={() => onApprove?.(pending)}>
-            <Check />{approving ? "Approving…" : `Approve purchase · ${money(pending.proposal.total)}`}
+            <Check />{approving ? "Approving…" : `${approveLabel} · ${money(pending.proposal.total)}`}
           </Button>
           <p className="text-center text-xs text-muted-foreground">
-            Paid from the {money(c.spend.hard_cap_all_in)} you already put down · {money(c.spend.hard_cap_all_in - pending.proposal.total)} comes back to you
+            Every check passed · nothing is paid until you approve{pending.payment ? ` · ${pending.payment.provider_label}` : ""}
           </p>
         </div>
       ) : (
         <div className="mt-auto space-y-1.5 text-sm text-muted-foreground">
           {!rejected && c.status !== "used" && <p>{relativeExpiry(c.expires_at)}</p>}
-          {funds && !rejected && <p className="flex items-center gap-1.5 text-foreground"><Landmark className="size-3.5" />{funds}</p>}
           <p>{c.single_use ? "Single use" : "Reusable"} · {c.constraints.filter((k) => k.severity === "hard").length} hard rules</p>
           {draft && (
             <p className="flex items-center gap-1 font-medium text-warn"><Sparkles className="size-3.5" />Review {inferredCount(c)} inferred values, then sign</p>
