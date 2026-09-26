@@ -155,6 +155,10 @@ class DraftRow(Base):
     owner: Mapped[str] = mapped_column(String, index=True, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     signed_contract_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # A draft made by "amending" a signed contract points back at it. ContractDraft
+    # (models.py) has no such field, so it lives here; signing copies it into the
+    # Contract's previous_contract_id and revokes the old version.
+    previous_contract_id: Mapped[str | None] = mapped_column(String, nullable=True)
     data: Mapped[dict] = mapped_column(JSON)
     # Compiler metadata: assumptions, clarifications_needed, compiler_notes.
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -292,12 +296,19 @@ class EvidenceRow(Base):
 # ============================================================
 
 
-def save_draft(session: Session, draft: ContractDraft, meta: dict[str, Any] | None = None, owner: str = "") -> None:
+def save_draft(
+    session: Session,
+    draft: ContractDraft,
+    meta: dict[str, Any] | None = None,
+    owner: str = "",
+    previous_contract_id: str | None = None,
+) -> None:
     """Insert a new unsigned draft (plus compiler metadata) owned by `owner`."""
     session.add(
         DraftRow(
             id=draft.id,
             owner=owner,
+            previous_contract_id=previous_contract_id,
             created_at=draft.created_at,
             data=_dump(draft),
             meta=meta or {},
@@ -313,6 +324,13 @@ def get_draft_row(session: Session, draft_id: str) -> DraftRow | None:
 def load_draft(row: DraftRow) -> ContractDraft:
     """Rebuild the ContractDraft model from a row."""
     return ContractDraft.model_validate(row.data)
+
+
+def update_draft(session: Session, draft: ContractDraft, meta: dict[str, Any]) -> None:
+    """Overwrite an unsigned draft's content and metadata (after an edit)."""
+    row = session.get(DraftRow, draft.id)
+    row.data = _dump(draft)
+    row.meta = meta
 
 
 def mark_draft_signed(session: Session, draft_id: str, contract_id: str) -> None:
@@ -381,6 +399,29 @@ def update_contract_status(session: Session, contract_id: str, status: ContractS
     row.status = status.value
     # Assign a new dict (not mutate in place) so SQLAlchemy notices the change.
     row.data = {**row.data, "status": status.value}
+
+
+def claim_contract_status(session: Session, contract_id: str, from_status: ContractStatus, to_status: ContractStatus) -> bool:
+    """
+    Atomically move a contract from one status to another; False if it wasn't in `from_status`.
+
+    The same conditional-UPDATE idea as claim_single_use_contract below, for
+    other transitions (e.g. amendment revoking the old version, or releasing
+    a payment reservation back to ACTIVE). Caller commits or rolls back.
+    """
+    statement = (
+        update(ContractRow)
+        .where(ContractRow.id == contract_id)
+        .where(ContractRow.status == from_status.value)
+        .values(status=to_status.value)
+        .execution_options(synchronize_session=False)
+    )
+    if session.execute(statement).rowcount != 1:
+        return False
+    row = session.get(ContractRow, contract_id)
+    session.refresh(row)
+    row.data = {**row.data, "status": to_status.value}
+    return True
 
 
 def claim_single_use_contract(session: Session, contract_id: str) -> bool:
@@ -559,6 +600,14 @@ def load_purchase(session: Session, purchase_id: str) -> Purchase | None:
     if row is None:
         return None
     return Purchase.model_validate(row.data)
+
+
+def list_purchases(session: Session, owner: str, contract_id: str | None = None) -> list[Purchase]:
+    """An owner's purchases (optionally for one contract), newest first."""
+    query = select(PurchaseRow).where(PurchaseRow.owner == owner).order_by(PurchaseRow.created_at.desc())
+    if contract_id is not None:
+        query = query.where(PurchaseRow.contract_id == contract_id)
+    return [Purchase.model_validate(row.data) for row in session.scalars(query)]
 
 
 # ============================================================

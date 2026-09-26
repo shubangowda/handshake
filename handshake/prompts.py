@@ -1,3 +1,21 @@
+"""
+prompts.py: the two kinds of instructions Handshake gives to language models.
+
+1. COMPILER_PROMPT (Ajay's, copied WORD FOR WORD; tests/test_integrity.py
+   pins its SHA-256). It is the system prompt for compiler.py, which turns a
+   user's shopping request into a DRAFT contract. The compiler never sees
+   merchant content and never decides anything; the user reviews and signs.
+
+2. HANDSHAKE_AGENT_INSTRUCTIONS (added in the integration, see the bottom of
+   this file). The operational workflow for the SHOPPING AGENT that talks to
+   Handshake over MCP. mcp_server.py registers it as the server instructions
+   and as the MCP prompt `handshake_purchase_workflow`.
+
+The two are deliberately separate: the compiler prompt describes how to draft
+authority, the agent instructions describe how to use authority someone else
+granted. Mixing them would blur exactly the line Handshake exists to enforce.
+"""
+
 COMPILER_PROMPT = """
 You are the Handshake Contract Compiler.
 

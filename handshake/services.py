@@ -39,7 +39,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError, model_validator
 from sqlalchemy.orm import Session
 
-from handshake import db
+from handshake import compiler, db
 from handshake.auth import Principal
 from handshake.config import DEV_SIGNING_SECRET, get_settings
 from handshake.intent_diff import (
@@ -72,6 +72,7 @@ from handshake.models import (
     SelectionReport,
     TransactionProposal,
     ValidationDecision,
+    generate_id,
     utc_now,
 )
 
@@ -343,9 +344,9 @@ def create_draft(session: Session, body: dict[str, Any], owner: str) -> dict[str
     # it is a bare draft, which we wrap ourselves so the rest is identical.
     try:
         if "draft" in body:
-            compiler = CompilerOutput.model_validate(body)
+            output = CompilerOutput.model_validate(body)
         else:
-            compiler = CompilerOutput(draft=ContractDraft.model_validate(body))
+            output = CompilerOutput(draft=ContractDraft.model_validate(body))
     except ValidationError as exc:
         raise ServiceError(422, "invalid_draft", "Contract draft failed validation.", {"errors": _errors(exc)})
     except TypeError as exc:
@@ -353,16 +354,42 @@ def create_draft(session: Session, body: dict[str, Any], owner: str) -> dict[str
         # datetime raise TypeError (not ValidationError), so catch it here.
         raise ServiceError(422, "invalid_draft", f"Contract draft could not be validated: {exc}")
 
-    draft = compiler.draft
-    if db.get_draft_row(session, draft.id) is not None:
-        raise ServiceError(409, "draft_exists", f"A draft with id {draft.id!r} already exists.")
+    if db.get_draft_row(session, output.draft.id) is not None:
+        raise ServiceError(409, "draft_exists", f"A draft with id {output.draft.id!r} already exists.")
 
-    meta = {
-        "assumptions": compiler.assumptions,
-        "clarifications_needed": compiler.clarifications_needed,
-        "compiler_notes": compiler.compiler_notes,
-    }
-    db.save_draft(session, draft, meta, owner=owner)
+    return _store_draft(session, output, owner, source="posted")
+
+
+def store_compiled_draft(session: Session, result: "compiler.CompileResult", owner: str) -> dict[str, Any]:
+    """Persist a successful compile (the compiler already set the id and created_at server-side)."""
+    return _store_draft(session, result.output, owner, source=result.source)
+
+
+def _store_draft(
+    session: Session,
+    output: CompilerOutput,
+    owner: str,
+    source: str,
+    previous_contract_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Lint, persist, and log a draft. Every path that creates a draft goes through here.
+
+    Lint runs BEFORE storing, so a draft is never saved without its blocking
+    issues attached (they show up in clarifications_needed with a 'lint: '
+    prefix, and sign_draft refuses the draft until they are resolved).
+    """
+    report = compiler.lint_draft(output.draft, clock())
+    draft = report.draft  # naive datetimes were given the user's timezone
+    meta = compiler.merge_lint(
+        {
+            "assumptions": list(output.assumptions),
+            "clarifications_needed": list(output.clarifications_needed),
+            "compiler_notes": list(output.compiler_notes),
+        },
+        report,
+    )
+    db.save_draft(session, draft, meta, owner=owner, previous_contract_id=previous_contract_id)
 
     # Draft events are keyed by the draft id (there is no contract id yet).
     log_event(
@@ -370,10 +397,192 @@ def create_draft(session: Session, body: dict[str, Any], owner: str) -> dict[str
         draft.id,
         EvidenceEventType.CONTRACT_CREATED,
         f"Contract draft created for goal: {draft.goal!r}.",
-        {"draft": draft, **meta},
+        {"draft": draft, "source": source, "previous_contract_id": previous_contract_id, **meta},
     )
     session.commit()
-    return {"draft_id": draft.id, "draft": draft, **meta}
+    record = draft_record(db.get_draft_row(session, draft.id))
+    # The original POST /contracts response keys, kept for compatibility...
+    return {"draft_id": draft.id, "draft": draft, **meta, **{k: record[k] for k in ("review_url", "blocking_issues", "previous_contract_id")}, "record": record}
+
+
+# ============================================================
+# Draft records (Rohan's DraftRecord shape)
+# ============================================================
+
+
+def review_url_for(record_id: str) -> str:
+    """Where the user reviews a draft or contract in the frontend (from config, never hardcoded)."""
+    return f"{get_settings().frontend_url}/contracts/{record_id}"
+
+
+def purchase_url_for(purchase_id: str) -> str:
+    """Where the user sees a purchase in the frontend."""
+    return f"{get_settings().frontend_url}/purchases/{purchase_id}"
+
+
+def blocking_issues(meta: dict[str, Any]) -> list[str]:
+    """The lint errors that currently prevent signing (without their 'lint: ' prefix)."""
+    return [c[len(compiler.LINT_PREFIX):] for c in meta.get("clarifications_needed", []) if c.startswith(compiler.LINT_PREFIX)]
+
+
+def draft_record(row: db.DraftRow) -> dict[str, Any]:
+    """
+    A draft as the frontend's DraftRecord: every ContractDraft field, flattened,
+    plus status "draft", the compiler metadata, and previous_contract_id.
+
+    API-only keys (not in models.py): status, assumptions, clarifications_needed,
+    compiler_notes, previous_contract_id, signed_contract_id, review_url,
+    blocking_issues.
+    """
+    draft = db.load_draft(row)
+    return {
+        **draft.model_dump(mode="json"),
+        "status": "draft",
+        "assumptions": row.meta.get("assumptions", []),
+        "clarifications_needed": row.meta.get("clarifications_needed", []),
+        "compiler_notes": row.meta.get("compiler_notes", []),
+        "previous_contract_id": row.previous_contract_id,
+        "signed_contract_id": row.signed_contract_id,
+        "review_url": review_url_for(row.id),
+        "blocking_issues": blocking_issues(row.meta),
+    }
+
+
+def _owned_draft_row(session: Session, draft_id: str, owner: str | None) -> db.DraftRow:
+    """Load a draft row the caller owns, or raise 404."""
+    row = db.get_draft_row(session, draft_id)
+    missing = f"No contract draft with id {draft_id!r}."
+    if row is None:
+        raise ServiceError(404, "draft_not_found", missing)
+    _check_owner(row.owner, owner, "draft_not_found", missing)
+    return row
+
+
+def list_draft_records(session: Session, owner: str) -> list[dict[str, Any]]:
+    """The caller's drafts, newest first, as DraftRecords."""
+    return [draft_record(row) for row in db.list_drafts(session, owner=owner)]
+
+
+def get_draft_record(session: Session, draft_id: str, owner: str | None) -> dict[str, Any]:
+    """One draft as a DraftRecord (404 if missing or foreign)."""
+    return draft_record(_owned_draft_row(session, draft_id, owner))
+
+
+# The editable subset of a draft (Rohan's DraftPatch).
+PATCHABLE_KEYS = {"goal", "target", "hard_cap_all_in", "max_shipping", "deliver_by", "constraints"}
+
+
+def patch_draft(session: Session, draft_id: str, patch: dict[str, Any], owner: str | None) -> dict[str, Any]:
+    """
+    Apply the user's edits to an unsigned draft, re-validate, and re-lint. User only.
+
+    Any value the user edits becomes source=USER: the user has now stated it
+    themselves, so the review screen stops showing it as "inferred". A signed
+    draft can't be edited (that would change what was signed); amend the
+    contract instead, which creates a new draft.
+    """
+    row = _owned_draft_row(session, draft_id, owner)
+    if row.signed_contract_id is not None:
+        raise ServiceError(409, "already_signed", "This draft was already signed. Amend the contract to change it.", {"contract_id": row.signed_contract_id})
+
+    unknown = set(patch) - PATCHABLE_KEYS
+    if unknown:
+        raise ServiceError(422, "invalid_patch", f"These fields can't be edited here: {', '.join(sorted(unknown))}.")
+
+    data = db.load_draft(row).model_dump(mode="json")
+    changed: list[str] = []
+
+    if "goal" in patch and patch["goal"] != data["goal"]:
+        data["goal"] = patch["goal"]
+        changed.append("goal")
+    if "target" in patch and patch["target"] != data["spend"]["target"]:
+        data["spend"]["target"] = patch["target"]
+        data["spend"]["target_source"] = "user"
+        changed.append("target")
+    if "hard_cap_all_in" in patch and patch["hard_cap_all_in"] != data["spend"]["hard_cap_all_in"]:
+        data["spend"]["hard_cap_all_in"] = patch["hard_cap_all_in"]
+        data["spend"]["hard_cap_source"] = "user"
+        changed.append("hard_cap_all_in")
+
+    # Delivery edits create the delivery policy if the draft had none.
+    if "max_shipping" in patch or "deliver_by" in patch:
+        delivery = data.get("delivery") or {}
+        if "max_shipping" in patch and patch["max_shipping"] != delivery.get("max_shipping"):
+            delivery["max_shipping"] = patch["max_shipping"]
+            delivery["max_shipping_source"] = "user"
+            changed.append("max_shipping")
+        if "deliver_by" in patch and patch["deliver_by"] != delivery.get("deliver_by"):
+            delivery["deliver_by"] = patch["deliver_by"]
+            delivery["deliver_by_source"] = "user"
+            changed.append("deliver_by")
+        data["delivery"] = delivery
+
+    if "constraints" in patch:
+        old = {(c["field"], c["operator"], repr(c["value"]), c["severity"]) for c in data["constraints"]}
+        new_constraints = []
+        for item in patch["constraints"] or []:
+            if not isinstance(item, dict):
+                raise ServiceError(422, "invalid_patch", "Each constraint must be an object.")
+            constraint = dict(item)
+            key = (constraint.get("field"), constraint.get("operator"), repr(constraint.get("value")), constraint.get("severity", "hard"))
+            if key not in old:
+                constraint["source"] = "user"  # new or changed by the user
+            new_constraints.append(constraint)
+        data["constraints"] = new_constraints
+        changed.append("constraints")
+
+    try:
+        draft = ContractDraft.model_validate(data)
+    except ValidationError as exc:
+        raise ServiceError(422, "invalid_patch", "The edited draft is not valid.", {"errors": _errors(exc)})
+    except TypeError as exc:
+        raise ServiceError(422, "invalid_patch", f"The edited draft is not valid: {exc}")
+
+    report = compiler.lint_draft(draft, clock())
+    meta = compiler.merge_lint(dict(row.meta), report)
+    db.update_draft(session, report.draft, meta)
+    log_event(
+        session, draft_id, EvidenceEventType.CONTRACT_CREATED,
+        f"Draft edited by the user: {', '.join(changed) or 'no changes'}.",
+        {"kind": "draft_edited", "changed": changed, "blocking_issues": report.errors},
+    )
+    session.commit()
+    return draft_record(db.get_draft_row(session, draft_id))
+
+
+def amend_contract(session: Session, contract_id: str, owner: str | None) -> dict[str, Any]:
+    """
+    Start a new version of a signed contract: a new DRAFT copied from it, pointing back at it. User only.
+
+    Nothing changes for the old contract yet. Signing the new draft revokes
+    the old version atomically (sign_draft). Until then, the old one stays in force.
+    """
+    contract = _require_contract(session, contract_id, owner)
+    row = db.get_contract_row(session, contract_id)
+    if contract.status == ContractStatus.ACTIVE and not contract.revocable:
+        raise ServiceError(409, "not_revocable", "This contract was signed as non-revocable, so it can't be replaced.")
+
+    # Copy every field ContractDraft has; drop the signed-only ones.
+    signed_only = {"id", "status", "agent_key", "signed_at", "contract_hash", "signature", "previous_contract_id", "created_at"}
+    data = contract.model_dump(mode="json", exclude=signed_only)
+    data["id"] = generate_id("draft")
+    data["created_at"] = clock().isoformat()
+    draft = ContractDraft.model_validate(data)
+
+    result = _store_draft(
+        session,
+        CompilerOutput(draft=draft, compiler_notes=[f"Amendment of contract {contract_id}."]),
+        row.owner,
+        source="amend",
+        previous_contract_id=contract_id,
+    )
+    log_event(
+        session, contract_id, EvidenceEventType.CONTRACT_CREATED,
+        f"A new version was started as draft {draft.id}. This contract stays in force until that draft is signed.",
+        {"kind": "contract_amended", "new_draft_id": draft.id},
+    )
+    session.commit()
+    return result["record"]
 
 
 def sign_draft(
@@ -405,10 +614,27 @@ def sign_draft(
 
     draft = db.load_draft(row)
 
+    # --- Lint again, NOW -----------------------------------------------------
+    # The draft may have been fine when compiled but not anymore (its
+    # delivery deadline passed overnight), or the user may not have resolved
+    # an earlier problem. A draft with blocking lint errors is never signed.
+    report = compiler.lint_draft(draft, clock())
+    if report.blocking:
+        db.update_draft(session, report.draft, compiler.merge_lint(dict(row.meta), report))
+        session.commit()
+        raise ServiceError(
+            409, "draft_has_blocking_issues",
+            "This draft has problems that must be fixed before it can be signed.",
+            {"blocking_issues": report.errors},
+        )
+    draft = report.draft
+
     # Copy every draft field except its id (a signed contract gets a new
     # contract_... id), and normalize all datetimes to UTC so the canonical
     # JSON, and therefore the hash, is stable.
     fields = _utc_datetimes(draft.model_dump(exclude={"id"}))
+    # An amendment draft points at the contract it replaces.
+    fields["previous_contract_id"] = row.previous_contract_id
 
     try:
         # Build it with placeholder hash/signature first, because the hash is
@@ -430,6 +656,20 @@ def sign_draft(
     hash_hex = contract_hash(unsigned)
     contract = unsigned.model_copy(update={"contract_hash": hash_hex, "signature": sign_hash(hash_hex)})
 
+    # --- Amendment: replace the old version atomically -----------------------
+    # Signing a new version and revoking the old one happen in ONE transaction,
+    # so there is never a moment with two active versions (or with none). The
+    # conditional UPDATE only revokes the old contract if it is still ACTIVE.
+    replaced: str | None = None
+    if row.previous_contract_id:
+        old_row = db.get_contract_row(session, row.previous_contract_id)
+        if old_row is not None and old_row.owner == row.owner and old_row.status == ContractStatus.ACTIVE.value:
+            if db.claim_contract_status(session, old_row.id, ContractStatus.ACTIVE, ContractStatus.REVOKED):
+                replaced = old_row.id
+                for credential in db.list_credentials_for_contract(session, old_row.id):
+                    if credential.status in (CredentialStatus.CREATED, CredentialStatus.ACTIVE):
+                        db.update_credential(session, credential.model_copy(update={"status": CredentialStatus.REVOKED}))
+
     db.save_contract(session, contract, draft_id=draft_id, owner=row.owner)
     db.mark_draft_signed(session, draft_id, contract.id)
 
@@ -445,7 +685,15 @@ def sign_draft(
     if client_signature is not None:
         data["client_signature"] = client_signature
 
+    if replaced:
+        data["replaces_contract_id"] = replaced
     log_event(session, contract.id, EvidenceEventType.CONTRACT_SIGNED, "User signed the contract.", data)
+    if replaced:
+        log_event(
+            session, replaced, EvidenceEventType.CONTRACT_REVOKED,
+            f"Replaced by the new version {contract.id}, which the user signed.",
+            {"kind": "contract_amended", "replaced_by": contract.id},
+        )
     session.commit()
     return contract
 
@@ -1337,6 +1585,20 @@ def complete_purchase(session: Session, purchase_id: str, charged_amount: float)
 # ============================================================
 # Read models for the API
 # ============================================================
+
+
+def list_purchase_outcomes(session: Session, owner: str, contract_id: str | None = None) -> list[dict[str, Any]]:
+    """The owner's purchases (optionally for one contract), newest first, as {purchase, decision, credential}."""
+    outcomes: list[dict[str, Any]] = []
+    for purchase in db.list_purchases(session, owner, contract_id):
+        outcomes.append(
+            {
+                "purchase": purchase,
+                "decision": db.load_decision(session, purchase.decision_id),
+                "credential": db.load_credential(session, purchase.credential_id),
+            }
+        )
+    return outcomes
 
 
 def summarize(purchase: Purchase, decision: ValidationDecision | None) -> str:

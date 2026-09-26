@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -75,6 +75,20 @@ def draft_payload() -> dict[str, Any]:
         ],
         "created_at": "2026-09-26T10:00:00Z",
     }
+
+
+def api_draft_payload() -> dict[str, Any]:
+    """
+    The demo draft for API tests, with a ROLLING deadline 14 days from now.
+
+    Signing re-runs lint, and lint refuses a deadline in the past. With the
+    fixed 2026-10-10 date the API tests would start failing on 2026-10-11.
+    The engine tests keep the fixed dates (they evaluate at a fixed EVAL_TIME).
+    """
+    payload = draft_payload()
+    deadline = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(days=14)
+    payload["delivery"] = {**payload["delivery"], "deliver_by": deadline.isoformat()}
+    return payload
 
 
 def proposal_payload(contract_id: str = "contract_demo") -> dict[str, Any]:
@@ -154,7 +168,7 @@ def passing_proposal() -> TransactionProposal:
 @pytest.fixture
 def draft_json() -> dict[str, Any]:
     """A fresh copy of the draft JSON that a test may modify freely."""
-    return copy.deepcopy(draft_payload())
+    return copy.deepcopy(api_draft_payload())
 
 
 @pytest.fixture

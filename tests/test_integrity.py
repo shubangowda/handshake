@@ -32,7 +32,15 @@ def test_there_is_exactly_one_models_py() -> None:
         for path in REPO_ROOT.rglob("models.py")
         if not (set(path.relative_to(REPO_ROOT).parts) & skip)
     ]
-    # ajay_mcp/models.py is Ajay's as-delivered import; it is removed when his
-    # files are integrated (milestone 5), after which only the canonical copy remains.
-    copies = [c for c in copies if not c.startswith("ajay_mcp/")]
     assert copies == ["handshake/models.py"]
+
+
+# SHA-256 of Ajay's COMPILER_PROMPT string exactly as delivered in prompts.py.
+CANONICAL_COMPILER_PROMPT_SHA256 = "1dda5a8ab6f2a765ab89e0c1fcacc51b9130c5c0be138c3c339db9ac59216f98"
+
+
+def test_compiler_prompt_is_word_for_word() -> None:
+    """COMPILER_PROMPT must stay exactly Ajay's text; new instructions go in separate constants."""
+    from handshake.prompts import COMPILER_PROMPT
+
+    assert hashlib.sha256(COMPILER_PROMPT.encode("utf-8")).hexdigest() == CANONICAL_COMPILER_PROMPT_SHA256

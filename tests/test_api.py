@@ -21,7 +21,7 @@ from httpx import Response
 
 from handshake import db, services
 from handshake.config import get_settings
-from conftest import Mutator, draft_payload, proposal_payload
+from conftest import Mutator, api_draft_payload, proposal_payload
 
 
 # ------------------------------------------------------------
@@ -31,7 +31,7 @@ from conftest import Mutator, draft_payload, proposal_payload
 
 def sign(client: TestClient, **draft_overrides: Any) -> str:
     """Create the demo draft (with optional overrides), sign it, and return the new contract id."""
-    draft = {**draft_payload(), **draft_overrides}
+    draft = {**api_draft_payload(), **draft_overrides}
     assert client.post("/contracts", json=draft).status_code == 201
     response = client.post(f"/contracts/{draft['id']}/sign", json={"draft_id": draft["id"], "agent_key": "agent_1"})
     assert response.status_code == 200, response.json()
@@ -132,7 +132,7 @@ HAPPY_PATH_EVENTS = [
 # 1. Full happy path
 def test_full_happy_path_end_to_end(client: TestClient) -> None:
     """Create -> sign -> purchase: AUTHORIZED, exact-amount credential, contract USED, full evidence story."""
-    created = client.post("/contracts", json=draft_payload())
+    created = client.post("/contracts", json=api_draft_payload())
     assert created.status_code == 201
     signed = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes"})
     assert signed.status_code == 200
@@ -260,7 +260,7 @@ def find_credential_leaks(value: Any, path: str = "$") -> list[str]:
 def test_no_raw_credential_in_any_happy_path_response(client: TestClient) -> None:
     """Every JSON body from every endpoint in the happy path is free of card-number/CVV-like keys and values."""
     bodies: dict[str, Any] = {}
-    bodies["POST /contracts"] = client.post("/contracts", json=draft_payload()).json()
+    bodies["POST /contracts"] = client.post("/contracts", json=api_draft_payload()).json()
     bodies["GET /contracts/{draft}"] = client.get("/contracts/draft_demo_shoes").json()
     signed = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes"}).json()
     bodies["POST /contracts/{id}/sign"] = signed

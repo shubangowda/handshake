@@ -38,7 +38,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
-from handshake import auth, db, services
+from handshake import auth, compiler, db, services
 from handshake.auth import AuthError, Principal, current_principal
 from handshake.config import get_settings
 from handshake.models import (
@@ -94,6 +94,29 @@ class CompleteRequest(BaseModel):
     charged_amount: float = Field(ge=0)
 
 
+class CompileRequest(BaseModel):
+    """Body for POST /drafts/compile: the user's shopping request in their own words."""
+
+    intent: str = Field(min_length=1, max_length=4000)
+
+
+class DraftPatch(BaseModel):
+    """
+    Body for PATCH /drafts/{id} (Rohan's DraftPatch). Every field is optional;
+    only the keys actually sent are applied (model_fields_set decides).
+    Unknown keys are refused, so a typo can't silently do nothing.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    goal: str | None = None
+    target: float | None = None
+    hard_cap_all_in: float | None = None
+    max_shipping: float | None = None
+    deliver_by: datetime | None = None
+    constraints: list[dict[str, Any]] | None = None
+
+
 class DemoLoginRequest(BaseModel):
     """Body for POST /auth/demo-login. DEMO ONLY: anyone who types an email gets a token."""
 
@@ -146,6 +169,19 @@ async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Give FastAPI's own body-validation failures the same error shape as everything else."""
     return error_response(422, "invalid_request", "Request body failed validation.", {"errors": _clean_errors(exc.errors())})
+
+
+# How each compile failure maps to HTTP. The body always carries the code.
+COMPILE_ERROR_STATUS = {
+    "timeout": 504,
+    "provider_error": 502,
+    "missing_api_key": 503,
+}
+
+
+def compile_error(exc: compiler.CompileError) -> ServiceError:
+    """Turn a CompileError into the standard API error (no draft was created)."""
+    return ServiceError(COMPILE_ERROR_STATUS.get(exc.code, 422), exc.code, exc.message, {"draft_created": False, **exc.details})
 
 
 # ============================================================
@@ -316,6 +352,85 @@ def sign_contract(
     )
 
 
+@router.post("/contracts/{contract_id}/amend")
+def amend_contract(
+    contract_id: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """Start a new version of a signed contract as a draft (previous_contract_id points back). User only."""
+    require_user(session, principal, "amend a contract", contract_id=contract_id)
+    return services.amend_contract(session, contract_id, owner=principal.email)
+
+
+@router.get("/contracts/{contract_id}/purchases", response_model=list[PurchaseResponse])
+def list_contract_purchases(
+    contract_id: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> list[PurchaseResponse]:
+    """Every purchase attempt against one of the caller's contracts, newest first."""
+    services._require_contract(session, contract_id, principal.email)
+    return [_purchase_response(item) for item in services.list_purchase_outcomes(session, principal.email, contract_id)]
+
+
+# ============================================================
+# Drafts
+# ============================================================
+
+
+@router.post("/drafts/compile", status_code=201)
+async def compile_draft(
+    body: CompileRequest,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """
+    Compile a shopping request into a DRAFT (user or agent). It has no authority until the user signs it.
+
+    The compiler only sees the user's words plus trusted date context; the
+    result is linted and stored, and review_url is where the user reviews it.
+    """
+    try:
+        result = await compiler.compile_intent(body.intent, now=services.clock())
+    except compiler.CompileError as exc:
+        raise compile_error(exc)
+    stored = services.store_compiled_draft(session, result, owner=principal.email)
+    return {**stored["record"], "compiler_source": result.source}
+
+
+@router.get("/drafts")
+def list_drafts(
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> list[dict[str, Any]]:
+    """The caller's drafts, newest first, as DraftRecords (ContractDraft fields flattened with the compiler metadata)."""
+    return services.list_draft_records(session, principal.email)
+
+
+@router.get("/drafts/{draft_id}")
+def get_draft(
+    draft_id: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """One draft as a DraftRecord."""
+    return services.get_draft_record(session, draft_id, principal.email)
+
+
+@router.patch("/drafts/{draft_id}")
+def patch_draft(
+    draft_id: str,
+    body: DraftPatch,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """Edit an unsigned draft (user only). Edited values become source=user; lint re-runs."""
+    require_user(session, principal, "edit a draft", draft_id=draft_id)
+    patch = body.model_dump(mode="json", include=body.model_fields_set)
+    return services.patch_draft(session, draft_id, patch, owner=principal.email)
+
+
 @router.post("/contracts/{contract_id}/revoke", response_model=Contract)
 def revoke_contract(
     contract_id: str,
@@ -380,6 +495,15 @@ def create_purchase(
         principal=principal,
     )
     return _purchase_response(outcome)
+
+
+@router.get("/purchases", response_model=list[PurchaseResponse])
+def list_purchases(
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> list[PurchaseResponse]:
+    """The caller's purchases across all contracts, newest first."""
+    return [_purchase_response(item) for item in services.list_purchase_outcomes(session, principal.email)]
 
 
 @router.get("/purchases/{purchase_id}", response_model=PurchaseResponse)

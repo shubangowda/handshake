@@ -19,12 +19,12 @@ from fastapi.testclient import TestClient
 
 from handshake import auth, db, services
 from handshake.config import override_settings
-from conftest import draft_payload, proposal_payload
+from conftest import api_draft_payload, proposal_payload
 
 
 def sign(client: TestClient, **overrides: Any) -> str:
     """Create and sign the demo draft as the user; return the contract id."""
-    draft = {**draft_payload(), **overrides}
+    draft = {**api_draft_payload(), **overrides}
     assert client.post("/contracts", json=draft).status_code == 201
     response = client.post(f"/contracts/{draft['id']}/sign")
     assert response.status_code == 200, response.json()
@@ -60,7 +60,7 @@ def last_event(contract_or_draft_id: str) -> dict[str, Any]:
 
 def test_agent_cannot_sign(client: TestClient, agent_client: TestClient) -> None:
     """Signing is the user's consent; the agent gets 403 and the attempt is recorded."""
-    assert client.post("/contracts", json=draft_payload()).status_code == 201
+    assert client.post("/contracts", json=api_draft_payload()).status_code == 201
     response = agent_client.post("/contracts/draft_demo_shoes/sign")
     assert response.status_code == 403
     assert response.json()["error"] == "agent_not_permitted"
@@ -102,7 +102,7 @@ def test_agent_cannot_revoke(client: TestClient, agent_client: TestClient) -> No
 
 def test_agent_cannot_create_raw_drafts(agent_client: TestClient) -> None:
     """The agent drafts only through the compiler (POST /drafts/compile), never by posting a raw draft."""
-    response = agent_client.post("/contracts", json=draft_payload())
+    response = agent_client.post("/contracts", json=api_draft_payload())
     assert response.status_code == 403
     assert response.json()["error"] == "agent_not_permitted"
 
@@ -129,7 +129,7 @@ def test_agent_can_read_and_request(client: TestClient, agent_client: TestClient
 
 def test_wrong_agent_key_is_rejected(client: TestClient, agent_client: TestClient) -> None:
     """A contract signed for another agent can't be used by this one, and the refusal is recorded."""
-    assert client.post("/contracts", json=draft_payload()).status_code == 201
+    assert client.post("/contracts", json=api_draft_payload()).status_code == 201
     contract_id = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes", "agent_key": "agent_other"}).json()["id"]
 
     response = submit(agent_client, contract_id)
@@ -166,7 +166,7 @@ def test_foreign_records_are_404(client: TestClient, stranger_client: TestClient
 
 def test_stranger_cannot_act_on_foreign_records(client: TestClient, stranger_client: TestClient) -> None:
     """Writes on foreign ids get the same 404 as reads, and change nothing."""
-    assert client.post("/contracts", json=draft_payload()).status_code == 201
+    assert client.post("/contracts", json=api_draft_payload()).status_code == 201
     assert stranger_client.post("/contracts/draft_demo_shoes/sign").status_code == 404
 
     contract_id, purchase_id = escalated(client, id="draft_second")
