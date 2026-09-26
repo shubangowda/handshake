@@ -1,0 +1,59 @@
+# ------------------------------------------------------------
+# Secrets: every .env and .env.* at any depth, EXCEPT the .example templates.
+# ------------------------------------------------------------
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Link CLI temp card files, sessions, and any private key material
+.link-tmp/
+**/.link-tmp/
+*.pem
+*.key
+link-card*.json
+
+# ------------------------------------------------------------
+# Owner's copies of the teammates' original deliveries (never committed)
+# ------------------------------------------------------------
+_incoming/
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+venv/
+.venv/
+**/venv/
+**/.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# ------------------------------------------------------------
+# Node / Next.js (frontend/)
+# ------------------------------------------------------------
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+
+# Playwright artifacts from the headless UI check
+test-results/
+playwright-report/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
