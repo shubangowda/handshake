@@ -300,6 +300,30 @@ class PaymentRow(Base):
     receipt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+class DeviceAuthorizationRow(Base):
+    """
+    One "connect this agent to my Handshake account" request (OAuth 2.0 device
+    authorization grant, RFC 8628 style; see auth.py).
+
+    The device_code is a secret the agent holds, so only its SHA-256 is stored.
+    The user_code is the short code the user sees ("KDQM-TXBW").
+    """
+
+    __tablename__ = "device_authorizations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    device_code_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    user_code: Mapped[str] = mapped_column(String, unique=True, index=True)
+    client_id: Mapped[str] = mapped_column(String)  # becomes the agent id in the issued token
+    client_name: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, index=True)  # pending / approved / denied / consumed
+    owner: Mapped[str | None] = mapped_column(String, nullable=True)  # the user who approved
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 # The evidence ledger is APPEND-ONLY BY DESIGN. This module has an insert
 # helper and read helpers for it, and deliberately no update or delete
 # helper. Nothing in the app can rewrite history.

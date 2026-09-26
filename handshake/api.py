@@ -26,6 +26,7 @@ the same way:
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -122,6 +123,30 @@ class DraftPatch(BaseModel):
     constraints: list[dict[str, Any]] | None = None
 
 
+class DeviceAuthorizationRequest(BaseModel):
+    """Body for POST /oauth/device_authorization: which agent wants to connect."""
+
+    client_id: str
+    client_name: str | None = None
+
+
+class TokenRequest(BaseModel):
+    """Body for POST /oauth/token (device code grant)."""
+
+    grant_type: str
+    device_code: str
+    client_id: str
+
+
+class DeviceDecision(BaseModel):
+    """Body for approving or denying a connect request."""
+
+    user_code: str
+
+
+DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+
+
 class DemoLoginRequest(BaseModel):
     """Body for POST /auth/demo-login. DEMO ONLY: anyone who types an email gets a token."""
 
@@ -165,6 +190,10 @@ async def service_error_handler(request: Request, exc: ServiceError) -> JSONResp
 async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
     """Turn authentication/permission failures into the standard error JSON."""
     response = error_response(exc.status_code, exc.code, exc.message)
+    # OAuth clients read `error_description` (RFC 6749); add it alongside our own `message`.
+    body = json.loads(response.body)
+    body["error_description"] = exc.message
+    response = JSONResponse(status_code=exc.status_code, content=body)
     if exc.status_code == 401:
         # Tells HTTP clients which scheme to use; harmless for browsers.
         response.headers["WWW-Authenticate"] = "Bearer"
@@ -231,6 +260,72 @@ def demo_login(body: DemoLoginRequest) -> dict[str, Any]:
         "expires_at": expires_at,
         "demo_auth": True,
     }
+
+
+# ------------------------------------------------------------
+# Connecting an agent: OAuth 2.0 device authorization grant (RFC 8628 style)
+# ------------------------------------------------------------
+
+
+@router.get("/.well-known/oauth-authorization-server")
+def oauth_metadata() -> dict[str, Any]:
+    """Discovery document so OAuth-aware clients can find the device and token endpoints."""
+    base = get_settings().api_url
+    return {
+        "issuer": base,
+        "device_authorization_endpoint": f"{base}/oauth/device_authorization",
+        "token_endpoint": f"{base}/oauth/token",
+        "grant_types_supported": [DEVICE_CODE_GRANT],
+        "scopes_supported": ["handshake.agent"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "service_documentation": f"{get_settings().frontend_url}/connect",
+    }
+
+
+@router.post("/oauth/device_authorization")
+def device_authorization(body: DeviceAuthorizationRequest, session: Session = Depends(db.get_session)) -> dict[str, Any]:
+    """Start connecting an agent. The agent shows the user `verification_uri_complete`; the user logs in and approves."""
+    return auth.start_device_authorization(session, body.client_id, body.client_name)
+
+
+@router.post("/oauth/token")
+def oauth_token(body: TokenRequest, session: Session = Depends(db.get_session)) -> dict[str, Any]:
+    """The agent polls here with its device_code until the user approves; then it gets an agent token (once)."""
+    if body.grant_type != DEVICE_CODE_GRANT:
+        raise AuthError(400, "unsupported_grant_type", f"Only {DEVICE_CODE_GRANT} is supported.")
+    return auth.exchange_device_code(session, body.device_code, body.client_id)
+
+
+@router.get("/oauth/device")
+def describe_device(
+    user_code: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """For the approval screen: which agent is asking to connect. Users only."""
+    if principal.is_agent:
+        raise AuthError(403, "agent_not_permitted", "Only the user reviews connect requests.")
+    return auth.describe_device_authorization(session, user_code)
+
+
+@router.post("/oauth/device/approve")
+def approve_device(
+    body: DeviceDecision,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """The USER approves connecting the agent to their account (an agent calling this gets 403)."""
+    return auth.decide_device_authorization(session, principal, body.user_code, approve=True)
+
+
+@router.post("/oauth/device/deny")
+def deny_device(
+    body: DeviceDecision,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> dict[str, Any]:
+    """The user declines connecting the agent."""
+    return auth.decide_device_authorization(session, principal, body.user_code, approve=False)
 
 
 @router.get("/auth/me")

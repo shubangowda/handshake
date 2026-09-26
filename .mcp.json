@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "handshake": {
+      "type": "stdio",
+      "command": ".venv/bin/handshake-mcp",
+      "args": [],
+      "env": {
+        "HANDSHAKE_API_URL": "${HANDSHAKE_API_URL:-}",
+        "HANDSHAKE_FRONTEND_URL": "${HANDSHAKE_FRONTEND_URL:-}",
+        "HANDSHAKE_AGENT_TOKEN": "${HANDSHAKE_AGENT_TOKEN:-}"
+      }
+    }
+  }
+}
