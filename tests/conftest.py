@@ -32,9 +32,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["HANDSHAKE_SKIP_DOTENV"] = "1"
 os.environ.setdefault("HANDSHAKE_SIGNING_SECRET", "test-secret")
 os.environ.setdefault("HANDSHAKE_SESSION_SECRET", "test-session-secret")
+# The shopping agent's static token, and the user it acts for.
+os.environ["HANDSHAKE_AGENT_TOKEN"] = "test-agent-token"
+os.environ["HANDSHAKE_AGENT_OWNER"] = "demo@handshake.dev"
+os.environ["HANDSHAKE_AGENT_ID"] = "agent_demo"
 
 from handshake import db  # noqa: E402  (must come after the environment setup)
 from handshake.models import Contract, ContractDraft, TransactionProposal  # noqa: E402
+
+# The logged-in test user. The agent (above) acts for this same user, so the
+# agent can see the user's records; OTHER_USER is a stranger.
+TEST_USER = "demo@handshake.dev"
+OTHER_USER = "stranger@example.com"
+AGENT_TOKEN = "test-agent-token"
 
 # Every engine test evaluates at this exact moment, so results never depend
 # on when the tests happen to run.
@@ -156,12 +166,68 @@ def test_db(tmp_path: Path) -> Iterator[Any]:
     db.engine.dispose()
 
 
+def bearer(token: str) -> dict[str, str]:
+    """The Authorization header for a token."""
+    return {"Authorization": f"Bearer {token}"}
+
+
+def user_headers(email: str = TEST_USER) -> dict[str, str]:
+    """Authorization header carrying a fresh demo login token for `email`."""
+    from handshake.auth import issue_user_token
+
+    token, _ = issue_user_token(email)
+    return bearer(token)
+
+
 @pytest.fixture
-def client(test_db: Any) -> Iterator[Any]:
-    """A FastAPI TestClient using the temporary database."""
+def api_app(test_db: Any) -> Any:
+    """A fresh FastAPI app built from the current settings."""
+    from handshake.api import create_app
+
+    return create_app()
+
+
+@pytest.fixture
+def client(api_app: Any) -> Iterator[Any]:
+    """A TestClient logged in as TEST_USER (every existing API test runs as the user)."""
     from fastapi.testclient import TestClient
 
-    from handshake.api import app
-
-    with TestClient(app) as test_client:
+    with TestClient(api_app, headers=user_headers()) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def agent_client(api_app: Any) -> Iterator[Any]:
+    """A TestClient authenticated as the shopping agent (acts for TEST_USER)."""
+    from fastapi.testclient import TestClient
+
+    with TestClient(api_app, headers=bearer(AGENT_TOKEN)) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def stranger_client(api_app: Any) -> Iterator[Any]:
+    """A TestClient logged in as a different user, who must not see TEST_USER's records."""
+    from fastapi.testclient import TestClient
+
+    with TestClient(api_app, headers=user_headers(OTHER_USER)) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def anon_client(api_app: Any) -> Iterator[Any]:
+    """A TestClient with no credentials at all."""
+    from fastapi.testclient import TestClient
+
+    with TestClient(api_app) as test_client:
+        yield test_client
+
+
+@pytest.fixture(autouse=True)
+def fresh_settings() -> Iterator[None]:
+    """Reload settings from the (test) environment before each test and after it, so overrides never leak."""
+    from handshake import config
+
+    config.reset_settings()
+    yield
+    config.reset_settings()

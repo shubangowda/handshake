@@ -151,6 +151,8 @@ class DraftRow(Base):
     __tablename__ = "drafts"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    # The user (email) who owns this record. Every read and write checks it.
+    owner: Mapped[str] = mapped_column(String, index=True, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     signed_contract_id: Mapped[str | None] = mapped_column(String, nullable=True)
     data: Mapped[dict] = mapped_column(JSON)
@@ -164,6 +166,8 @@ class ContractRow(Base):
     __tablename__ = "contracts"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    # The user (email) who owns this record. Every read and write checks it.
+    owner: Mapped[str] = mapped_column(String, index=True, default="")
     draft_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     status: Mapped[str] = mapped_column(String, index=True)
     contract_hash: Mapped[str] = mapped_column(String)
@@ -215,6 +219,8 @@ class PurchaseRow(Base):
     __tablename__ = "purchases"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    # The user (email) who owns this record. Every read and write checks it.
+    owner: Mapped[str] = mapped_column(String, index=True, default="")
     contract_id: Mapped[str] = mapped_column(String, index=True)
     proposal_id: Mapped[str | None] = mapped_column(String, nullable=True)
     decision_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -286,11 +292,12 @@ class EvidenceRow(Base):
 # ============================================================
 
 
-def save_draft(session: Session, draft: ContractDraft, meta: dict[str, Any] | None = None) -> None:
-    """Insert a new unsigned draft (plus compiler metadata)."""
+def save_draft(session: Session, draft: ContractDraft, meta: dict[str, Any] | None = None, owner: str = "") -> None:
+    """Insert a new unsigned draft (plus compiler metadata) owned by `owner`."""
     session.add(
         DraftRow(
             id=draft.id,
+            owner=owner,
             created_at=draft.created_at,
             data=_dump(draft),
             meta=meta or {},
@@ -313,9 +320,11 @@ def mark_draft_signed(session: Session, draft_id: str, contract_id: str) -> None
     session.get(DraftRow, draft_id).signed_contract_id = contract_id
 
 
-def list_drafts(session: Session) -> list[DraftRow]:
-    """All drafts, newest first."""
+def list_drafts(session: Session, owner: str | None = None) -> list[DraftRow]:
+    """All drafts (of `owner`, if given), newest first."""
     query = select(DraftRow).order_by(DraftRow.created_at.desc())
+    if owner is not None:
+        query = query.where(DraftRow.owner == owner)
     return list(session.scalars(query))
 
 
@@ -324,11 +333,12 @@ def list_drafts(session: Session) -> list[DraftRow]:
 # ============================================================
 
 
-def save_contract(session: Session, contract: Contract, draft_id: str | None = None) -> None:
-    """Insert a newly signed contract."""
+def save_contract(session: Session, contract: Contract, draft_id: str | None = None, owner: str = "") -> None:
+    """Insert a newly signed contract owned by `owner`."""
     session.add(
         ContractRow(
             id=contract.id,
+            owner=owner,
             draft_id=draft_id,
             status=contract.status.value,
             contract_hash=contract.contract_hash,
@@ -441,9 +451,11 @@ def claim_purchase_status(session: Session, purchase_id: str, from_status: str, 
     return True
 
 
-def list_contracts(session: Session) -> list[ContractRow]:
-    """All signed contracts, newest first."""
+def list_contracts(session: Session, owner: str | None = None) -> list[ContractRow]:
+    """All signed contracts (of `owner`, if given), newest first."""
     query = select(ContractRow).order_by(ContractRow.signed_at.desc())
+    if owner is not None:
+        query = query.where(ContractRow.owner == owner)
     return list(session.scalars(query))
 
 
@@ -529,9 +541,9 @@ def _purchase_columns(purchase: Purchase) -> dict[str, Any]:
     }
 
 
-def save_purchase(session: Session, purchase: Purchase) -> None:
-    """Insert a new purchase."""
-    session.add(PurchaseRow(id=purchase.id, **_purchase_columns(purchase)))
+def save_purchase(session: Session, purchase: Purchase, owner: str = "") -> None:
+    """Insert a new purchase owned by `owner` (always the contract's owner)."""
+    session.add(PurchaseRow(id=purchase.id, owner=owner, **_purchase_columns(purchase)))
 
 
 def update_purchase(session: Session, purchase: Purchase) -> None:

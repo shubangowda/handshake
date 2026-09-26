@@ -78,6 +78,39 @@ def tamper_with_cap(contract_id: str, new_cap: float) -> None:
         session.commit()
 
 
+class ServiceResult:
+    """A tiny stand-in for an HTTP response, for service-layer calls (same .status_code / .json())."""
+
+    def __init__(self, status_code: int, body: dict[str, Any]) -> None:
+        """Keep the status code and JSON body."""
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict[str, Any]:
+        """The JSON body, like httpx.Response.json()."""
+        return self._body
+
+
+def complete(purchase_id: str, charged_amount: float) -> ServiceResult:
+    """
+    Reconcile a purchase through the SERVICE layer.
+
+    POST /purchases/{id}/complete is internal now (403 over HTTP; the payment
+    flow calls it after verifying the merchant order). These tests keep their
+    exact assertions by calling the same service function and rendering the
+    result exactly as the old route did.
+    """
+    from handshake.api import _purchase_response
+    from handshake.services import ServiceError
+
+    with db.SessionLocal() as session:
+        try:
+            outcome = services.complete_purchase(session, purchase_id, charged_amount)
+            return ServiceResult(200, _purchase_response(outcome).model_dump(mode="json"))
+        except ServiceError as exc:
+            return ServiceResult(exc.status_code, {"error": exc.code, "message": exc.message, "details": exc.details})
+
+
 # The full expected evidence story for a successful purchase.
 HAPPY_PATH_EVENTS = [
     "contract_created",
@@ -241,7 +274,7 @@ def test_no_raw_credential_in_any_happy_path_response(client: TestClient) -> Non
     purchase_id = created["purchase_id"]
     bodies["GET /purchases/{id}"] = client.get(f"/purchases/{purchase_id}").json()
     bodies["GET /evidence/{id} (authorized)"] = client.get(f"/evidence/{purchase_id}").json()
-    bodies["POST /purchases/{id}/complete"] = client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 128.39}).json()
+    bodies["POST /purchases/{id}/complete"] = complete(purchase_id, 128.39).json()
     bodies["GET /evidence/{id} (completed)"] = client.get(f"/evidence/{purchase_id}").json()
     bodies["GET /health"] = client.get("/health").json()
 
@@ -383,7 +416,12 @@ def test_malformed_submission_without_known_contract_is_plain_422(client: TestCl
 
 def test_health(client: TestClient) -> None:
     """/health reports ok and the database type."""
-    assert client.get("/health").json() == {"status": "ok", "database": "sqlite"}
+    body = client.get("/health").json()
+    # The original two keys, unchanged...
+    assert {"status": body["status"], "database": body["database"]} == {"status": "ok", "database": "sqlite"}
+    # ...plus the modes section 6.1 adds (a superset, never a changed shape).
+    assert body["payment_mode"] == "stub" and body["payment_label"] == "Simulated provider"
+    assert body["credential_mode"] == "agent_visible" and body["compiler_mode"] in ("fixture", "openai")
 
 
 def test_create_draft_returns_id(client: TestClient, draft_json: dict[str, Any]) -> None:
@@ -635,18 +673,18 @@ def test_complete_purchase(client: TestClient) -> None:
     """Charging the authorized amount completes the purchase and uses the credential once."""
     contract_id = sign(client)
     purchase_id = purchase(client, contract_id).json()["purchase_id"]
-    body = client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 128.39}).json()
+    body = complete(purchase_id, 128.39).json()
     assert body["status"] == "completed"
     assert body["credential"]["status"] == "used"
     assert event_types(client, purchase_id)[-2:] == ["credential_used", "payment_completed"]
-    assert client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 1}).status_code == 409
+    assert complete(purchase_id, 1).status_code == 409
 
 
 def test_overcharge_revokes_credential(client: TestClient) -> None:
     """Charging one cent more than authorized fails the purchase and revokes the credential."""
     contract_id = sign(client)
     purchase_id = purchase(client, contract_id).json()["purchase_id"]
-    body = client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 128.40}).json()
+    body = complete(purchase_id, 128.40).json()
     assert body["status"] == "failed"
     assert body["credential"]["status"] == "revoked"
     assert event_types(client, purchase_id)[-1] == "payment_mismatch"
@@ -658,7 +696,7 @@ def test_complete_after_credential_expiry(client: TestClient, monkeypatch: pytes
     purchase_id = purchase(client, contract_id).json()["purchase_id"]
     later = datetime.now(timezone.utc) + timedelta(minutes=get_settings().credential_ttl_minutes + 1)
     monkeypatch.setattr(services, "clock", lambda: later)
-    response = client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 128.39})
+    response = complete(purchase_id, 128.39)
     assert response.status_code == 409
     assert response.json()["error"] == "credential_expired"
 
@@ -667,7 +705,7 @@ def test_complete_blocked_purchase_is_conflict(client: TestClient) -> None:
     """Only AUTHORIZED purchases can be completed."""
     contract_id = sign(client)
     purchase_id = purchase(client, contract_id, lambda p: p.update(currency="EUR")).json()["purchase_id"]
-    assert client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 1}).status_code == 409
+    assert complete(purchase_id, 1).status_code == 409
 
 
 # ============================================================
@@ -685,7 +723,7 @@ def test_credential_uses_computed_total_when_claim_is_lower(client: TestClient) 
     assert purchase_row["authorized_amount"] == 128.39
 
     # The merchant charging the real 128.39 is therefore NOT a mismatch.
-    completed = client.post(f"/purchases/{body['purchase_id']}/complete", json={"charged_amount": 128.39}).json()
+    completed = complete(body['purchase_id'], 128.39).json()
     assert completed["status"] == "completed"
 
 

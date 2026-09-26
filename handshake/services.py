@@ -40,6 +40,7 @@ from pydantic import BaseModel, ValidationError, model_validator
 from sqlalchemy.orm import Session
 
 from handshake import db
+from handshake.auth import Principal
 from handshake.config import DEV_SIGNING_SECRET, get_settings
 from handshake.intent_diff import (
     as_utc,
@@ -247,12 +248,94 @@ def _errors(exc: ValidationError) -> list[dict[str, Any]]:
 
 
 # ============================================================
+# Ownership and role checks
+# ============================================================
+#
+# Every draft, contract, and purchase row has an `owner` (a user email).
+# Public service functions take the caller's owner email and refuse to touch
+# a record owned by someone else. A foreign record gets the SAME 404 as a
+# missing one, so a caller can't learn which ids exist by probing.
+# Passing owner=None means "internal call" (tests and the payment executor)
+# and skips the check.
+
+
+def _check_owner(row_owner: str | None, owner: str | None, code: str, message: str) -> None:
+    """Raise a 404 ServiceError unless `owner` is None (internal) or matches the row's owner."""
+    if owner is not None and row_owner != owner:
+        raise ServiceError(404, code, message)
+
+
+def get_owned_purchase(session: Session, purchase_id: str, owner: str | None) -> Purchase:
+    """Load a purchase the caller owns, or raise 404."""
+    row = session.get(db.PurchaseRow, purchase_id)
+    message = f"No purchase with id {purchase_id!r}."
+    if row is None:
+        raise ServiceError(404, "purchase_not_found", message)
+    _check_owner(row.owner, owner, "purchase_not_found", message)
+    return Purchase.model_validate(row.data)
+
+
+def deny_agent_action(
+    session: Session,
+    principal: Principal,
+    action: str,
+    *,
+    draft_id: str | None = None,
+    contract_id: str | None = None,
+    purchase_id: str | None = None,
+) -> ServiceError:
+    """
+    Record that the AGENT tried a user-only action, and return the 403 to raise.
+
+    Signing, editing drafts, amending, revoking, approving, rejecting, and
+    simulating payment approval are the user's decisions. The agent proposing
+    a purchase must never be able to approve it, and that is enforced HERE, in
+    backend code, not by prompt wording. The attempt is written to the evidence
+    ledger of the record it targeted, so the user can see that it happened.
+
+    The record must exist and belong to the agent's owner; otherwise the
+    caller gets the ordinary 404 (no evidence is written for foreign ids).
+    """
+    ledger_id: str | None = None
+    if purchase_id is not None:
+        purchase = get_owned_purchase(session, purchase_id, principal.email)
+        ledger_id = purchase.contract_id
+    elif contract_id is not None:
+        row = db.get_contract_row(session, contract_id)
+        message = f"No signed contract with id {contract_id!r}."
+        if row is None:
+            raise ServiceError(404, "contract_not_found", message)
+        _check_owner(row.owner, principal.email, "contract_not_found", message)
+        ledger_id = contract_id
+    elif draft_id is not None:
+        row = db.get_draft_row(session, draft_id)
+        message = f"No contract draft with id {draft_id!r}."
+        if row is None:
+            raise ServiceError(404, "draft_not_found", message)
+        _check_owner(row.owner, principal.email, "draft_not_found", message)
+        ledger_id = draft_id
+
+    message = f"The shopping agent is not permitted to {action}; only the user can."
+    if ledger_id is not None:
+        # models.py has no event type for "denied action", so we use the
+        # closest one and put the precise meaning in data.kind.
+        log_event(
+            session, ledger_id, EvidenceEventType.PURCHASE_BLOCKED,
+            f"Refused: the agent tried to {action}.",
+            {"kind": "agent_action_denied", "action": action, "actor": principal.label},
+            purchase_id,
+        )
+        session.commit()
+    return ServiceError(403, "agent_not_permitted", message, {"action": action})
+
+
+# ============================================================
 # Contract lifecycle
 # ============================================================
 
 
-def create_draft(session: Session, body: dict[str, Any]) -> dict[str, Any]:
-    """Store a new draft. Accepts a bare ContractDraft or a CompilerOutput ({"draft": {...}, ...})."""
+def create_draft(session: Session, body: dict[str, Any], owner: str) -> dict[str, Any]:
+    """Store a new draft owned by `owner`. Accepts a bare ContractDraft or a CompilerOutput ({"draft": {...}, ...})."""
     if not isinstance(body, dict):
         raise ServiceError(422, "invalid_draft", "Request body must be a JSON object.")
 
@@ -279,7 +362,7 @@ def create_draft(session: Session, body: dict[str, Any]) -> dict[str, Any]:
         "clarifications_needed": compiler.clarifications_needed,
         "compiler_notes": compiler.compiler_notes,
     }
-    db.save_draft(session, draft, meta)
+    db.save_draft(session, draft, meta, owner=owner)
 
     # Draft events are keyed by the draft id (there is no contract id yet).
     log_event(
@@ -296,13 +379,25 @@ def create_draft(session: Session, body: dict[str, Any]) -> dict[str, Any]:
 def sign_draft(
     session: Session,
     draft_id: str,
+    owner: str | None,
     agent_key: str | None = None,
     client_signature: str | None = None,
 ) -> Contract:
-    """Turn a draft into an ACTIVE signed Contract with a new id, hash, and server signature."""
+    """
+    Turn a draft into an ACTIVE signed Contract with a new id, hash, and server signature.
+
+    Only the user who owns the draft may sign it (api.py refuses agents before
+    this is called). The contract is bound to one agent via agent_key: if the
+    caller names none, it binds to the configured HANDSHAKE_AGENT_ID, so a
+    contract is never usable by "any agent".
+    """
     row = db.get_draft_row(session, draft_id)
+    missing = f"No contract draft with id {draft_id!r}."
     if row is None:
-        raise ServiceError(404, "draft_not_found", f"No contract draft with id {draft_id!r}.")
+        raise ServiceError(404, "draft_not_found", missing)
+    _check_owner(row.owner, owner, "draft_not_found", missing)
+    if not agent_key:
+        agent_key = get_settings().agent_id
     if row.signed_contract_id is not None:
         raise ServiceError(
             409, "already_signed", "This draft has already been signed.", {"contract_id": row.signed_contract_id}
@@ -335,7 +430,7 @@ def sign_draft(
     hash_hex = contract_hash(unsigned)
     contract = unsigned.model_copy(update={"contract_hash": hash_hex, "signature": sign_hash(hash_hex)})
 
-    db.save_contract(session, contract, draft_id=draft_id)
+    db.save_contract(session, contract, draft_id=draft_id, owner=row.owner)
     db.mark_draft_signed(session, draft_id, contract.id)
 
     data: dict[str, Any] = {
@@ -355,20 +450,22 @@ def sign_draft(
     return contract
 
 
-def _require_contract(session: Session, contract_id: str) -> Contract:
-    """Load a contract or raise 404; raise 409 if its stored JSON no longer parses (tampered)."""
+def _require_contract(session: Session, contract_id: str, owner: str | None = None) -> Contract:
+    """Load a contract the caller owns or raise 404; raise 409 if its stored JSON no longer parses (tampered)."""
     row = db.get_contract_row(session, contract_id)
+    missing = f"No signed contract with id {contract_id!r}."
     if row is None:
-        raise ServiceError(404, "contract_not_found", f"No signed contract with id {contract_id!r}.")
+        raise ServiceError(404, "contract_not_found", missing)
+    _check_owner(row.owner, owner, "contract_not_found", missing)
     try:
         return db.contract_from_row(row)
     except ValidationError as exc:
         raise ServiceError(409, "contract_tampered", "Stored contract is no longer valid.", {"errors": _errors(exc)})
 
 
-def revoke_contract(session: Session, contract_id: str) -> Contract:
+def revoke_contract(session: Session, contract_id: str, owner: str | None) -> Contract:
     """Revoke an ACTIVE, revocable contract and revoke any of its credentials that are still usable."""
-    contract = _require_contract(session, contract_id)
+    contract = _require_contract(session, contract_id, owner)
     if not contract.revocable:
         raise ServiceError(409, "not_revocable", "This contract was signed as non-revocable.")
     if contract.status != ContractStatus.ACTIVE:
@@ -594,7 +691,7 @@ def _record_rejected_attempt(
         completed_at=now,
         error=message,
     )
-    db.save_purchase(session, purchase)
+    db.save_purchase(session, purchase, owner=row.owner)
 
     log_event(
         session, row.id, EvidenceEventType.SHOPPING_STARTED,
@@ -620,18 +717,21 @@ def _record_rejected_attempt(
 
 
 def _load_contract_for_purchase(
-    session: Session, contract_id: str, checkout_url: str, raw_proposal: Any
+    session: Session, contract_id: str, checkout_url: str, raw_proposal: Any, principal: Principal | None = None
 ) -> Contract:
     """
     Step 1: load the contract and make sure it can be spent against.
 
-    Unknown id -> plain 404 with no records (there is nothing to attach them to).
-    Known contract but unusable (tampered / expired / used / revoked) ->
-    a BLOCKED purchase with evidence, then 409 with its purchase_id.
+    Unknown or foreign id -> plain 404 with no records (nothing to attach them to).
+    Known contract but unusable (tampered / expired / used / revoked, or bound
+    to a different agent) -> a BLOCKED purchase with evidence, then an error
+    that carries its purchase_id.
     """
     row = db.get_contract_row(session, contract_id)
+    missing = f"No signed contract with id {contract_id!r}."
     if row is None:
-        raise ServiceError(404, "contract_not_found", f"No signed contract with id {contract_id!r}.")
+        raise ServiceError(404, "contract_not_found", missing)
+    _check_owner(row.owner, principal.email if principal else None, "contract_not_found", missing)
 
     def reject(code: str, message: str, extra: dict[str, Any]) -> ServiceError:
         """Shortcut for recording a BLOCKED attempt against this contract."""
@@ -667,6 +767,15 @@ def _load_contract_for_purchase(
             f"contract_{status}",  # contract_used / contract_revoked / contract_expired
             f"Contract is {status}, not active; no purchase can be made against it.",
             {"contract_status": status},
+        )
+
+    # A signed contract names the ONE agent allowed to spend against it
+    # (agent_key). Any other agent is refused, even if it has the same owner.
+    if principal is not None and principal.is_agent and contract.agent_key != principal.agent_id:
+        raise _record_rejected_attempt(
+            session, row, PurchaseStatus.BLOCKED, 403, "agent_not_authorized",
+            "This contract was signed for a different agent; this agent may not use it.",
+            checkout_url, raw_proposal, {"contract_agent_key": contract.agent_key, "agent_id": principal.agent_id},
         )
 
     return contract
@@ -728,6 +837,7 @@ def submit_purchase(
     checkout_url: str,
     selection_report: SelectionReport | None,
     raw_proposal: dict[str, Any],
+    principal: Principal | None = None,
 ) -> dict[str, Any]:
     """
     The full purchase flow: check contract -> record -> parse -> evaluate -> block / escalate / authorize.
@@ -736,11 +846,12 @@ def submit_purchase(
     "credential"}; purchase.status is the effective outcome.
     """
     # ---- Step 1: is the contract usable at all? ------------------------
-    contract = _load_contract_for_purchase(session, contract_id, checkout_url, raw_proposal)
+    contract = _load_contract_for_purchase(session, contract_id, checkout_url, raw_proposal, principal)
+    contract_owner = db.get_contract_row(session, contract.id).owner
 
     # ---- Step 2: create the purchase record ----------------------------
     purchase = Purchase(contract_id=contract.id, currency=contract.spend.currency, created_at=clock())
-    db.save_purchase(session, purchase)
+    db.save_purchase(session, purchase, owner=contract_owner)
 
     shopping_data: dict[str, Any] = {"checkout_url": checkout_url, "selection_report": selection_report}
     # Informational only: the contract asked for a report on how the agent
@@ -974,11 +1085,11 @@ def _authorize(
 # contract, which leaves a new signed record behind, not a one-click override.
 
 
-def _load_escalated(session: Session, purchase_id: str, action: str) -> tuple[Purchase, ValidationDecision]:
-    """Load a purchase and its decision, or raise 404/409 if it is not an escalated purchase."""
-    purchase = db.load_purchase(session, purchase_id)
-    if purchase is None:
-        raise ServiceError(404, "purchase_not_found", f"No purchase with id {purchase_id!r}.")
+def _load_escalated(
+    session: Session, purchase_id: str, action: str, owner: str | None = None
+) -> tuple[Purchase, ValidationDecision]:
+    """Load a purchase the caller owns and its decision, or raise 404/409 if it is not an escalated purchase."""
+    purchase = get_owned_purchase(session, purchase_id, owner)
     if purchase.status != PurchaseStatus.ESCALATED:
         raise ServiceError(
             409, "purchase_not_escalated",
@@ -991,7 +1102,7 @@ def _load_escalated(session: Session, purchase_id: str, action: str) -> tuple[Pu
     return purchase, decision
 
 
-def approve_purchase(session: Session, purchase_id: str, note: str | None = None) -> dict[str, Any]:
+def approve_purchase(session: Session, purchase_id: str, note: str | None = None, owner: str | None = None) -> dict[str, Any]:
     """
     A human approves an ESCALATED purchase: issue the credential exactly like a normal authorization.
 
@@ -999,8 +1110,24 @@ def approve_purchase(session: Session, purchase_id: str, note: str | None = None
       - the purchase is ESCALATED (not blocked, not already approved/rejected)
       - its decision contains zero hard FAIL results
       - the contract is still ACTIVE, not expired, and its hash/signature verify
+      - the escalation is fresh (younger than HANDSHAKE_ESCALATION_TTL_MINUTES)
     """
-    purchase, decision = _load_escalated(session, purchase_id, "approved")
+    purchase, decision = _load_escalated(session, purchase_id, "approved", owner)
+
+    # --- Stale escalations cannot be approved ----------------------------
+    # The checkout was evaluated at decision.evaluated_at. Prices, stock, and
+    # delivery promises change, so approving facts that are an hour old could
+    # approve a checkout that no longer exists in that form. Past the TTL the
+    # agent must request the purchase again, which re-extracts the checkout.
+    ttl = timedelta(minutes=get_settings().escalation_ttl_minutes)
+    age = clock() - as_utc(decision.evaluated_at)[0]
+    if age > ttl:
+        raise ServiceError(
+            409, "escalation_stale",
+            f"This escalation is {int(age.total_seconds() // 60)} minutes old (limit {int(ttl.total_seconds() // 60)}). "
+            "Prices may have changed; ask the agent to request the purchase again.",
+            {"evaluated_at": decision.evaluated_at.isoformat()},
+        )
 
     # --- Never override a FAIL -------------------------------------------
     # compute_outcome would already have BLOCKED any hard FAIL, so this should
@@ -1018,7 +1145,7 @@ def approve_purchase(session: Session, purchase_id: str, note: str | None = None
         )
 
     # --- The contract must still be spendable -----------------------------
-    contract = _require_contract(session, purchase.contract_id)  # 404, or 409 if its JSON no longer parses
+    contract = _require_contract(session, purchase.contract_id, owner)  # 404, or 409 if its JSON no longer parses
     contract = expire_if_needed(session, contract)
     verification = verify_contract(contract)
     if not verification["valid"]:
@@ -1088,9 +1215,9 @@ def approve_purchase(session: Session, purchase_id: str, note: str | None = None
     return {"purchase": purchase, "decision": decision, "credential": credential}
 
 
-def reject_purchase(session: Session, purchase_id: str, note: str | None = None) -> dict[str, Any]:
+def reject_purchase(session: Session, purchase_id: str, note: str | None = None, owner: str | None = None) -> dict[str, Any]:
     """A human rejects an ESCALATED purchase: it becomes BLOCKED and no credential is ever issued."""
-    purchase, decision = _load_escalated(session, purchase_id, "rejected")
+    purchase, decision = _load_escalated(session, purchase_id, "rejected", owner)
 
     # Same conditional UPDATE as approval, so approve and reject racing each
     # other cannot both succeed: whichever runs first wins, the other gets 409.
@@ -1111,7 +1238,9 @@ def reject_purchase(session: Session, purchase_id: str, note: str | None = None)
     return {"purchase": purchase, "decision": decision, "credential": None}
 
 
-def record_malformed_submission(session: Session, body: Any, errors: list[dict[str, Any]]) -> str | None:
+def record_malformed_submission(
+    session: Session, body: Any, errors: list[dict[str, Any]], owner: str | None = None
+) -> str | None:
     """
     Record a POST /purchases body that did not even match PurchaseSubmission.
 
@@ -1121,8 +1250,8 @@ def record_malformed_submission(session: Session, body: Any, errors: list[dict[s
     if not isinstance(body, dict) or not isinstance(body.get("contract_id"), str):
         return None
     row = db.get_contract_row(session, body["contract_id"])
-    if row is None:
-        return None
+    if row is None or (owner is not None and row.owner != owner):
+        return None  # unknown or foreign contract: nothing to attach records to
 
     checkout_url = body.get("checkout_url") if isinstance(body.get("checkout_url"), str) else None
     error = _record_rejected_attempt(
@@ -1248,11 +1377,9 @@ CONTRACT_LEVEL_EVENTS = {
 }
 
 
-def evidence_chain(session: Session, purchase_id: str) -> dict[str, Any]:
+def evidence_chain(session: Session, purchase_id: str, owner: str | None = None) -> dict[str, Any]:
     """Everything the frontend needs to tell one purchase's story, in a single response."""
-    purchase = db.load_purchase(session, purchase_id)
-    if purchase is None:
-        raise ServiceError(404, "purchase_not_found", f"No purchase with id {purchase_id!r}.")
+    purchase = get_owned_purchase(session, purchase_id, owner)
 
     contract_row = db.get_contract_row(session, purchase.contract_id)
 
