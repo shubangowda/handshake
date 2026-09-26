@@ -259,3 +259,26 @@ def fresh_settings() -> Iterator[None]:
     config.reset_settings()
     yield
     config.reset_settings()
+
+
+@pytest.fixture
+def merchant_env(api_app: Any) -> Iterator[Any]:
+    """
+    Wire the backend to an IN-PROCESS mock merchant: the real MockMerchantExtractor
+    and the payment executor both reach it through the shared merchant client
+    factory. Yields a TestClient for the merchant (the "agent's browser").
+    """
+    from fastapi.testclient import TestClient
+
+    from handshake import extractor, merchant
+    from handshake.config import get_settings
+
+    merchant_app = merchant.create_app()
+    extractor.set_merchant_client_factory(
+        lambda settings: TestClient(merchant_app, base_url=settings.merchant_url, follow_redirects=False)
+    )
+    api_app.dependency_overrides.pop(extractor.get_extractor, None)  # the REAL extractor
+    try:
+        yield TestClient(merchant_app, base_url=get_settings().merchant_url, follow_redirects=False)
+    finally:
+        extractor.set_merchant_client_factory(None)

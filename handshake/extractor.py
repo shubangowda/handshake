@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -89,6 +90,8 @@ class Extraction:
     raw_proposal: dict[str, Any]
     evidence: dict[str, Any] = field(default_factory=dict)
     snapshot_hash: str | None = None
+    # What the checkout-link parser learned about the URL itself (None for test extractors).
+    link: dict[str, Any] | None = None
 
 
 class Extractor(Protocol):
@@ -155,6 +158,18 @@ def check_url_allowed(url: str, settings: Settings) -> None:
 def default_client_factory(settings: Settings) -> httpx.Client:
     """The production HTTP client: bounded timeout, and NO automatic redirects (we check each hop)."""
     return httpx.Client(timeout=settings.http_timeout_seconds, follow_redirects=False)
+
+
+# Every backend call to a merchant (extraction here, plus pay and order
+# lookups in payments.py) builds its HTTP client through this one factory.
+# End-to-end tests point it at an in-process merchant app; production leaves it alone.
+merchant_client_factory: Callable[[Settings], httpx.Client] = default_client_factory
+
+
+def set_merchant_client_factory(factory: Callable[[Settings], httpx.Client] | None) -> None:
+    """Route merchant HTTP calls through `factory` (None restores the real network client)."""
+    global merchant_client_factory
+    merchant_client_factory = factory or default_client_factory
 
 
 def safe_get(client: httpx.Client, url: str, settings: Settings) -> tuple[bytes, str]:
@@ -409,7 +424,7 @@ class MockMerchantExtractor:
     def __init__(self, settings: Settings | None = None, client_factory: Callable[[Settings], httpx.Client] | None = None) -> None:
         """client_factory lets tests route requests to an in-process merchant app."""
         self.settings = settings or get_settings()
-        self.client_factory = client_factory or default_client_factory
+        self.client_factory = client_factory or merchant_client_factory
 
     def feed_url(self, checkout_url: str) -> str:
         """The structured feed for a checkout page: /checkout/{id} -> /api/checkout/{id}."""
@@ -468,7 +483,138 @@ class MockMerchantExtractor:
             "pay_url": feed_facts.get("pay_url"),
         }
         proposal["evidence"] = evidence
-        return Extraction(raw_proposal=proposal, evidence=evidence, snapshot_hash=snapshot)
+        link = parse_checkout_link(checkout_url, settings)
+        link["fetched_url"] = final_page_url
+        return Extraction(raw_proposal=proposal, evidence=evidence, snapshot_hash=snapshot, link=link)
+
+
+# ============================================================
+# The checkout-link parser: does the link the agent found match the contract?
+# ============================================================
+#
+# The agent found a link and asked Handshake to approve a purchase at it.
+# Before trusting anything on that page, parse the LINK itself:
+#
+#   checkout_link_format     is it really this merchant's checkout-page format
+#                            (/checkout/<session id>), and is that exactly the
+#                            page Handshake read (no redirect somewhere else)?
+#   checkout_link_merchant   which merchant does this origin belong to
+#                            (HANDSHAKE_MERCHANT_IDENTITIES)? Does the page
+#                            claim to be that same merchant (a page on some
+#                            other site calling itself "Amazon.com" is caught
+#                            here)? And does the contract allow that merchant?
+#   checkout_link_selection  if the agent sent a selection report, does its
+#                            chosen product point at this link, this merchant,
+#                            and this product (and roughly this price)?
+#
+# Pure, deterministic string and URL comparison. No LLM, no network. Every
+# result is HARD: a link that doesn't match the contract never gets paid.
+
+def parse_checkout_link(checkout_url: str, settings: Settings) -> dict[str, Any]:
+    """Break a checkout URL into the facts the link rules check."""
+    parts = urlsplit(checkout_url)
+    match = re.fullmatch(r"/checkout/([A-Za-z0-9_\-]{3,64})/?", parts.path or "")
+    origin = origin_of(checkout_url)
+    return {
+        "checkout_url": checkout_url,
+        "origin": origin,
+        "host": parts.hostname,
+        "format_ok": bool(match) and not parts.query and not parts.fragment,
+        "session_id": match.group(1) if match else None,
+        "registered_merchant": settings.effective_merchant_identities.get(origin),
+    }
+
+
+def _norm(text: Any) -> str:
+    """Trim, lowercase, collapse whitespace."""
+    return " ".join(str(text or "").lower().split())
+
+
+def checkout_link_results(
+    contract: Any,
+    link: dict[str, Any],
+    proposal: dict[str, Any],
+    selection_report: Any | None,
+) -> list[Any]:
+    """The link rules as ConstraintResults (hard). `contract` is a models.Contract."""
+    from handshake.intent_diff import FAIL, PASS, UNVERIFIABLE, result, to_cents
+
+    results: list[Any] = []
+    url = link["checkout_url"]
+
+    # --- 1. Link format, and it's exactly the page we read -----------------
+    ev = {"source": "checkout_url", "link": link}
+    if not link["format_ok"]:
+        results.append(result("checkout_link_format", FAIL, "a /checkout/<session> link on the merchant's site", url,
+                              "The link the agent submitted is not this merchant's checkout-page format.", ev))
+    elif link.get("fetched_url") not in (None, url):
+        results.append(result("checkout_link_format", FAIL, url, link.get("fetched_url"),
+                              "The checkout link led to a different page than the one submitted.", ev))
+    else:
+        results.append(result("checkout_link_format", PASS, "a /checkout/<session> link on the merchant's site", url,
+                              "The link is the merchant's checkout page, and it is the page Handshake read.", ev))
+
+    # --- 2. The link's merchant: registered, same as the page claims, allowed by the contract ---
+    registered = link.get("registered_merchant")
+    claimed = (proposal.get("merchant") or {}).get("name")
+    ev = {"source": "checkout_url origin", "origin": link["origin"], "registered_merchant": registered, "page_claims": claimed}
+    policy = contract.merchants
+    allow = {_norm(m) for m in policy.allow}
+    deny = {_norm(m) for m in policy.deny}
+    if registered is None:
+        results.append(result("checkout_link_merchant", UNVERIFIABLE, "a known merchant's site", link["origin"],
+                              f"Handshake doesn't know which merchant {link['origin']} belongs to, so the link can't be matched to the contract.", ev))
+    elif _norm(registered) != _norm(claimed):
+        results.append(result("checkout_link_merchant", FAIL, registered, claimed or "missing",
+                              f"The page claims to be {claimed!r}, but the link belongs to {registered!r}.", ev))
+    elif _norm(registered) in deny:
+        results.append(result("checkout_link_merchant", FAIL, "a merchant the contract allows", registered,
+                              f"The link belongs to {registered!r}, which the contract denies.", ev))
+    elif _norm(registered) in allow:
+        results.append(result("checkout_link_merchant", PASS, "a merchant the contract allows", registered,
+                              f"The link belongs to {registered!r}, which the contract allows.", ev))
+    elif policy.new_merchant.value == "allow":
+        results.append(result("checkout_link_merchant", PASS, "a merchant the contract allows", registered,
+                              f"The link belongs to {registered!r}; the contract allows new merchants.", ev))
+    elif policy.new_merchant.value == "deny":
+        results.append(result("checkout_link_merchant", FAIL, "a merchant the contract allows", registered,
+                              f"The link belongs to {registered!r}, which isn't on the contract's list.", ev))
+    else:
+        results.append(result("checkout_link_merchant", UNVERIFIABLE, "a merchant the contract allows", registered,
+                              f"The link belongs to {registered!r}, which isn't on the contract's list, so you decide.", ev))
+
+    # --- 3. The agent's own account of what it picked must match the link ---
+    if selection_report is not None:
+        candidate = selection_report.selected_candidate
+        problems: list[str] = []
+        uncertain: list[str] = []
+        if selection_report.contract_id != contract.id:
+            problems.append("the selection report is for a different contract")
+        if candidate.url:
+            if origin_of(candidate.url) != link["origin"]:
+                problems.append(f"the chosen product's link is on {origin_of(candidate.url)}, not {link['origin']}")
+            elif link["session_id"] and "/checkout/" in urlsplit(candidate.url).path and link["session_id"] not in candidate.url:
+                problems.append("the chosen product's link points at a different checkout")
+        if registered and _norm(candidate.merchant) != _norm(registered):
+            problems.append(f"the agent says it picked a product from {candidate.merchant!r}, but the link is {registered!r}")
+        names = [_norm(item.get("name")) for item in proposal.get("line_items") or []]
+        wanted = _norm(candidate.name)
+        if wanted and not any(wanted in name or name in wanted for name in names if name):
+            problems.append(f"the checkout doesn't contain the product the agent says it picked ({candidate.name!r})")
+        prices = [item.get("unit_price") for item in proposal.get("line_items") or [] if _norm(item.get("name")) and (wanted in _norm(item.get("name")) or _norm(item.get("name")) in wanted)]
+        if prices and all(abs(to_cents(p) - to_cents(candidate.price)) > 1 for p in prices if p is not None):
+            uncertain.append(f"the checkout price differs from the {candidate.price:.2f} the agent reported")
+        ev = {"source": "selection_report.selected_candidate", "candidate": candidate.model_dump(mode="json")}
+        if problems:
+            results.append(result("checkout_link_selection", FAIL, "the product the agent reported choosing", url,
+                                  "The link doesn't match the agent's own selection: " + "; ".join(problems) + ".", ev))
+        elif uncertain:
+            results.append(result("checkout_link_selection", UNVERIFIABLE, "the product the agent reported choosing", url,
+                                  "The link matches the agent's selection, but " + "; ".join(uncertain) + ".", ev))
+        else:
+            results.append(result("checkout_link_selection", PASS, "the product the agent reported choosing", url,
+                                  "The link, merchant, and product match what the agent reported choosing.", ev))
+    return results
 
 
 # ============================================================

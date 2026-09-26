@@ -268,6 +268,38 @@ class CredentialRow(Base):
     data: Mapped[dict] = mapped_column(JSON)
 
 
+class PaymentRow(Base):
+    """
+    The provider side of one purchase: the Link TEST spend request (or the
+    simulated one) and where it is in the payment state machine
+    (payments.py lists the states). One row per purchase, at most.
+
+    NEVER stored here: a card number, CVC, or full expiry. Only last4.
+    provider_request_id is written the moment the provider returns it,
+    before any polling, so a crash can never lose track of a request.
+    """
+
+    __tablename__ = "payments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    purchase_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    provider: Mapped[str] = mapped_column(String)  # "stub" or "link_test"
+    provider_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    state: Mapped[str] = mapped_column(String, index=True)
+    approval_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    amount_minor: Mapped[int] = mapped_column(Integer)  # the authorized amount, integer cents
+    pay_amount_minor: Mapped[int] = mapped_column(Integer)  # what to submit (lower if the cart got cheaper)
+    currency: Mapped[str] = mapped_column(String)
+    checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)  # sanitized, never card data
+    card_last4: Mapped[str | None] = mapped_column(String, nullable=True)
+    credential_released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    receipt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
 # The evidence ledger is APPEND-ONLY BY DESIGN. This module has an insert
 # helper and read helpers for it, and deliberately no update or delete
 # helper. Nothing in the app can rewrite history.
@@ -677,6 +709,47 @@ def list_credentials_for_contract(session: Session, contract_id: str) -> list[Cr
     """Every credential ever issued under a contract."""
     query = select(CredentialRow).where(CredentialRow.contract_id == contract_id)
     return [Credential.model_validate(row.data) for row in session.scalars(query)]
+
+
+# ============================================================
+# Payments
+# ============================================================
+
+
+def get_payment(session: Session, purchase_id: str) -> PaymentRow | None:
+    """The payment row for a purchase, if a payment was started."""
+    return session.scalar(select(PaymentRow).where(PaymentRow.purchase_id == purchase_id))
+
+
+def list_open_payments_for_contract(session: Session, contract_id: str) -> list[PaymentRow]:
+    """Payments of a contract's purchases that have not reached a terminal state."""
+    query = (
+        select(PaymentRow)
+        .join(PurchaseRow, PurchaseRow.id == PaymentRow.purchase_id)
+        .where(PurchaseRow.contract_id == contract_id)
+    )
+    return [row for row in session.scalars(query) if row.state not in ("completed", "denied", "expired", "checkout_changed", "failed")]
+
+
+def claim_payment_state(session: Session, payment_id: str, from_states: tuple[str, ...], to_state: str) -> bool:
+    """
+    Atomically move a payment into `to_state` if it is currently in one of `from_states`.
+
+    The same conditional-UPDATE pattern as the contract claims: two requests
+    racing (say, two credential releases, or a release and a decline) can't
+    both win, because only one UPDATE finds the row still in the old state.
+    """
+    statement = (
+        update(PaymentRow)
+        .where(PaymentRow.id == payment_id)
+        .where(PaymentRow.state.in_(from_states))
+        .values(state=to_state, updated_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    )
+    if session.execute(statement).rowcount != 1:
+        return False
+    session.refresh(session.get(PaymentRow, payment_id))
+    return True
 
 
 # ============================================================

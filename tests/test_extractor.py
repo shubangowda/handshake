@@ -390,3 +390,131 @@ def test_extractor_receives_url_and_contract_only(client: TestClient) -> None:
     STATIC_EXTRACTOR.set(proposal_payload(contract_id))
     client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout"})
     assert STATIC_EXTRACTOR.calls[-1] == ("https://mocknike.example/checkout", contract_id)
+
+
+# ============================================================
+# The checkout-link parser (does the agent's link match the contract?)
+# ============================================================
+
+from handshake.extractor import checkout_link_results, parse_checkout_link  # noqa: E402
+from handshake.models import CandidateProduct, SelectionReport  # noqa: E402
+from conftest import make_contract  # noqa: E402
+
+
+def link_for(url: str) -> dict[str, Any]:
+    """Parse a link the way the real extractor does (the page was read from that exact URL)."""
+    link = parse_checkout_link(url, get_settings())
+    link["fetched_url"] = url
+    return link
+
+
+def amazon_contract(**merchant_changes: Any) -> Any:
+    """The fixture contract, allowing the mock store's identity (Amazon.com)."""
+    return make_contract(merchants={"allow": ["Amazon.com"], **merchant_changes})
+
+
+def page(name: str = "Amazon.com", item: str = "Pegasus 41", price: float = 119.99) -> dict[str, Any]:
+    """A minimal extracted proposal dict."""
+    return {"merchant": {"name": name}, "line_items": [{"name": item, "unit_price": price}]}
+
+
+def verdicts(results: list[Any]) -> dict[str, str]:
+    """constraint name -> verdict value."""
+    return {r.constraint: r.verdict.value for r in results}
+
+
+MERCHANT = "http://localhost:3001"
+
+
+def test_link_rules_pass_for_the_real_store() -> None:
+    """A /checkout/<id> link on the registered store, claiming to be that store, which the contract allows."""
+    results = checkout_link_results(amazon_contract(), link_for(f"{MERCHANT}/checkout/cs_abc123"), page(), None)
+    assert verdicts(results) == {"checkout_link_format": "pass", "checkout_link_merchant": "pass"}
+
+
+def test_link_to_a_non_checkout_page_fails() -> None:
+    """A product or search page is not a checkout, so there's nothing to authorize."""
+    results = checkout_link_results(amazon_contract(), link_for(f"{MERCHANT}/search?q=pegasus"), page(), None)
+    assert verdicts(results)["checkout_link_format"] == "fail"
+
+
+def test_page_claiming_a_different_merchant_fails() -> None:
+    """The page says 'Nike Outlet' but the link belongs to Amazon.com: impersonation, blocked."""
+    results = checkout_link_results(amazon_contract(), link_for(f"{MERCHANT}/checkout/cs_abc123"), page(name="Nike Outlet"), None)
+    result = {r.constraint: r for r in results}["checkout_link_merchant"]
+    assert result.verdict.value == "fail" and "belongs to 'Amazon.com'" in result.reason
+
+
+def test_link_merchant_denied_by_contract_fails() -> None:
+    """The link's merchant is on the contract's deny list."""
+    contract = make_contract(merchants={"allow": [], "deny": ["amazon.com"]})
+    assert verdicts(checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), page(), None))["checkout_link_merchant"] == "fail"
+
+
+def test_unregistered_origin_is_unverifiable() -> None:
+    """An origin Handshake can't map to a merchant can't be matched to the contract, so it escalates."""
+    override_settings(merchant_identities=(("http://localhost:3999", "Other Store"),))
+    results = checkout_link_results(amazon_contract(), link_for(f"{MERCHANT}/checkout/cs_abc123"), page(), None)
+    assert verdicts(results)["checkout_link_merchant"] == "unverifiable"
+
+
+def selection(contract_id: str, **candidate: Any) -> SelectionReport:
+    """A selection report where the agent says what it picked."""
+    fields = {"name": "Pegasus 41", "merchant": "Amazon.com", "price": 119.99, "url": f"{MERCHANT}/checkout/cs_abc123", **candidate}
+    chosen = CandidateProduct(**fields)
+    return SelectionReport(contract_id=contract_id, selected_candidate=chosen, candidates=[chosen], reasoning_summary="Best match.")
+
+
+def test_selection_matching_the_link_passes() -> None:
+    """The agent's own report agrees with the link, the merchant, the product, and the price."""
+    contract = amazon_contract()
+    results = checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), page(), selection(contract.id))
+    assert verdicts(results)["checkout_link_selection"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "changes, fragment",
+    [
+        ({"url": "https://other.example/checkout/cs_abc123"}, "not http://localhost:3001"),
+        ({"url": f"{MERCHANT}/checkout/cs_different"}, "different checkout"),
+        ({"merchant": "Nike Outlet"}, "from 'Nike Outlet'"),
+        ({"name": "Air Max 90"}, "doesn't contain the product"),
+    ],
+)
+def test_selection_not_matching_the_link_fails(changes: dict[str, Any], fragment: str) -> None:
+    """The agent said it picked one thing, but the link is something else: blocked."""
+    contract = amazon_contract()
+    results = checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), page(), selection(contract.id, **changes))
+    result = {r.constraint: r for r in results}["checkout_link_selection"]
+    assert result.verdict.value == "fail" and fragment in result.reason
+
+
+def test_selection_for_another_contract_fails() -> None:
+    """A selection report written for a different contract doesn't count."""
+    contract = amazon_contract()
+    results = checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), page(), selection("contract_other"))
+    assert verdicts(results)["checkout_link_selection"] == "fail"
+
+
+def test_selection_price_differs_is_unverifiable() -> None:
+    """Same product, but the checkout price isn't what the agent reported: ask the user."""
+    contract = amazon_contract()
+    results = checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), page(price=129.99), selection(contract.id))
+    assert verdicts(results)["checkout_link_selection"] == "unverifiable"
+
+
+def test_link_mismatch_blocks_a_purchase_end_to_end(client: TestClient, agent_client: TestClient, merchant_env: TestClient) -> None:
+    """Through the API: the agent claims it picked a different product than the checkout it links to -> BLOCKED."""
+    from handshake import compiler as compiler_module
+
+    record = client.post("/drafts/compile", json={"intent": compiler_module.DEMO_INTENT}).json()
+    contract_id = client.post(f"/contracts/{record['id']}/sign").json()["id"]
+    checkout = merchant_env.post("/api/checkout-sessions", json={"scenario": "valid"}).json()
+    report = selection(contract_id, name="Air Max 90", url=checkout["checkout_url"]).model_dump(mode="json")
+    body = agent_client.post("/purchases", json={
+        "contract_id": contract_id, "checkout_url": checkout["checkout_url"], "idempotency_key": "link-mismatch-01", "selection_report": report,
+    }).json()
+    assert body["status"] == "blocked"
+    first = body["decision"]["results"][:3]
+    assert [r["constraint"] for r in first] == ["checkout_link_format", "checkout_link_merchant", "checkout_link_selection"]
+    assert first[2]["verdict"] == "fail" and first[2]["label"] == "Link matches agent's pick"

@@ -368,12 +368,12 @@ def amend_contract(
     return services.amend_contract(session, contract_id, owner=principal.email)
 
 
-@router.get("/contracts/{contract_id}/purchases", response_model=list[PurchaseResponse])
+@router.get("/contracts/{contract_id}/purchases")
 def list_contract_purchases(
     contract_id: str,
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
-) -> list[PurchaseResponse]:
+) -> list[dict[str, Any]]:
     """Every purchase attempt against one of the caller's contracts, newest first."""
     services._require_contract(session, contract_id, principal.email)
     return [_purchase_response(item) for item in services.list_purchase_outcomes(session, principal.email, contract_id)]
@@ -452,29 +452,25 @@ def revoke_contract(
 # ============================================================
 
 
-def _purchase_response(outcome: dict[str, Any]) -> PurchaseResponse:
-    """Build the PurchaseResponse from {"purchase", "decision", "credential"}."""
-    purchase = outcome["purchase"]
-    decision = outcome["decision"]
-    return PurchaseResponse(
-        purchase_id=purchase.id,
-        status=purchase.status,
-        decision=decision,
-        contract_id=purchase.contract_id,
-        proposal_id=purchase.proposal_id,
-        credential=services.credential_summary(outcome.get("credential")),
-        summary=services.summarize(purchase, decision),
-        idempotent_replay=bool(outcome.get("idempotent_replay")),
-    )
+def _purchase_response(outcome: dict[str, Any]) -> dict[str, Any]:
+    """
+    Every purchase response: the original PurchaseResponse keys (purchase_id,
+    status, decision, contract_id, proposal_id, credential, summary) PLUS the
+    section 6.4 superset (purchase, proposal, payment, payment_state,
+    approval_url, resolution, next_action, review_url). Never card data.
+    """
+    with db.SessionLocal() as session:
+        purchase = db.load_purchase(session, outcome["purchase"].id) or outcome["purchase"]
+        return services.purchase_detail(session, purchase, idempotent_replay=outcome.get("idempotent_replay"))
 
 
-@router.post("/purchases", response_model=PurchaseResponse)
+@router.post("/purchases")
 def create_purchase(
     body: Any = Body(...),
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
     extractor: Extractor = Depends(get_extractor),
-) -> PurchaseResponse:
+) -> dict[str, Any]:
     """
     Run the full purchase flow for one proposed checkout (see services.submit_purchase). User or agent.
 
@@ -509,39 +505,63 @@ def create_purchase(
     return _purchase_response(outcome)
 
 
-@router.get("/purchases", response_model=list[PurchaseResponse])
+@router.get("/purchases")
 def list_purchases(
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
-) -> list[PurchaseResponse]:
+) -> list[dict[str, Any]]:
     """The caller's purchases across all contracts, newest first."""
     return [_purchase_response(item) for item in services.list_purchase_outcomes(session, principal.email)]
 
 
-@router.get("/purchases/{purchase_id}", response_model=PurchaseResponse)
+@router.get("/purchases/{purchase_id}")
 def get_purchase(
     purchase_id: str,
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
-) -> PurchaseResponse:
-    """Current state of one purchase, with its decision and credential summary."""
+    extractor: Extractor = Depends(get_extractor),
+) -> dict[str, Any]:
+    """
+    Current state of one purchase. Runs the payment refresh first (idempotent),
+    so polling this is enough to move a purchase along.
+    """
     purchase = services.get_owned_purchase(session, purchase_id, principal.email)
-    return _purchase_response(
-        {
-            "purchase": purchase,
-            "decision": db.load_decision(session, purchase.decision_id),
-            "credential": db.load_credential(session, purchase.credential_id),
-        }
-    )
+    purchase = _safe_refresh(session, purchase, principal, extractor)
+    return services.purchase_detail(session, purchase)
 
 
-@router.post("/purchases/{purchase_id}/approve", response_model=PurchaseResponse)
+def _safe_refresh(session: Session, purchase: Any, principal: Principal, extractor: Extractor) -> Any:
+    """Refresh the payment, but never let a provider hiccup break a read (the error is kept on the payment)."""
+    try:
+        return services.refresh_payment(session, purchase.id, principal.email, extractor)
+    except ServiceError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a read must still answer; the next poll retries
+        session.rollback()
+        log.warning("payment refresh failed for %s: %s", purchase.id, type(exc).__name__)
+        return db.load_purchase(session, purchase.id)
+
+
+@router.post("/purchases/{purchase_id}/payment/refresh")
+def refresh_payment(
+    purchase_id: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+    extractor: Extractor = Depends(get_extractor),
+) -> dict[str, Any]:
+    """Poll the payment provider and advance the payment state machine (user or agent). Idempotent."""
+    purchase = services.get_owned_purchase(session, purchase_id, principal.email)
+    purchase = services.refresh_payment(session, purchase.id, principal.email, extractor)
+    return services.purchase_detail(session, purchase)
+
+
+@router.post("/purchases/{purchase_id}/approve")
 def approve_purchase(
     purchase_id: str,
     body: HumanDecisionRequest | None = None,
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
-) -> PurchaseResponse:
+) -> dict[str, Any]:
     """
     The user approves an ESCALATED purchase: it becomes AUTHORIZED and a credential is issued. User only.
 
@@ -554,13 +574,13 @@ def approve_purchase(
     return _purchase_response(services.approve_purchase(session, purchase_id, note, owner=principal.email))
 
 
-@router.post("/purchases/{purchase_id}/reject", response_model=PurchaseResponse)
+@router.post("/purchases/{purchase_id}/reject")
 def reject_purchase(
     purchase_id: str,
     body: HumanDecisionRequest | None = None,
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
-) -> PurchaseResponse:
+) -> dict[str, Any]:
     """The user rejects an ESCALATED purchase: it becomes BLOCKED. 409 if it is not escalated. User only."""
     require_user(session, principal, "reject a purchase", purchase_id=purchase_id)
     note = body.note if body else None
@@ -613,6 +633,54 @@ def health() -> dict[str, Any]:
 
 
 # ============================================================
+# Mode-specific routes (registered only in their mode)
+# ============================================================
+
+stub_router = APIRouter()
+
+
+@stub_router.post("/purchases/{purchase_id}/payment/simulate-approval")
+def simulate_approval(
+    purchase_id: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+    extractor: Extractor = Depends(get_extractor),
+) -> dict[str, Any]:
+    """
+    SIMULATED PROVIDER APPROVAL (stub mode only, user only). Stands in for the
+    user's approval tap in Link when no Link account is connected.
+    """
+    require_user(session, principal, "approve a payment", purchase_id=purchase_id)
+    purchase = services.simulate_approval(session, purchase_id, principal.email)
+    purchase = services.refresh_payment(session, purchase.id, principal.email, extractor)
+    return services.purchase_detail(session, purchase)
+
+
+credential_router = APIRouter()
+
+
+@credential_router.post("/purchases/{purchase_id}/credential")
+def release_credential(
+    purchase_id: str,
+    session: Session = Depends(db.get_session),
+    principal: Principal = Depends(current_principal),
+) -> JSONResponse:
+    """
+    AGENT-VISIBLE MODE ONLY, agent only, ONCE: the single-use Link TEST card for this purchase.
+
+    This is the only response in Handshake that contains card values. It is
+    sent with Cache-Control: no-store and is never logged or stored.
+    """
+    if not principal.is_agent:
+        raise ServiceError(403, "agent_only", "Only the shopping agent collects the card, and only once.")
+    release = services.release_credential(session, purchase_id, principal)
+    return JSONResponse(
+        content=release.model_dump(mode="json"),
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
+
+
+# ============================================================
 # App factory
 # ============================================================
 
@@ -645,6 +713,11 @@ def create_app() -> FastAPI:
     application.add_exception_handler(RequestValidationError, validation_error_handler)
 
     application.include_router(router)
+    settings = get_settings()
+    if settings.payment_mode == "stub":
+        application.include_router(stub_router)
+    if settings.credential_mode == "agent_visible":
+        application.include_router(credential_router)
     return application
 
 

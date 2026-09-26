@@ -32,6 +32,9 @@ import hashlib
 import hmac
 import json
 import logging
+import asyncio
+from decimal import Decimal
+import concurrent.futures
 import secrets
 from datetime import datetime, timedelta
 from typing import Any
@@ -40,7 +43,7 @@ from pydantic import BaseModel, ValidationError, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from handshake import compiler, db
+from handshake import compiler, db, payments
 from handshake.extractor import Extractor, ExtractionError
 from handshake.auth import Principal
 from handshake.config import DEV_SIGNING_SECRET, get_settings
@@ -732,9 +735,21 @@ def revoke_contract(session: Session, contract_id: str, owner: str | None) -> Co
             db.update_credential(session, credential.model_copy(update={"status": CredentialStatus.REVOKED}))
             revoked_ids.append(credential.id)
 
+    # ...and no pending payment request either: cancel any that haven't
+    # released a card yet. (Ones already paying are left to reconcile.)
+    canceled_payments: list[str] = []
+    for payment in db.list_open_payments_for_contract(session, contract_id):
+        if payment.state in (payments.AWAITING_APPROVAL, payments.APPROVED, payments.CREDENTIAL_READY):
+            _cancel_provider_request(payment)
+            if db.claim_payment_state(session, payment.id, (payment.state,), payments.DENIED):
+                canceled_payments.append(payment.purchase_id)
+                purchase = db.load_purchase(session, payment.purchase_id)
+                if purchase is not None and purchase.status == PurchaseStatus.AUTHORIZED:
+                    _set_purchase(session, purchase, status=PurchaseStatus.BLOCKED, error="Contract revoked before payment.", completed_at=clock())
+
     log_event(
         session, contract_id, EvidenceEventType.CONTRACT_REVOKED,
-        "User revoked the contract.", {"revoked_credentials": revoked_ids},
+        "User revoked the contract.", {"revoked_credentials": revoked_ids, "canceled_payments": canceled_payments},
     )
     session.commit()
     return db.load_contract(session, contract_id)
@@ -1234,6 +1249,16 @@ def submit_purchase(
     else:
         decision, _ = evaluate(contract, proposal, now=clock(), raw_fields_set=fields_set)
 
+    # The checkout-link parser (extractor.checkout_link_results): does the
+    # LINK the agent found match the contract (right merchant, the page is who
+    # the link says, and it's what the agent says it picked)? Those hard
+    # results go FIRST. Test extractors that supply no link facts skip this.
+    if extraction.link is not None:
+        from handshake.extractor import checkout_link_results
+
+        link_results = checkout_link_results(contract, extraction.link, raw_proposal, selection_report)
+        decision = _make_decision(contract.id, proposal.id, [*link_results, *decision.results])
+
     # compute_outcome is the only source of BLOCKED / ESCALATED / AUTHORIZED.
     outcome = compute_outcome(decision.results, contract.escalate_if)
 
@@ -1264,6 +1289,10 @@ def submit_purchase(
         purchase = _escalate(session, purchase, decision)
     else:
         purchase, credential = _authorize(session, contract, proposal, purchase, decision)
+        if purchase.status == PurchaseStatus.AUTHORIZED:
+            # Handshake's decision is made; now the PAYMENT can begin (section 9):
+            # a Link TEST spend request the user approves in Link (or the simulated one).
+            purchase = start_payment(session, purchase, contract, proposal)
 
     # purchase.status is the effective outcome. It can differ from `outcome`
     # in one case: AUTHORIZED by the engine, but the contract was consumed by
@@ -1546,11 +1575,23 @@ def approve_purchase(session: Session, purchase_id: str, note: str | None = None
         session.rollback()
         raise
 
+    # Consent #1 (accepting the exception, here in Handshake) is done.
+    # Consent #2 is separate: the user still approves the payment in Link.
+    purchase = start_payment(session, purchase, contract, proposal)
     return {"purchase": purchase, "decision": decision, "credential": credential}
 
 
 def reject_purchase(session: Session, purchase_id: str, note: str | None = None, owner: str | None = None) -> dict[str, Any]:
-    """A human rejects an ESCALATED purchase: it becomes BLOCKED and no credential is ever issued."""
+    """
+    A human says no. Two cases:
+      - an ESCALATED purchase: it becomes BLOCKED and no credential is ever issued
+      - an AUTHORIZED purchase whose payment has not started (no card released,
+        nothing submitted): the pending provider request is cancelled, the
+        purchase becomes BLOCKED ("declined"), and the contract is freed
+    """
+    current = get_owned_purchase(session, purchase_id, owner)
+    if current.status == PurchaseStatus.AUTHORIZED:
+        return decline_authorized_purchase(session, current, note)
     purchase, decision = _load_escalated(session, purchase_id, "rejected", owner)
 
     # Same conditional UPDATE as approval, so approve and reject racing each
@@ -1669,8 +1710,799 @@ def complete_purchase(session: Session, purchase_id: str, charged_amount: float)
 
 
 # ============================================================
+# Payments: the state machine after AUTHORIZED (section 9)
+# ============================================================
+#
+#   awaiting_approval -> approved -> revalidating -> credential_ready -> paying -> paid -> completed
+#                                                   (agent_visible only)
+#   side exits: denied, expired, checkout_changed, failed, unknown
+#
+# PurchaseStatus (models.py) stays AUTHORIZED through all of this, and only
+# becomes COMPLETED after Handshake verifies the merchant's order itself.
+# refresh_payment() is the one function that advances the machine; the
+# frontend and the MCP server poll it, and GET /purchases/{id} runs it too.
+# It is idempotent: calling it again in a stable state changes nothing.
+
+
+def _run_async(coro: Any) -> Any:
+    """
+    Run a provider coroutine from synchronous service code.
+
+    The Link adapter is async (asyncio subprocesses, so the CLI never blocks
+    the server's event loop). FastAPI runs our sync routes in worker threads
+    with no event loop, where asyncio.run works. If there IS a running loop
+    in this thread, run the coroutine on a helper thread instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _provider_for(row: db.PaymentRow) -> payments.Provider:
+    """The provider that owns this payment row (a row never switches providers)."""
+    if row.provider == "link_test":
+        return payments.LinkTestProvider()
+    return payments.StubProvider()
+
+
+def _cancel_provider_request(row: db.PaymentRow) -> None:
+    """Best effort: cancel the provider request so the user isn't asked to approve something dead."""
+    if not row.provider_request_id:
+        return
+    try:
+        _run_async(_provider_for(row).cancel(row.provider_request_id))
+    except payments.PaymentError:
+        pass
+
+
+def _payment_event(session: Session, row: db.PaymentRow, contract_id: str, event_type: EvidenceEventType, kind: str, message: str, **data: Any) -> None:
+    """Log a payment step. data.kind carries the precise subtype (models.py has no payment event types)."""
+    log_event(
+        session, contract_id, event_type, message,
+        {"kind": kind, "payment_state": row.state, "provider": row.provider, "provider_request_id": row.provider_request_id, **data},
+        row.purchase_id,
+    )
+
+
+def _set_payment(session: Session, row: db.PaymentRow, **changes: Any) -> None:
+    """Update a payment row and stamp updated_at."""
+    for key, value in changes.items():
+        setattr(row, key, value)
+    row.updated_at = clock()
+
+
+def _release_reservation(session: Session, contract_id: str) -> bool:
+    """
+    Give a single-use contract back (USED -> ACTIVE) after a payment that
+    guaranteed no money moved (denied, expired, checkout changed, failed
+    before any order). The purchase holding the reservation is terminal, so
+    the user's authorization is usable again. Conditional UPDATE, as always.
+    """
+    return db.claim_contract_status(session, contract_id, ContractStatus.USED, ContractStatus.ACTIVE)
+
+
+def _end_payment(
+    session: Session,
+    row: db.PaymentRow,
+    purchase: Purchase,
+    state: str,
+    kind: str,
+    message: str,
+    purchase_status: PurchaseStatus = PurchaseStatus.FAILED,
+    release: bool = True,
+    **data: Any,
+) -> Purchase:
+    """
+    Finish a payment WITHOUT a completed order: record why, close the
+    purchase, revoke Handshake's credential, and (if no money moved) release
+    the single-use contract.
+    """
+    contract_id = purchase.contract_id
+    _set_payment(session, row, state=state, last_error=message[:300])
+    if purchase.status == PurchaseStatus.AUTHORIZED:
+        purchase = _set_purchase(session, purchase, status=purchase_status, error=message, completed_at=clock())
+    credential = db.load_credential(session, purchase.credential_id)
+    if credential is not None and credential.status == CredentialStatus.ACTIVE:
+        db.update_credential(session, credential.model_copy(update={"status": CredentialStatus.REVOKED}))
+    released = False
+    if release:
+        contract = db.load_contract(session, contract_id)
+        if contract is not None and contract.single_use:
+            released = _release_reservation(session, contract_id)
+    event_type = EvidenceEventType.PURCHASE_BLOCKED
+    _payment_event(session, row, contract_id, event_type, kind, message, contract_released=released, **data)
+    session.commit()
+    return purchase
+
+
+def _spend_spec(purchase: Purchase, contract: Contract, proposal: TransactionProposal, amount_minor: int) -> payments.SpendSpec:
+    """What we ask the provider for: the exact authorized amount and a truthful description."""
+    checkout_url = proposal.source_url or ""
+    parts = checkout_url.split("/")
+    merchant_url = "/".join(parts[:3]) if len(parts) >= 3 else checkout_url
+    items = tuple((item.name, to_cents(item.unit_price), item.quantity) for item in proposal.line_items)
+    context = payments.build_context(
+        contract.goal, proposal.merchant.name, [item.name for item in proposal.line_items], fmt_money(amount_minor, proposal.currency)
+    )
+    return payments.SpendSpec(
+        purchase_id=purchase.id, amount_minor=amount_minor, currency=proposal.currency.upper(),
+        merchant_name=proposal.merchant.name, merchant_url=merchant_url, context=context, line_items=items,
+    )
+
+
+def start_payment(session: Session, purchase: Purchase, contract: Contract, proposal: TransactionProposal) -> Purchase:
+    """
+    AUTHORIZED -> ask the provider for a single-use TEST card that the USER must approve.
+
+    The payment row is committed BEFORE the provider is called, and the
+    request id is committed the moment it comes back, so a crash can never
+    lose a request or cause a second one. Only one payment per purchase, ever.
+    """
+    if db.get_payment(session, purchase.id) is not None:
+        return purchase  # never a second spend request for the same purchase
+
+    settings = get_settings()
+    provider = payments.get_provider(settings)
+    amount_minor = to_cents(purchase.authorized_amount)
+    now = clock()
+    row = db.PaymentRow(
+        id=generate_id("payment"), purchase_id=purchase.id, provider=provider.name, state=payments.AWAITING_APPROVAL,
+        amount_minor=amount_minor, pay_amount_minor=amount_minor, currency=proposal.currency.upper(),
+        checkout_url=proposal.source_url, created_at=now, updated_at=now,
+    )
+    session.add(row)
+    session.commit()
+
+    spec = _spend_spec(purchase, contract, proposal, amount_minor)
+    try:
+        request = _run_async(provider.create_request(spec))
+    except payments.PaymentUncertain as exc:
+        # We don't know if Link created it. Look before ever trying again.
+        try:
+            request = _run_async(provider.reconcile(spec))
+        except payments.PaymentError:
+            request = None
+        if request is None:
+            _set_payment(session, row, state=payments.UNKNOWN, last_error=exc.message)
+            _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "payment_request_uncertain",
+                           "The payment request's creation could not be confirmed; Handshake will reconcile before anything else.")
+            session.commit()
+            return purchase
+    except payments.PaymentError as exc:
+        return _end_payment(session, row, purchase, payments.FAILED, "payment_request_failed",
+                            f"The payment provider refused the request: {exc.message}", error_code=exc.code)
+
+    # Persist the provider's id immediately, before any polling.
+    approval_url = request.approval_url
+    if provider.name == "stub":
+        approval_url = purchase_url_for(purchase.id)  # the "Simulated provider approval" button lives there
+    _set_payment(session, row, provider_request_id=request.request_id, approval_url=approval_url)
+    session.commit()
+
+    _payment_event(
+        session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "payment_requested",
+        f"{provider.label}: a single-use card for {fmt_money(amount_minor, spec.currency)} was requested. "
+        "It is waiting for your approval.",
+        approval_url=approval_url, amount=fmt_money(amount_minor, spec.currency),
+    )
+    session.commit()
+    return purchase
+
+
+def refresh_payment(session: Session, purchase_id: str, owner: str | None = None, extractor: Extractor | None = None) -> Purchase:
+    """
+    Advance the payment state machine as far as it can go right now. Idempotent.
+
+    Polled by the frontend and the MCP server, and run on GET /purchases/{id}.
+    Each step re-reads the row, so two refreshes racing are safe: the atomic
+    state claims decide who does a step.
+    """
+    purchase = get_owned_purchase(session, purchase_id, owner)
+    for _ in range(8):  # a few steps per call is plenty; each loop makes progress or stops
+        row = db.get_payment(session, purchase.id)
+        if row is None or row.state in payments.TERMINAL_STATES:
+            break
+        before = row.state
+        purchase = _payment_step(session, row, purchase, extractor)
+        session.refresh(row)
+        if row.state == before:
+            break
+    return purchase
+
+
+def _payment_step(session: Session, row: db.PaymentRow, purchase: Purchase, extractor: Extractor | None) -> Purchase:
+    """Do ONE transition from the payment's current state (see the diagram above)."""
+    provider = _provider_for(row)
+
+    if row.state == payments.AWAITING_APPROVAL:
+        if not row.provider_request_id:
+            return purchase
+        try:
+            status = _run_async(provider.get_status(row.provider_request_id))
+        except payments.PaymentError as exc:
+            _set_payment(session, row, last_error=payments.sanitize(exc.message))
+            session.commit()
+            return purchase
+        if status.state == payments.P_APPROVED:
+            if db.claim_payment_state(session, row.id, (payments.AWAITING_APPROVAL,), payments.APPROVED):
+                _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "payment_approved",
+                               f"The payment was approved in {provider.label}.")
+                session.commit()
+        elif status.state == payments.P_DENIED:
+            purchase = _end_payment(session, row, purchase, payments.DENIED, "payment_denied", "The payment was declined in Link.")
+        elif status.state == payments.P_EXPIRED:
+            purchase = _end_payment(session, row, purchase, payments.EXPIRED, "payment_expired", "The payment approval expired before you approved it.")
+        elif status.state == payments.P_FAILED:
+            purchase = _end_payment(session, row, purchase, payments.FAILED, "payment_request_failed", "The payment provider reported a failure.")
+        elif status.state == payments.P_UNKNOWN:
+            _set_payment(session, row, last_error=f"Unrecognized provider status {status.raw_status!r}; waiting.")
+            session.commit()
+        return purchase
+
+    if row.state == payments.APPROVED:
+        if not db.claim_payment_state(session, row.id, (payments.APPROVED,), payments.REVALIDATING):
+            return purchase
+        session.commit()
+        return _revalidate_and_continue(session, row, purchase, extractor)
+
+    if row.state == payments.REVALIDATING:
+        # A previous refresh died mid-revalidation; start it over.
+        return _revalidate_and_continue(session, row, purchase, extractor)
+
+    if row.state == payments.CREDENTIAL_READY:
+        credential = db.load_credential(session, purchase.credential_id)
+        if credential is not None and as_utc(credential.expires_at)[0] <= clock():
+            _cancel_provider_request(row)
+            return _end_payment(session, row, purchase, payments.EXPIRED, "payment_expired",
+                                "The authorization expired before the agent collected the card.")
+        return purchase  # waiting for the agent to collect the card
+
+    if row.state in (payments.PAYING, payments.UNKNOWN):
+        return _look_for_order(session, row, purchase)
+
+    if row.state == payments.PAID:
+        return _verify_and_complete(session, row, purchase)
+
+    return purchase
+
+
+def _revalidate_and_continue(session: Session, row: db.PaymentRow, purchase: Purchase, extractor: Extractor | None) -> Purchase:
+    """
+    After the user approves in Link and BEFORE any card moves: is everything still true?
+
+    1. The contract still verifies and is not revoked or expired.
+    2. The checkout is re-extracted. If its snapshot hash matches, nothing
+       changed. If it changed, the engine runs again on the new facts; if the
+       new outcome isn't AUTHORIZED or the total rose at all, stop at
+       checkout_changed and pay nothing.
+    """
+    contract_row = db.get_contract_row(session, purchase.contract_id)
+    try:
+        contract = db.contract_from_row(contract_row)
+    except ValidationError:
+        return _end_payment(session, row, purchase, payments.FAILED, "contract_tampered", "The contract no longer verifies; nothing was paid.", release=False)
+    if not verify_contract(contract)["valid"]:
+        return _end_payment(session, row, purchase, payments.FAILED, "contract_tampered", "The contract no longer verifies; nothing was paid.", release=False)
+    if contract.status in (ContractStatus.REVOKED, ContractStatus.EXPIRED) or (
+        contract.expires_at is not None and as_utc(contract.expires_at)[0] <= clock()
+    ):
+        _cancel_provider_request(row)
+        return _end_payment(session, row, purchase, payments.FAILED, "contract_no_longer_valid",
+                            "The contract was revoked or expired before payment; nothing was paid.", release=False)
+
+    proposal_row = db.get_proposal_row(session, purchase.proposal_id)
+    if extractor is None:
+        from handshake.extractor import get_extractor
+
+        extractor = get_extractor()
+    try:
+        extraction = extractor.extract(row.checkout_url or "", contract.id)
+    except ExtractionError as exc:
+        # Can't look at the checkout, so can't pay for it. Try again next refresh.
+        db.claim_payment_state(session, row.id, (payments.REVALIDATING,), payments.APPROVED)
+        _set_payment(session, row, last_error=f"Could not re-read the checkout: {exc.message}")
+        session.commit()
+        return purchase
+
+    authorized_minor = row.amount_minor
+    changed = extraction.snapshot_hash != proposal_row.checkout_snapshot_hash
+    if changed:
+        new_outcome, new_total, reasons = _re_evaluate(contract, extraction.raw_proposal)
+        if new_outcome != PurchaseStatus.AUTHORIZED or new_total is None or new_total > authorized_minor:
+            _cancel_provider_request(row)
+            return _end_payment(
+                session, row, purchase, payments.CHECKOUT_CHANGED, "checkout_changed",
+                "The checkout changed after authorization and no longer matches the contract; nothing was paid.",
+                purchase_status=PurchaseStatus.BLOCKED,
+                new_outcome=new_outcome.value if new_outcome else None,
+                new_total=fmt_money(new_total, row.currency) if new_total is not None else None,
+                authorized=fmt_money(authorized_minor, row.currency), reasons=reasons,
+                new_snapshot_hash=extraction.snapshot_hash,
+            )
+        _set_payment(session, row, pay_amount_minor=new_total)
+
+    _payment_event(
+        session, row, purchase.contract_id, EvidenceEventType.VALIDATION_COMPLETED, "checkout_revalidated",
+        "The checkout was read again before payment and still matches the contract." if not changed
+        else "The checkout changed but still satisfies the contract at no higher cost.",
+        unchanged=not changed, snapshot_hash=extraction.snapshot_hash,
+    )
+
+    if get_settings().credential_mode == "agent_visible":
+        db.claim_payment_state(session, row.id, (payments.REVALIDATING,), payments.CREDENTIAL_READY)
+        _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "credential_ready",
+                       "The single-use card is ready for the agent to collect once and pay this exact checkout.")
+        session.commit()
+        return purchase
+
+    session.commit()
+    return _execute_payment(session, row, purchase)
+
+
+def _re_evaluate(contract: Contract, raw_proposal: dict[str, Any]) -> tuple[PurchaseStatus | None, int | None, list[str]]:
+    """Run the engine on a re-extracted checkout. Returns (outcome, payable cents, failing reasons)."""
+    try:
+        proposal = TransactionProposal.model_validate(raw_proposal)
+    except ValidationError:
+        return None, None, ["The new checkout's numbers don't add up."]
+    decision, outcome = evaluate(contract, proposal, now=clock())
+    reasons = [r.reason for r in decision.results if r.verdict != ConstraintVerdict.PASS and r.severity != ConstraintSeverity.SOFT]
+    return outcome, payable_total_cents(proposal), reasons
+
+
+def _execute_payment(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
+    """
+    EXECUTOR mode: the backend retrieves the card and pays the merchant itself.
+    The card never enters any agent's context. It lives only inside this function.
+    """
+    if not db.claim_payment_state(session, row.id, (payments.REVALIDATING,), payments.PAYING):
+        return purchase
+    session.commit()  # "paying" is on disk BEFORE the pay call, so a crash means "check for an order"
+
+    try:
+        card = _run_async(_provider_for(row).retrieve_card(row.provider_request_id or ""))
+    except payments.PaymentError as exc:
+        return _end_payment(session, row, purchase, payments.FAILED, "credential_retrieval_failed",
+                            f"The card could not be retrieved ({exc.code}); nothing was paid.")
+    try:
+        order = payments.pay_merchant(row.checkout_url or "", card, row.pay_amount_minor, row.currency)
+    except payments.PaymentUncertain as exc:
+        # Maybe charged, maybe not. NEVER retry blindly: the next refresh asks the merchant.
+        _set_payment(session, row, state=payments.UNKNOWN, last_error=exc.message, card_last4=card.last4)
+        _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_USED, "payment_outcome_unknown",
+                       "The merchant did not confirm the payment. Handshake will check for an order; it will not pay again.", last4=card.last4)
+        session.commit()
+        return purchase
+    except payments.PaymentError as exc:
+        return _end_payment(session, row, purchase, payments.FAILED, "payment_refused", f"The merchant refused the payment ({exc.code}).")
+    finally:
+        del card
+
+    _set_payment(session, row, state=payments.PAID, order_id=str(order.get("order_id")), card_last4=str(order.get("last4") or "")[-4:] or None)
+    _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_USED, "payment_submitted",
+                   "Handshake's executor paid the merchant with the single-use card.", order_id=row.order_id, last4=row.card_last4)
+    session.commit()
+    return _verify_and_complete(session, row, purchase)
+
+
+def _look_for_order(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
+    """
+    PAYING or UNKNOWN: ask the MERCHANT whether this checkout has an order.
+
+    This resolves an uncertain outcome before anything else happens: an order
+    means it was paid; no order after an uncertain call means it wasn't (and
+    we still never pay again on our own). For a request whose creation was
+    uncertain, reconcile with the provider instead.
+    """
+    if row.state == payments.UNKNOWN and not row.provider_request_id:
+        contract = db.load_contract(session, purchase.contract_id)
+        proposal = TransactionProposal.model_validate(db.get_proposal_row(session, purchase.proposal_id).data)
+        try:
+            found = _run_async(_provider_for(row).reconcile(_spend_spec(purchase, contract, proposal, row.amount_minor)))
+        except payments.PaymentError:
+            return purchase
+        if found is None:
+            return _end_payment(session, row, purchase, payments.FAILED, "payment_request_failed",
+                                "The payment request was never created; nothing was paid.")
+        _set_payment(session, row, provider_request_id=found.request_id, approval_url=found.approval_url, state=payments.AWAITING_APPROVAL)
+        session.commit()
+        return purchase
+
+    try:
+        order = payments.find_session_order(row.checkout_url or "")
+    except payments.PaymentError as exc:
+        _set_payment(session, row, last_error=exc.message)
+        session.commit()
+        return purchase
+    if order is None:
+        if row.state == payments.UNKNOWN:
+            return _end_payment(session, row, purchase, payments.FAILED, "payment_not_made",
+                                "The merchant has no order for this checkout, so the uncertain payment did not happen. Nothing will be retried automatically.")
+        return purchase  # agent hasn't paid yet
+    _set_payment(session, row, state=payments.PAID, order_id=str(order.get("order_id")), card_last4=(str(order.get("last4") or "")[-4:] or row.card_last4))
+    _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_USED, "payment_submitted",
+                   "The merchant reports an order for this checkout.", order_id=row.order_id, last4=row.card_last4)
+    session.commit()
+    return _verify_and_complete(session, row, purchase)
+
+
+def _verify_and_complete(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
+    """
+    PAID: verify the order with the merchant INDEPENDENTLY, then reconcile.
+
+    Reconciliation reuses complete_purchase(): an overcharge of even one cent
+    fails the purchase and revokes the credential. Money did move then, so
+    the contract is NOT released.
+    """
+    try:
+        order = payments.get_order(row.checkout_url or "", row.order_id or "")
+    except payments.PaymentUncertain as exc:
+        _set_payment(session, row, last_error=exc.message)
+        session.commit()
+        return purchase
+    except payments.PaymentError as exc:
+        return _end_payment(session, row, purchase, payments.FAILED, "order_not_verified",
+                            f"The merchant could not confirm order {row.order_id}: {exc.message}", release=False)
+
+    if order.get("session_id") != (row.checkout_url or "").rstrip("/").rsplit("/", 1)[-1] or str(order.get("currency", "")).upper() != row.currency:
+        return _end_payment(session, row, purchase, payments.FAILED, "order_mismatch",
+                            "The merchant's order does not belong to this checkout.", release=False)
+
+    outcome = complete_purchase(session, purchase.id, float(order.get("amount_charged") or 0))
+    purchase = outcome["purchase"]
+    receipt = {
+        "order_id": order.get("order_id"),
+        "amount_charged": order.get("amount_charged"),
+        "currency": order.get("currency"),
+        "last4": order.get("last4"),
+        "status": order.get("status"),
+        "verified_at": clock().isoformat(),
+        "test_mode": bool(order.get("test_mode", True)),
+    }
+    if purchase.status == PurchaseStatus.COMPLETED:
+        _set_payment(session, row, state=payments.COMPLETED, receipt=receipt, card_last4=str(order.get("last4") or row.card_last4 or "") or None)
+        contract = db.load_contract(session, purchase.contract_id)
+        if contract is not None and contract.single_use and contract.status == ContractStatus.ACTIVE:
+            db.claim_single_use_contract(session, contract.id)  # already USED via the reservation; this is a no-op then
+        _payment_event(session, row, purchase.contract_id, EvidenceEventType.PAYMENT_COMPLETED, "receipt_verified",
+                       f"Order {order.get('order_id')} verified with the merchant: {fmt_money(to_cents(order.get('amount_charged') or 0), row.currency)} charged.",
+                       receipt=receipt)
+    else:
+        _set_payment(session, row, state=payments.FAILED, receipt=receipt, last_error=purchase.error)
+        _payment_event(session, row, purchase.contract_id, EvidenceEventType.PAYMENT_MISMATCH, "receipt_mismatch",
+                       f"The verified charge did not match the authorization: {purchase.error}", receipt=receipt)
+    session.commit()
+    return purchase
+
+
+# ============================================================
+# Agent-visible mode: the one-time card release (section 9.6)
+# ============================================================
+
+
+class CredentialRelease(BaseModel):
+    """
+    The ONLY response in Handshake that contains card values. Sensitive.
+
+    It is returned once, to the owning agent, for one purchase, and is never
+    cached, logged, stored, or put into evidence. Every other response
+    carries at most last4.
+    """
+
+    purchase_id: str
+    contract_id: str
+    merchant_name: str
+    checkout_url: str
+    pay_url: str
+    pay_method: str = "POST"
+    amount: float
+    currency: str
+    card_number: str
+    exp_month: int
+    exp_year: int
+    cvc: str
+    card_valid_until: str | None = None
+    authorization_expires_at: datetime
+    simulated: bool
+    mode_label: str
+    instructions: str
+
+
+def release_credential(session: Session, purchase_id: str, principal: Principal) -> CredentialRelease:
+    """
+    Release the single-use TEST card to the owning agent, exactly once, for exactly this purchase.
+
+    Requires: the caller is the agent the contract is bound to; the payment
+    is credential_ready (approved in Link AND revalidated); the contract still
+    verifies. The credential_ready -> paying claim is atomic, so a second call
+    (or two at once) gets 409 credential_already_released and no card values.
+    """
+    purchase = get_owned_purchase(session, purchase_id, principal.email)
+    contract = _require_contract(session, purchase.contract_id, principal.email)
+    if not principal.is_agent or contract.agent_key != principal.agent_id:
+        raise ServiceError(403, "agent_not_authorized", "Only the agent this contract is bound to can collect its card.")
+
+    row = db.get_payment(session, purchase.id)
+    if row is None or row.state in (payments.AWAITING_APPROVAL, payments.APPROVED, payments.REVALIDATING):
+        raise ServiceError(409, "payment_not_ready", "The card isn't available yet: the user must approve the payment and Handshake must recheck the checkout.")
+    if row.credential_released_at is not None or row.state in (payments.PAYING, payments.PAID, payments.COMPLETED, payments.UNKNOWN):
+        raise ServiceError(409, "credential_already_released", "The card for this purchase was already released. It is never sent twice.")
+    if row.state != payments.CREDENTIAL_READY:
+        raise ServiceError(409, "payment_not_ready", f"The payment is {row.state}; there is no card to release.")
+    if not verify_contract(contract)["valid"] or contract.status in (ContractStatus.REVOKED, ContractStatus.EXPIRED):
+        raise ServiceError(409, "contract_not_valid", "The contract no longer verifies or is no longer in force.")
+    credential = db.load_credential(session, purchase.credential_id)
+    if credential is None or credential.status != CredentialStatus.ACTIVE or as_utc(credential.expires_at)[0] <= clock():
+        raise ServiceError(409, "authorization_expired", "The authorization for this purchase is no longer active.")
+
+    # The one-time claim. Whoever flips credential_ready -> paying first gets the card.
+    if not db.claim_payment_state(session, row.id, (payments.CREDENTIAL_READY,), payments.PAYING):
+        raise ServiceError(409, "credential_already_released", "The card for this purchase was already released. It is never sent twice.")
+    session.commit()
+
+    try:
+        card = _run_async(_provider_for(row).retrieve_card(row.provider_request_id or ""))
+    except payments.PaymentError as exc:
+        # Nothing was delivered, so put the payment back and let the agent try again.
+        db.claim_payment_state(session, row.id, (payments.PAYING,), payments.CREDENTIAL_READY)
+        _set_payment(session, row, last_error=f"Card retrieval failed ({exc.code}).")
+        session.commit()
+        raise ServiceError(502, "credential_retrieval_failed", "The card could not be retrieved from the provider. Try again shortly.")
+
+    _set_payment(session, row, credential_released_at=clock(), card_last4=card.last4)
+    _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_CREATED, "credential_released",
+                   f"The single-use card (ending {card.last4}) was released once to {principal.label} for this checkout only.",
+                   last4=card.last4, simulated=card.simulated)
+    session.commit()
+
+    endpoints = payments.merchant_endpoints(row.checkout_url or "")
+    settings = get_settings()
+    return CredentialRelease(
+        purchase_id=purchase.id,
+        contract_id=purchase.contract_id,
+        merchant_name=purchase.merchant_name or "",
+        checkout_url=row.checkout_url or "",
+        pay_url=endpoints["pay_url"],
+        amount=float(Decimal(row.pay_amount_minor) / 100),
+        currency=row.currency,
+        card_number=card.number,
+        exp_month=card.exp_month,
+        exp_year=card.exp_year,
+        cvc=card.cvc,
+        card_valid_until=card.valid_until,
+        authorization_expires_at=credential.expires_at,
+        simulated=card.simulated,
+        mode_label=settings.payment_label,
+        instructions=(
+            "Use these card values ONCE, only for this checkout: POST them to pay_url with exactly this amount and currency. "
+            "Do not repeat them in chat, logs, or any other tool. Then poll get_purchase_status until it is completed. "
+            "If the payment outcome is uncertain, do NOT pay again; poll status instead."
+        ),
+    )
+
+
+def simulate_approval(session: Session, purchase_id: str, owner: str | None) -> Purchase:
+    """
+    STUB MODE ONLY: stand in for the user's approval tap in Link. Labeled "Simulated provider approval" everywhere.
+    """
+    purchase = get_owned_purchase(session, purchase_id, owner)
+    row = db.get_payment(session, purchase.id)
+    if row is None or row.provider != "stub":
+        raise ServiceError(409, "not_simulated", "Only a simulated payment can be approved this way.")
+    if row.state != payments.AWAITING_APPROVAL or not row.provider_request_id:
+        raise ServiceError(409, "payment_not_awaiting_approval", f"The payment is {row.state}, not waiting for approval.")
+    payments.StubProvider.simulate(row.provider_request_id, "approved")
+    _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "simulated_provider_approval",
+                   "Simulated provider approval: the user approved the (simulated) payment.")
+    session.commit()
+    return purchase
+
+
+def decline_authorized_purchase(session: Session, purchase: Purchase, note: str | None) -> dict[str, Any]:
+    """
+    The user declines an AUTHORIZED purchase before any card has moved ("Not this one").
+
+    Only while the payment hasn't started (awaiting approval, approved, or
+    card ready but not collected). The claim to DENIED is atomic, so it can't
+    race a card release: one of them wins.
+    """
+    row = db.get_payment(session, purchase.id)
+    not_started = (payments.AWAITING_APPROVAL, payments.APPROVED, payments.CREDENTIAL_READY)
+    if row is not None and not db.claim_payment_state(session, row.id, not_started, payments.DENIED):
+        raise ServiceError(409, "payment_already_started", "The payment is already under way and can no longer be declined.")
+    if row is not None:
+        _cancel_provider_request(row)
+    decision = db.load_decision(session, purchase.decision_id)
+    purchase = _set_purchase(session, purchase, status=PurchaseStatus.BLOCKED, error="Declined by the user before payment.", completed_at=clock())
+    credential = db.load_credential(session, purchase.credential_id)
+    if credential is not None and credential.status == CredentialStatus.ACTIVE:
+        db.update_credential(session, credential.model_copy(update={"status": CredentialStatus.REVOKED}))
+    contract = db.load_contract(session, purchase.contract_id)
+    released = bool(contract and contract.single_use and _release_reservation(session, purchase.contract_id))
+    log_event(
+        session, purchase.contract_id, EvidenceEventType.PURCHASE_BLOCKED,
+        "You declined this purchase before payment. The agent can keep looking under the same contract.",
+        {"kind": "purchase_declined", "human_rejection": True, "note": note, "contract_released": released},
+        purchase.id,
+    )
+    session.commit()
+    return {"purchase": purchase, "decision": decision, "credential": db.load_credential(session, purchase.credential_id)}
+
+
+# ============================================================
 # Read models for the API
 # ============================================================
+
+
+# Human names for results, so the UI never has to parse "constraint[0]:size:eq".
+# (field, label) per built-in rule; generic constraints use FIELD_LABELS.
+RULE_FIELDS: dict[str, tuple[str, str]] = {
+    "currency_match": ("currency", "Currency"),
+    "subtotal_integrity": ("item_subtotal", "Item subtotal adds up"),
+    "total_integrity": ("total_price", "Total adds up"),
+    "hard_cap_all_in": ("total_price", "Total price"),
+    "max_shipping": ("shipping", "Shipping cost"),
+    "contract_category": ("category", "Category"),
+    "no_subscription": ("subscription", "No subscription"),
+    "no_membership": ("membership", "No membership"),
+    "no_addons": ("addons", "No add-ons"),
+    "min_return_days": ("return_days", "Return window"),
+    "delivery_deadline": ("delivery_date", "Delivery date"),
+    "merchant_policy": ("merchant_name", "Merchant"),
+    "seller_requirement": ("seller_of_record", "Seller"),
+    "extractor_agreement": ("extractors_agreed", "Checkout readings agree"),
+    "contract_binding": ("contract_id", "Right contract"),
+    "checkout_link_format": ("checkout_url", "Checkout link"),
+    "checkout_link_merchant": ("merchant_name", "Link belongs to merchant"),
+    "checkout_link_selection": ("checkout_url", "Link matches agent's pick"),
+}
+
+FIELD_LABELS: dict[str, str] = {
+    "category": "Category", "brand": "Brand", "model": "Model", "product_name": "Product",
+    "condition": "Condition", "color": "Color", "size": "Size", "quantity": "Quantity",
+    "screen_size_inches": "Screen size", "display_type": "Display type", "refresh_rate_hz": "Refresh rate",
+    "storage_gb": "Storage", "memory_gb": "Memory", "material": "Material", "gender": "Gender", "fit": "Fit",
+    "food_size": "Size", "toppings": "Toppings", "dietary": "Dietary needs", "event_name": "Event",
+    "ticket_quantity": "Tickets", "seats_together": "Seats together", "section": "Section",
+    "merchant_name": "Merchant", "seller_of_record": "Seller", "return_days": "Return window",
+    "subscription": "Subscription", "membership": "Membership", "addons": "Add-ons",
+    "delivery_date": "Delivery date", "item_price": "Item price", "shipping": "Shipping",
+    "fees": "Fees", "tax": "Tax", "total_price": "Total price",
+}
+
+
+def result_field_and_label(constraint_name: str, category: str | None = None) -> tuple[str, str]:
+    """The (field, label) the UI shows for one ConstraintResult name."""
+    if constraint_name in RULE_FIELDS:
+        return RULE_FIELDS[constraint_name]
+    if constraint_name.startswith("constraint["):
+        parts = constraint_name.split(":")
+        field = parts[1] if len(parts) >= 2 else constraint_name
+        label = FIELD_LABELS.get(field, field.replace("_", " ").capitalize())
+        if field == "size" and category and "shoe" in category.lower():
+            label = "Shoe size"
+        return field, label
+    return constraint_name, constraint_name.replace("_", " ").capitalize()
+
+
+def decision_for_api(decision: ValidationDecision | None, category: str | None = None) -> dict[str, Any] | None:
+    """
+    A ValidationDecision as JSON, with two extra keys on every result: field and label.
+    The ConstraintResult model itself is unchanged; the keys are added only here, when serializing.
+    """
+    if decision is None:
+        return None
+    data = decision.model_dump(mode="json")
+    for item in data["results"]:
+        item["field"], item["label"] = result_field_and_label(item["constraint"], category)
+    return data
+
+
+def payment_for_api(row: db.PaymentRow | None) -> dict[str, Any] | None:
+    """The payment as the frontend sees it. No secrets: at most last4, never a card, token, or file path."""
+    if row is None:
+        return None
+    return {
+        "state": row.state,
+        "provider": row.provider,
+        "provider_label": "Stripe Link: TEST MODE" if row.provider == "link_test" else "Simulated provider",
+        "approval_url": row.approval_url,
+        "provider_reference": row.provider_request_id,
+        "amount": float(Decimal(row.amount_minor) / 100),
+        "pay_amount": float(Decimal(row.pay_amount_minor) / 100),
+        "currency": row.currency,
+        "last4": row.card_last4,
+        "credential_released": row.credential_released_at is not None,
+        "order_id": row.order_id,
+        "receipt": row.receipt,
+        "last_error": row.last_error,
+        "updated_at": db.utc(row.updated_at).isoformat() if row.updated_at else None,
+    }
+
+
+def resolution_from_evidence(session: Session, purchase_id: str) -> dict[str, Any] | None:
+    """Whether (and how) a human decided an escalation or declined, read from the evidence we already record."""
+    for row in reversed(db.list_evidence_for_purchase(session, purchase_id)):
+        data = row.data.get("data", {})
+        if data.get("human_approval"):
+            return {
+                "action": "approve",
+                "resolved_at": row.data.get("timestamp"),
+                "accepted_constraints": [c.get("constraint") for c in data.get("accepted_constraints", [])],
+                "note": data.get("note"),
+            }
+        if data.get("human_rejection"):
+            return {
+                "action": "reject" if data.get("kind") != "purchase_declined" else "decline",
+                "resolved_at": row.data.get("timestamp"),
+                "accepted_constraints": [],
+                "note": data.get("note"),
+            }
+    return None
+
+
+def next_action_for(purchase: Purchase, payment: db.PaymentRow | None) -> str:
+    """A short machine-readable hint for the agent and the UI about what happens next."""
+    status = purchase.status
+    if status == PurchaseStatus.COMPLETED:
+        return "completed"
+    if status == PurchaseStatus.ESCALATED:
+        return "wait_for_user_decision"
+    if status in (PurchaseStatus.BLOCKED, PurchaseStatus.FAILED):
+        if payment is not None and payment.state in (payments.EXPIRED, payments.CHECKOUT_CHANGED):
+            return "request_purchase_again"
+        return "blocked_no_action"
+    if status != PurchaseStatus.AUTHORIZED:
+        return "wait"
+    if payment is None:
+        return "wait"
+    return {
+        payments.AWAITING_APPROVAL: "wait_for_user_link_approval",
+        payments.APPROVED: "wait_for_revalidation",
+        payments.REVALIDATING: "wait_for_revalidation",
+        payments.CREDENTIAL_READY: "get_payment_credential_and_pay" if get_settings().credential_mode == "agent_visible" else "wait_for_payment",
+        payments.PAYING: "wait_for_merchant_order",
+        payments.PAID: "wait_for_order_verification",
+        payments.UNKNOWN: "wait_for_reconciliation",
+    }.get(payment.state, "wait")
+
+
+def purchase_detail(session: Session, purchase: Purchase, **extra: Any) -> dict[str, Any]:
+    """
+    GET /purchases/{id} (and every purchase response): a SUPERSET of the original
+    PurchaseResponse, plus the full purchase, proposal, payment, resolution,
+    next_action, and links. Nothing here contains card data.
+    """
+    decision = db.load_decision(session, purchase.decision_id)
+    credential = db.load_credential(session, purchase.credential_id)
+    proposal_row = db.get_proposal_row(session, purchase.proposal_id) if purchase.proposal_id else None
+    contract_row = db.get_contract_row(session, purchase.contract_id)
+    category = contract_row.data.get("category") if contract_row is not None else None
+    payment = db.get_payment(session, purchase.id)
+    summary_card = credential_summary(credential)
+    return {
+        # --- the original PurchaseResponse keys (unchanged) ---
+        "purchase_id": purchase.id,
+        "status": purchase.status.value,
+        "decision": decision_for_api(decision, category),
+        "contract_id": purchase.contract_id,
+        "proposal_id": purchase.proposal_id,
+        "credential": summary_card.model_dump(mode="json") if summary_card else None,
+        "summary": summarize(purchase, decision),
+        "idempotent_replay": bool(extra.get("idempotent_replay")),
+        # --- the superset for Rohan's PurchaseDetail ---
+        "purchase": purchase.model_dump(mode="json"),
+        "proposal": proposal_row.data if proposal_row else None,
+        "payment": payment_for_api(payment),
+        "payment_state": payment.state if payment else None,
+        "approval_url": payment.approval_url if payment else None,
+        "resolution": resolution_from_evidence(session, purchase.id),
+        "next_action": next_action_for(purchase, payment),
+        "review_url": purchase_url_for(purchase.id),
+    }
 
 
 def list_purchase_outcomes(session: Session, owner: str, contract_id: str | None = None) -> list[dict[str, Any]]:

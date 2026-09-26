@@ -71,6 +71,9 @@ class Settings:
     merchant_url: str = "http://localhost:3001"  # Sri's mock merchant
     cors_origins: tuple[str, ...] = ()  # empty -> frontend + merchant URLs
     allowed_merchant_origins: tuple[str, ...] = ()  # empty -> merchant URL only
+    # Which merchant each checkout origin belongs to, e.g. "http://localhost:3001=Amazon.com".
+    # The checkout-link parser uses it to check that a link really is that merchant's.
+    merchant_identities: tuple[tuple[str, str], ...] = ()  # empty -> merchant URL = "Amazon.com" (the mock store)
 
     # --- Storage ------------------------------------------------------------
     database_url: str = "sqlite:///./handshake.db"
@@ -102,7 +105,7 @@ class Settings:
     user_timezone: str = "America/New_York"
     escalation_ttl_minutes: int = 30
     session_ttl_minutes: int = 12 * 60
-    credential_ttl_minutes: int = 15
+    credential_ttl_minutes: int = 30  # authorization -> Link approval (10 min window) -> agent pays
     http_timeout_seconds: float = 10.0  # extractor/executor calls to the merchant
     max_checkout_bytes: int = 512 * 1024  # extractor refuses bigger responses
 
@@ -128,6 +131,13 @@ class Settings:
         if self.allowed_merchant_origins:
             return tuple(_origin(o) for o in self.allowed_merchant_origins)
         return (_origin(self.merchant_url),)
+
+    @property
+    def effective_merchant_identities(self) -> dict[str, str]:
+        """origin -> merchant name. By default the mock merchant's origin is 'Amazon.com' (Sri's store)."""
+        if self.merchant_identities:
+            return {_origin(origin): name for origin, name in self.merchant_identities}
+        return {_origin(self.merchant_url): "Amazon.com"}
 
     @property
     def compiler_uses_fixture(self) -> bool:
@@ -165,6 +175,17 @@ def _split_list(raw: str | None) -> tuple[str, ...]:
     if not raw:
         return ()
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _parse_identities(raw: str | None) -> tuple[tuple[str, str], ...]:
+    """Parse 'origin=Name;origin=Name' into pairs (a semicolon list, since names may contain commas)."""
+    pairs: list[tuple[str, str]] = []
+    for item in (raw or "").split(";"):
+        if "=" in item:
+            origin, name = item.split("=", 1)
+            if origin.strip() and name.strip():
+                pairs.append((origin.strip(), name.strip()))
+    return tuple(pairs)
 
 
 def _choice(env: Mapping[str, str], name: str, default: str, allowed: tuple[str, ...]) -> str:
@@ -214,6 +235,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         merchant_url=merchant_url,
         cors_origins=tuple(_origin(o) if o != "*" else "*" for o in _split_list(env.get("HANDSHAKE_CORS_ORIGINS"))),
         allowed_merchant_origins=_split_list(env.get("HANDSHAKE_ALLOWED_MERCHANT_ORIGINS")),
+        merchant_identities=_parse_identities(env.get("HANDSHAKE_MERCHANT_IDENTITIES")),
         database_url=env.get("DATABASE_URL", Settings.database_url),
         signing_secret=_optional(env, "HANDSHAKE_SIGNING_SECRET") or DEV_SIGNING_SECRET,
         session_secret=_optional(env, "HANDSHAKE_SESSION_SECRET") or DEV_SESSION_SECRET,

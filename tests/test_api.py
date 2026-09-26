@@ -112,7 +112,7 @@ def complete(purchase_id: str, charged_amount: float) -> ServiceResult:
     with db.SessionLocal() as session:
         try:
             outcome = services.complete_purchase(session, purchase_id, charged_amount)
-            return ServiceResult(200, _purchase_response(outcome).model_dump(mode="json"))
+            return ServiceResult(200, _purchase_response(outcome))
         except ServiceError as exc:
             return ServiceResult(exc.status_code, {"error": exc.code, "message": exc.message, "details": exc.details})
 
@@ -127,6 +127,9 @@ HAPPY_PATH_EVENTS = [
     "validation_completed",
     "purchase_authorized",
     "credential_created",
+    # Added by the payment flow (section 9): the Link TEST / simulated spend
+    # request, recorded as a purchase_authorized event with data.kind "payment_requested".
+    "purchase_authorized",
 ]
 
 
@@ -244,6 +247,11 @@ FORBIDDEN_KEY_PHRASES = (
 CARD_NUMBER_PATTERN = re.compile(r"\b\d{13,19}\b")  # a bare 13-19 digit run looks like a PAN
 
 
+# The ONE allowed "provider_reference": the payment's spend-request id (section 6.4),
+# which identifies a request and can't be used to pay. Its value is checked.
+PROVIDER_REQUEST_ID = re.compile(r"^(lsrq_|stub_sr_)[A-Za-z0-9_]+$")
+
+
 def find_credential_leaks(value: Any, path: str = "$") -> list[str]:
     """Walk JSON recursively; return the paths of keys/values that look like raw payment credentials."""
     leaks: list[str] = []
@@ -252,6 +260,8 @@ def find_credential_leaks(value: Any, path: str = "$") -> list[str]:
             lowered = str(key).lower()
             tokens = set(re.split(r"[_\-\s.]+", lowered))
             squashed = re.sub(r"[_\-\s.]", "", lowered)
+            if path.endswith(".payment") and lowered == "provider_reference" and (inner is None or PROVIDER_REQUEST_ID.match(str(inner))):
+                continue
             if tokens & FORBIDDEN_KEY_TOKENS or any(p in squashed for p in FORBIDDEN_KEY_PHRASES):
                 leaks.append(f"{path}.{key}")
             leaks.extend(find_credential_leaks(inner, f"{path}.{key}"))
@@ -291,6 +301,8 @@ def test_no_raw_credential_in_any_happy_path_response(client: TestClient) -> Non
     assert find_credential_leaks({"card_number": "x"}) == ["$.card_number"]
     assert find_credential_leaks({"a": {"CVV": 1}}) == ["$.a.CVV"]
     assert find_credential_leaks({"note": "4111111111111111"}) != []
+    assert find_credential_leaks({"credential": {"provider_reference": "stub_abc"}}) != []  # the internal one still counts
+    assert find_credential_leaks({"payment": {"provider_reference": "not-a-request-id"}}) != []
 
 
 # ============================================================
@@ -780,8 +792,10 @@ def test_approve_escalated_purchase_issues_credential(client: TestClient) -> Non
     # Evidence: escalated, then the human approval, then the credential.
     evidence = client.get(f"/evidence/{purchase_id}").json()
     types = [e["event_type"] for e in evidence["events"]]
-    assert types[-3:] == ["purchase_escalated", "purchase_authorized", "credential_created"]
-    approval = evidence["events"][-2]["data"]
+    # ...then the payment request (section 9) is appended after the credential.
+    assert types[-4:] == ["purchase_escalated", "purchase_authorized", "credential_created", "purchase_authorized"]
+    assert evidence["events"][-1]["data"]["kind"] == "payment_requested"
+    approval = evidence["events"][-3]["data"]
     assert approval["human_approval"] is True
     assert approval["note"] == "I checked, no add-ons."
     assert [c["constraint"] for c in approval["accepted_constraints"]] == ["no_addons"]
@@ -894,10 +908,27 @@ def test_reject_escalated_purchase(client: TestClient) -> None:
     assert client.get(f"/contracts/{contract_id}").json()["status"] == "active"
 
 
-def test_reject_refused_on_authorized_purchase(client: TestClient) -> None:
-    """Only escalated purchases can be rejected."""
+def test_reject_declines_authorized_purchase_before_payment(client: TestClient) -> None:
+    """
+    Section 16 changed this: /reject on an AUTHORIZED purchase whose payment
+    has not started now DECLINES it (it used to be a 409). The pending payment
+    request is cancelled and the single-use contract is freed for another try.
+    """
     contract_id = sign(client)
     purchase_id = purchase(client, contract_id).json()["purchase_id"]
+    body = client.post(f"/purchases/{purchase_id}/reject").json()
+    assert body["status"] == "blocked"
+    assert body["credential"]["status"] == "revoked"
+    assert client.get(f"/contracts/{contract_id}").json()["status"] == "active"
+    events = client.get(f"/evidence/{purchase_id}").json()["events"]
+    assert events[-1]["data"]["kind"] == "purchase_declined"
+
+
+def test_reject_refused_once_payment_is_done(client: TestClient) -> None:
+    """A purchase that already completed can't be rejected."""
+    contract_id = sign(client)
+    purchase_id = purchase(client, contract_id).json()["purchase_id"]
+    assert complete(purchase_id, 128.39).json()["status"] == "completed"
     assert client.post(f"/purchases/{purchase_id}/reject").status_code == 409
 
 
