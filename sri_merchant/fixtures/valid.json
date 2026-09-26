@@ -1,0 +1,25 @@
+{
+  "merchant": {
+    "name": "Amazon.com",
+    "domain": "localhost",
+    "seller_of_record": "Nike"
+  },
+  "line_items": [
+    {
+      "name": "Pegasus 41",
+      "category": "running_shoes",
+      "size": "10",
+      "condition": "new",
+      "quantity": 1,
+      "unit_price": 119.99
+    }
+  ],
+  "tax": 8.4,
+  "shipping": 0,
+  "fees": 0,
+  "total": 128.39,
+  "recurring_billing": false,
+  "delivery": {
+    "promised_by": "2026-09-28"
+  }
+}

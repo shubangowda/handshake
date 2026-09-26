@@ -1,0 +1,33 @@
+{
+  "merchant": {
+    "name": "Amazon.com",
+    "domain": "localhost",
+    "seller_of_record": "Nike"
+  },
+  "line_items": [
+    {
+      "name": "Pegasus 41",
+      "category": "running_shoes",
+      "size": "10",
+      "condition": "new",
+      "quantity": 1,
+      "unit_price": 119.99
+    },
+    {
+      "name": "Shoe Club Membership (Auto-Renew)",
+      "category": "subscription",
+      "size": null,
+      "condition": null,
+      "quantity": 1,
+      "unit_price": 14.99
+    }
+  ],
+  "tax": 8.4,
+  "shipping": 0,
+  "fees": 0,
+  "total": 143.38,
+  "recurring_billing": true,
+  "delivery": {
+    "promised_by": "2026-09-28"
+  }
+}
