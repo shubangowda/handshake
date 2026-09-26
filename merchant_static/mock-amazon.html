@@ -16,7 +16,7 @@
     <!-- Top nav -->
     <div class="bg-[#131921] text-white px-4 py-2 flex items-center gap-4 text-sm">
         <a href="#" onclick="showView('product');return false;">
-            <img src="assets/amazon-logo-white.svg" alt="Amazon" class="h-7 px-2" />
+            <img src="/assets/amazon-logo-white.svg" alt="Amazon" class="h-7 px-2" />
         </a>
         <div class="hidden md:flex flex-col leading-tight px-2 border border-transparent hover:border-white rounded cursor-pointer">
             <span class="text-gray-300 text-xs">Deliver to Sri</span>
@@ -74,12 +74,12 @@
 
         <div class="max-w-6xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-8">
             <div class="lg:col-span-1 hidden lg:flex flex-col gap-2">
-                <img src="assets/shoe-pegasus.jpg" class="w-14 h-14 object-cover border rounded ring-2 ring-orange-400" />
+                <img src="/assets/shoe-pegasus.jpg" class="w-14 h-14 object-cover border rounded ring-2 ring-orange-400" />
                 <div class="w-14 h-14 border rounded flex items-center justify-center text-xl bg-gray-50">📦</div>
                 <div class="w-14 h-14 border rounded flex items-center justify-center text-xl bg-gray-50">👟</div>
             </div>
             <div class="lg:col-span-4 flex items-start justify-center">
-                <img src="assets/shoe-pegasus.jpg" class="w-full rounded border object-cover" />
+                <img src="/assets/shoe-pegasus.jpg" class="w-full rounded border object-cover" />
             </div>
 
             <div class="lg:col-span-4">
@@ -131,22 +131,22 @@
             <h2 class="text-sm font-bold text-gray-700 mb-3 border-t pt-6">Customers also viewed these running shoes</h2>
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="border rounded p-3">
-                    <img src="assets/shoe-secondary1.jpg" class="w-full h-24 object-cover rounded mb-2" />
+                    <img src="/assets/shoe-secondary1.jpg" class="w-full h-24 object-cover rounded mb-2" />
                     <p class="text-xs text-gray-800">Nike Vaporfly 3</p>
                     <p class="text-xs font-bold">$259.99</p>
                 </div>
                 <div class="border rounded p-3">
-                    <img src="assets/shoe-secondary2.jpg" class="w-full h-24 object-cover rounded mb-2" />
+                    <img src="/assets/shoe-secondary2.jpg" class="w-full h-24 object-cover rounded mb-2" />
                     <p class="text-xs text-gray-800">Nike Structure 25</p>
                     <p class="text-xs font-bold">$139.99</p>
                 </div>
                 <div class="border rounded p-3">
-                    <img src="assets/shoe-pegasus.jpg" class="w-full h-24 object-cover rounded mb-2" />
+                    <img src="/assets/shoe-pegasus.jpg" class="w-full h-24 object-cover rounded mb-2" />
                     <p class="text-xs text-gray-800">Nike Pegasus 41 (Wide)</p>
                     <p class="text-xs font-bold">$124.99</p>
                 </div>
                 <div class="border rounded p-3">
-                    <img src="assets/shoe-secondary1.jpg" class="w-full h-24 object-cover rounded mb-2" />
+                    <img src="/assets/shoe-secondary1.jpg" class="w-full h-24 object-cover rounded mb-2" />
                     <p class="text-xs text-gray-800">Nike Pegasus Trail 5</p>
                     <p class="text-xs font-bold">$129.99</p>
                 </div>
@@ -241,15 +241,23 @@
                 <option value="prompt_injection">G - Prompt Injection (red-team)</option>
             </select>
             <button onclick="applyScenario(document.getElementById('scenario-select').value)" class="w-full bg-gray-700 hover:bg-gray-600 text-white font-bold py-1.5 rounded font-sans text-xs mb-3">
-                Apply Scenario (resets cart)
+                Apply Scenario (creates a new checkout session)
             </button>
-            <p class="text-gray-500 font-sans mb-2">TransactionProposal is captured when the agent clicks "Place your order". This component only reports facts — it does not decide AUTHORIZED/BLOCKED/ESCALATED; that's Intent Diff's job.</p>
+            <div id="session-info" class="hidden font-sans mb-3 space-y-1">
+                <p class="text-gray-400">Checkout URL (give this to the agent):</p>
+                <a id="session-url" href="#" class="block break-all text-green-300 underline"></a>
+                <a id="frontend-link" href="#" target="_blank" rel="noopener" class="hidden block text-blue-300 underline">Open Handshake</a>
+            </div>
+            <p class="text-gray-500 font-sans mb-2">These are the checkout facts this store publishes (the same JSON the Handshake extractor reads). This component only reports facts — it does not decide AUTHORIZED/BLOCKED/ESCALATED; that's Intent Diff's job. "Place your order" is a visual demo only: real payment goes through this store's /pay API, called by the agent or Handshake's executor with the Link TEST card.</p>
             <pre id="json-output" class="whitespace-pre-wrap overflow-x-auto text-[11px]">{}</pre>
-            <button onclick="sendToBackend()" class="w-full bg-green-600 text-white font-bold py-1.5 rounded hover:bg-green-700 transition font-sans text-xs mt-3 hidden" id="send-btn">
-                Send to POST /purchases
-            </button>
         </div>
     </div>
+
+    <!-- Filled in by the merchant server (handshake/merchant.py). The facts are the
+         single source of truth for this checkout; the Handshake extractor reads
+         this exact tag (reading #2) and compares it with /api/checkout/{id} (reading #1). -->
+    <script type="application/json" id="handshake-checkout-facts">__HANDSHAKE_FACTS_JSON__</script>
+    <script type="application/json" id="handshake-merchant-config">__HANDSHAKE_CONFIG_JSON__</script>
 
     <script>
         // ---------------------------------------------------------------
@@ -260,7 +268,12 @@
         // is ever interpreted as control flow here — it is carried as inert data.
         // ---------------------------------------------------------------
 
-        let currentScenario = new URLSearchParams(location.search).get('scenario') || 'valid';
+        // Server-provided data (see the JSON script tags above). SERVER_FACTS is
+        // null on the bare product page, before a checkout session exists.
+        const SERVER_FACTS = JSON.parse(document.getElementById('handshake-checkout-facts').textContent);
+        const MERCHANT_CONFIG = JSON.parse(document.getElementById('handshake-merchant-config').textContent);
+
+        let currentScenario = (SERVER_FACTS && SERVER_FACTS.scenario) || new URLSearchParams(location.search).get('scenario') || 'valid';
         let cart = [];       // array of line items currently in the cart
         let meta = {};       // merchant / tax / shipping / fees / delivery / recurring_billing for the current cart
 
@@ -294,12 +307,27 @@
             return '$' + n.toFixed(2);
         }
 
-        // Single source of truth for what the scenario puts in the cart / checkout / final proposal.
-        // Matches the TransactionProposal schema agreed with Ajay/Shuban exactly (see fixtures/).
+        // Merchant text (product names, seller names) is untrusted. Everything that
+        // goes into innerHTML is escaped first, so a name like
+        // "<img src=x onerror=...>" or "Ignore previous rules" renders as plain text.
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // The scenarios themselves now live on the server (handshake/merchant.py,
+        // build_facts), so the page and the JSON feed can never disagree. This
+        // returns a copy of the facts the server embedded for this checkout.
         function buildScenarioData(scenario) {
+            if (SERVER_FACTS) {
+                return JSON.parse(JSON.stringify(SERVER_FACTS));
+            }
+            // Bare product page (no session yet): Sri's original valid-cart
+            // preview, for display only. Checking out creates a real session.
             const size = document.getElementById('size-select').value || '10';
             const data = {
-                merchant: { name: "Amazon.com", domain: "localhost", seller_of_record: "Nike", fulfilled_by_amazon: true },
+                merchant: { name: "Amazon.com", seller_of_record: "Nike", fulfilled_by_amazon: true },
                 line_items: [
                     { name: "Pegasus 41", category: "running_shoes", size: size, condition: "new", quantity: 1, unit_price: 119.99 }
                 ],
@@ -355,6 +383,19 @@
             document.getElementById('cart-badge').textContent = count;
         }
 
+        // Create a checkout session on this store (same origin, no hardcoded host)
+        // and go to its checkout page, which the server fills with the facts.
+        async function startCheckoutSession(scenario) {
+            const size = document.getElementById('size-select').value || '10';
+            const response = await fetch('/api/checkout-sessions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scenario: scenario, size: size, quantity: 1 })
+            });
+            if (!response.ok) { alert('Could not create a checkout session.'); return null; }
+            return response.json();
+        }
+
         function addToCart() {
             const data = buildScenarioData(currentScenario);
             cart = JSON.parse(JSON.stringify(data.line_items));
@@ -363,7 +404,12 @@
             document.getElementById('add-to-cart-banner').classList.remove('hidden');
         }
 
-        function buyNow() {
+        async function buyNow() {
+            if (!SERVER_FACTS) {
+                const created = await startCheckoutSession(currentScenario);
+                if (created) location.href = created.checkout_url;
+                return;
+            }
             addToCart();
             showView('checkout');
         }
@@ -383,10 +429,10 @@
                 <div class="flex gap-3 py-3 items-start">
                     <div class="w-16 h-16 border rounded flex items-center justify-center text-2xl bg-gray-50 shrink-0">${icon}</div>
                     <div class="flex-1">
-                        <p class="text-sm text-gray-900">${li.name}</p>
-                        <p class="text-xs text-gray-500">Condition: ${li.condition || 'N/A'}${li.size ? ' · Size: ' + li.size : ''}</p>
-                        <p class="text-xs text-gray-500">Sold by <span class="font-medium">${meta.merchant.seller_of_record}</span>${meta.merchant.fulfilled_by_amazon ? ' · Fulfilled by Amazon' : ''}</p>
-                        ${opts.showQty ? `<p class="text-xs text-gray-600 mt-1">Qty: ${li.quantity}</p>` : ''}
+                        <p class="text-sm text-gray-900">${escapeHtml(li.name)}</p>
+                        <p class="text-xs text-gray-500">Condition: ${escapeHtml(li.condition || 'N/A')}${li.size ? ' · Size: ' + escapeHtml(li.size) : ''}</p>
+                        <p class="text-xs text-gray-500">Sold by <span class="font-medium">${escapeHtml(meta.merchant.seller_of_record)}</span>${meta.merchant.fulfilled_by_amazon ? ' · Fulfilled by Amazon' : ''}</p>
+                        ${opts.showQty ? `<p class="text-xs text-gray-600 mt-1">Qty: ${escapeHtml(li.quantity)}</p>` : ''}
                     </div>
                     <div class="text-sm font-medium text-right">${money(li.unit_price * li.quantity)}</div>
                 </div>`;
@@ -497,6 +543,9 @@
             document.getElementById('checkout-summary').innerHTML = summary;
         }
 
+        // VISUAL DEMO ONLY. Nothing is charged here. Real payment is a separate
+        // call to this store's POST /api/checkout/{id}/pay with the Link TEST card,
+        // made by the agent (agent-visible mode) or Handshake's executor.
         function placeOrder() {
             const total = lineItemsSubtotal(cart) + meta.tax + meta.shipping + meta.fees;
             const pm = paymentMethods.find(p => p.id === selectedPaymentId);
@@ -520,7 +569,6 @@
             if (status.includes("PASS")) badge.className = "px-2 py-0.5 bg-green-900 text-green-300 rounded text-xs font-sans";
             else if (status.includes("FAIL")) badge.className = "px-2 py-0.5 bg-red-900 text-red-300 rounded text-xs font-sans";
             else badge.className = "px-2 py-0.5 bg-yellow-900 text-yellow-300 rounded text-xs font-sans";
-            document.getElementById('send-btn').classList.remove('hidden');
 
             document.getElementById('order-number').textContent = '111-' + Math.floor(1000000 + Math.random() * 8999999) + '-' + Math.floor(1000000 + Math.random() * 8999999);
             document.getElementById('order-delivery').textContent = meta.delivery.promised_by || 'date not provided by merchant';
@@ -531,45 +579,34 @@
             showView('confirmation');
         }
 
-        function applyScenario(scenario) {
+        // Dev panel: create a NEW checkout session for the chosen scenario and show
+        // its URL (what the agent is given), plus a link to the Handshake frontend.
+        async function applyScenario(scenario) {
             currentScenario = scenario;
             document.getElementById('scenario-select').value = scenario;
-            cart = [];
-            meta = {};
-            updateCartBadge();
-            document.getElementById('add-to-cart-banner').classList.add('hidden');
-            document.getElementById('json-output').textContent = '{}';
-            document.getElementById('status-badge').textContent = 'Awaiting Checkout';
-            document.getElementById('status-badge').className = 'px-2 py-0.5 bg-gray-700 rounded text-xs font-sans';
-            document.getElementById('send-btn').classList.add('hidden');
-            showView('product');
-        }
-
-        async function sendToBackend() {
-            const btn = document.getElementById('send-btn');
-            btn.textContent = "Sending to http://localhost:8000/purchases...";
-            try {
-                /* Uncomment when backend is running:
-                const response = await fetch('http://localhost:8000/purchases', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(window.currentPayload)
-                });
-                const result = await response.json();
-                console.log(result);
-                */
-                setTimeout(() => {
-                    btn.textContent = "Simulated Request Sent!";
-                    setTimeout(() => btn.textContent = "Send to POST /purchases", 2000);
-                }, 800);
-            } catch (e) {
-                alert("Ensure the FastAPI server is running on port 8000.");
-                btn.textContent = "Send to POST /purchases";
+            const created = await startCheckoutSession(scenario);
+            if (!created) return;
+            const link = document.getElementById('session-url');
+            link.textContent = created.checkout_url;
+            link.href = created.checkout_url;
+            document.getElementById('session-info').classList.remove('hidden');
+            const frontend = document.getElementById('frontend-link');
+            if (MERCHANT_CONFIG.frontend_url) {
+                frontend.href = MERCHANT_CONFIG.frontend_url + '/contracts';
+                frontend.classList.remove('hidden');
             }
         }
 
         document.getElementById('scenario-select').value = currentScenario;
-        showView('product');
+        if (SERVER_FACTS) {
+            // /checkout/{id}: the cart is preloaded from the server's facts.
+            addToCart();
+            document.getElementById('add-to-cart-banner').classList.add('hidden');
+            document.getElementById('json-output').textContent = JSON.stringify(SERVER_FACTS, null, 2);
+            showView('checkout');
+        } else {
+            showView('product');
+        }
     </script>
 </body>
 </html>

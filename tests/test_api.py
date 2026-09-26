@@ -21,7 +21,7 @@ from httpx import Response
 
 from handshake import db, services
 from handshake.config import get_settings
-from conftest import Mutator, api_draft_payload, proposal_payload
+from conftest import STATIC_EXTRACTOR, Mutator, api_draft_payload, proposal_payload
 
 
 # ------------------------------------------------------------
@@ -39,11 +39,17 @@ def sign(client: TestClient, **draft_overrides: Any) -> str:
 
 
 def purchase(client: TestClient, contract_id: str, mutate: Mutator | None = None, **extra: Any) -> Response:
-    """Submit the passing proposal (optionally edited by `mutate`) against `contract_id`."""
+    """
+    Submit a purchase whose checkout contains the passing proposal (optionally edited by `mutate`).
+
+    The proposal is no longer posted by the caller: it is loaded into the
+    StaticExtractor, which plays the part of Handshake reading the checkout.
+    """
     proposal = proposal_payload(contract_id)
     if mutate is not None:
         mutate(proposal)
-    body = {"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout", "proposal": proposal, **extra}
+    STATIC_EXTRACTOR.set(proposal)
+    body = {"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout", **extra}
     return client.post("/purchases", json=body)
 
 

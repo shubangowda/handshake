@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 from handshake import auth, compiler, db, services
 from handshake.auth import AuthError, Principal, current_principal
 from handshake.config import get_settings
+from handshake.extractor import Extractor, get_extractor
 from handshake.models import (
     Contract,
     PurchaseRequest,
@@ -60,17 +61,20 @@ log = logging.getLogger("handshake")
 
 class PurchaseSubmission(PurchaseRequest):
     """
-    The POST /purchases body: PurchaseRequest (from models.py) plus the extracted checkout facts.
+    The POST /purchases body: PurchaseRequest (from models.py) plus an idempotency key.
 
-    TODO: confirm this exact payload with Ajay (producer) and Rohan (consumer).
+    Deliberately NO proposal field. The caller says WHERE the checkout is
+    (checkout_url); Handshake's extractor reads WHAT is in it. Letting the
+    proposing side supply its own facts would let it grade its own homework.
+    Unknown keys (including an old-style "proposal") are refused.
 
-    `proposal` is a raw dict on purpose. If it were typed as
-    TransactionProposal, FastAPI would reject a fudged total with a bare 422
-    before our code ran, and nothing would be logged. As a dict, the purchase
-    flow parses it itself and records a BLOCKED decision instead.
+    idempotency_key is required for the agent: retries after a timeout must
+    return the same purchase, never create a second one.
     """
 
-    proposal: dict[str, Any]
+    model_config = {"extra": "forbid"}
+
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class PurchaseResponse(PurchaseStatusResponse):
@@ -80,6 +84,7 @@ class PurchaseResponse(PurchaseStatusResponse):
     proposal_id: str | None = None
     credential: CredentialSummary | None = None
     summary: str
+    idempotent_replay: bool = False  # true when an idempotency key returned an existing purchase
 
 
 class HumanDecisionRequest(BaseModel):
@@ -459,6 +464,7 @@ def _purchase_response(outcome: dict[str, Any]) -> PurchaseResponse:
         proposal_id=purchase.proposal_id,
         credential=services.credential_summary(outcome.get("credential")),
         summary=services.summarize(purchase, decision),
+        idempotent_replay=bool(outcome.get("idempotent_replay")),
     )
 
 
@@ -467,6 +473,7 @@ def create_purchase(
     body: Any = Body(...),
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
+    extractor: Extractor = Depends(get_extractor),
 ) -> PurchaseResponse:
     """
     Run the full purchase flow for one proposed checkout (see services.submit_purchase). User or agent.
@@ -486,13 +493,18 @@ def create_purchase(
             details["status"] = "failed"
         raise ServiceError(422, "invalid_request", "Purchase submission failed validation.", details)
 
+    if principal.is_agent and not submission.idempotency_key:
+        raise ServiceError(422, "idempotency_key_required", "The agent must send an idempotency_key (a fresh random string per purchase attempt).")
+
     outcome = services.submit_purchase(
         session,
         contract_id=submission.contract_id,
         checkout_url=submission.checkout_url,
         selection_report=submission.selection_report,
-        raw_proposal=submission.proposal,
         principal=principal,
+        extractor=extractor,
+        idempotency_key=submission.idempotency_key,
+        submission=submission.model_dump(mode="json"),
     )
     return _purchase_response(outcome)
 

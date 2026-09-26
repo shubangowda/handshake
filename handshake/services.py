@@ -37,9 +37,11 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ValidationError, model_validator
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from handshake import compiler, db
+from handshake.extractor import Extractor, ExtractionError
 from handshake.auth import Principal
 from handshake.config import DEV_SIGNING_SECRET, get_settings
 from handshake.intent_diff import (
@@ -919,6 +921,7 @@ def _record_rejected_attempt(
     checkout_url: str | None,
     raw_payload: Any,
     extra: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
 ) -> ServiceError:
     """
     Record a purchase attempt that was rejected before evaluation, and return the error to raise.
@@ -939,7 +942,7 @@ def _record_rejected_attempt(
         completed_at=now,
         error=message,
     )
-    db.save_purchase(session, purchase, owner=row.owner)
+    db.save_purchase(session, purchase, owner=row.owner, idempotency_key=idempotency_key)
 
     log_event(
         session, row.id, EvidenceEventType.SHOPPING_STARTED,
@@ -965,7 +968,12 @@ def _record_rejected_attempt(
 
 
 def _load_contract_for_purchase(
-    session: Session, contract_id: str, checkout_url: str, raw_proposal: Any, principal: Principal | None = None
+    session: Session,
+    contract_id: str,
+    checkout_url: str,
+    raw_proposal: Any,
+    principal: Principal | None = None,
+    idempotency_key: str | None = None,
 ) -> Contract:
     """
     Step 1: load the contract and make sure it can be spent against.
@@ -984,7 +992,8 @@ def _load_contract_for_purchase(
     def reject(code: str, message: str, extra: dict[str, Any]) -> ServiceError:
         """Shortcut for recording a BLOCKED attempt against this contract."""
         return _record_rejected_attempt(
-            session, row, PurchaseStatus.BLOCKED, 409, code, message, checkout_url, raw_proposal, extra
+            session, row, PurchaseStatus.BLOCKED, 409, code, message, checkout_url, raw_proposal, extra,
+            idempotency_key=idempotency_key,
         )
 
     # If someone edited the stored JSON into something that is not even a
@@ -1024,6 +1033,7 @@ def _load_contract_for_purchase(
             session, row, PurchaseStatus.BLOCKED, 403, "agent_not_authorized",
             "This contract was signed for a different agent; this agent may not use it.",
             checkout_url, raw_proposal, {"contract_agent_key": contract.agent_key, "agent_id": principal.agent_id},
+            idempotency_key=idempotency_key,
         )
 
     return contract
@@ -1079,27 +1089,74 @@ def _parse_proposal(
     return proposal, [total_integrity]
 
 
+def _outcome_for(session: Session, purchase: Purchase, **extra: Any) -> dict[str, Any]:
+    """The {purchase, decision, credential} bundle for an existing purchase."""
+    return {
+        "purchase": purchase,
+        "decision": db.load_decision(session, purchase.decision_id),
+        "credential": db.load_credential(session, purchase.credential_id),
+        **extra,
+    }
+
+
 def submit_purchase(
     session: Session,
     contract_id: str,
     checkout_url: str,
     selection_report: SelectionReport | None,
-    raw_proposal: dict[str, Any],
     principal: Principal | None = None,
+    extractor: Extractor | None = None,
+    idempotency_key: str | None = None,
+    submission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    The full purchase flow: check contract -> record -> parse -> evaluate -> block / escalate / authorize.
+    The full purchase flow:
+        ownership -> idempotency -> contract checks -> record -> EXTRACT -> parse -> evaluate
+        -> block / escalate / authorize
+
+    The caller supplies only WHERE the checkout is. Handshake's extractor
+    reads the facts itself; the agent's claims about price, items, or
+    approval are never an input to the decision.
 
     Every step writes an evidence event. Returns {"purchase", "decision",
     "credential"}; purchase.status is the effective outcome.
     """
+    owner = principal.email if principal else None
+
+    # ---- Step 0a: ownership (unknown and foreign both look missing) --------
+    row = db.get_contract_row(session, contract_id)
+    missing = f"No signed contract with id {contract_id!r}."
+    if row is None:
+        raise ServiceError(404, "contract_not_found", missing)
+    _check_owner(row.owner, owner, "contract_not_found", missing)
+
+    # ---- Step 0b: idempotency ---------------------------------------------
+    # The agent retries after timeouts. The same (contract, idempotency_key)
+    # must return the SAME purchase, never create a second one. This runs
+    # before the contract checks on purpose: after a successful purchase the
+    # contract is "used", and a retry must get its purchase back, not a
+    # "contract used" rejection.
+    if idempotency_key:
+        existing = db.find_purchase_by_idempotency_key(session, contract_id, idempotency_key)
+        if existing is not None:
+            return _outcome_for(session, existing, idempotent_replay=True)
+
     # ---- Step 1: is the contract usable at all? ------------------------
-    contract = _load_contract_for_purchase(session, contract_id, checkout_url, raw_proposal, principal)
-    contract_owner = db.get_contract_row(session, contract.id).owner
+    contract = _load_contract_for_purchase(session, contract_id, checkout_url, submission, principal, idempotency_key)
+    contract_owner = row.owner
 
     # ---- Step 2: create the purchase record ----------------------------
     purchase = Purchase(contract_id=contract.id, currency=contract.spend.currency, created_at=clock())
-    db.save_purchase(session, purchase, owner=contract_owner)
+    try:
+        db.save_purchase(session, purchase, owner=contract_owner, idempotency_key=idempotency_key)
+        session.flush()
+    except IntegrityError:
+        # Two requests with the same key raced; the other one won. Return its purchase.
+        session.rollback()
+        existing = db.find_purchase_by_idempotency_key(session, contract_id, idempotency_key or "")
+        if existing is None:
+            raise
+        return _outcome_for(session, existing, idempotent_replay=True)
 
     shopping_data: dict[str, Any] = {"checkout_url": checkout_url, "selection_report": selection_report}
     # Informational only: the contract asked for a report on how the agent
@@ -1112,18 +1169,47 @@ def submit_purchase(
     )
     session.commit()
 
-    # ---- Step 3: parse and store the proposal --------------------------
+    # ---- Step 3a: Handshake reads the checkout itself ----------------------
+    if extractor is None:
+        from handshake.extractor import get_extractor
+
+        extractor = get_extractor()
+    try:
+        extraction = extractor.extract(checkout_url, contract.id)
+    except ExtractionError as exc:
+        # A URL Handshake refuses to fetch (SSRF rules) is BLOCKED; a merchant
+        # that can't be read is FAILED. Either way: evidence, then an error
+        # that carries the purchase_id so the frontend can show the attempt.
+        status = PurchaseStatus.BLOCKED if exc.code == "unsupported_checkout_url" else PurchaseStatus.FAILED
+        purchase = _set_purchase(session, purchase, status=status, error=exc.message, completed_at=clock())
+        log_event(
+            session, contract.id, EvidenceEventType.PURCHASE_BLOCKED,
+            f"Handshake could not read the checkout: {exc.message}",
+            {"reason": exc.code, "kind": "extraction_failed", "checkout_url": checkout_url, **exc.details},
+            purchase.id,
+        )
+        session.commit()
+        raise ServiceError(exc.status_code, exc.code, exc.message, {"purchase_id": purchase.id, "status": status.value, **exc.details})
+    raw_proposal = extraction.raw_proposal
+
+    # ---- Step 3b: parse and store the proposal --------------------------
     proposal, total_mismatch_results = _parse_proposal(session, contract, purchase, raw_proposal)
 
     # Record which fields were explicitly sent BEFORE anything is re-loaded
     # from the database (see intent_diff.explicit_fields for why).
     fields_set = explicit_fields(proposal)
-    db.save_proposal(session, proposal, raw_proposal, fields_set, purchase.id)
+    db.save_proposal(session, proposal, raw_proposal, fields_set, purchase.id, snapshot_hash=extraction.snapshot_hash)
     purchase = _set_purchase(session, purchase, proposal_id=proposal.id, merchant_name=proposal.merchant.name)
     log_event(
         session, contract.id, EvidenceEventType.PROPOSAL_CREATED,
-        f"Checkout proposal recorded: {fmt_money(to_cents(proposal.total), proposal.currency)} at {proposal.merchant.name}.",
-        {"proposal": proposal, "fields_set": sorted(fields_set)},
+        f"Checkout extracted by Handshake: {fmt_money(to_cents(proposal.total), proposal.currency)} at {proposal.merchant.name}.",
+        {
+            "proposal": proposal,
+            "fields_set": sorted(fields_set),
+            "checkout_snapshot_hash": extraction.snapshot_hash,
+            "extractor": extraction.evidence.get("extractor"),
+            "extractor_disagreements": extraction.evidence.get("disagreements", []),
+        },
         purchase.id,
     )
 

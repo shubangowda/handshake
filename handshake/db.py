@@ -37,6 +37,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     func,
     select,
@@ -201,6 +202,10 @@ class ProposalRow(Base):
     # re-loaded from `data`, every field is present in the JSON and would
     # look "explicitly sent", which would defeat the fail-closed check.
     fields_set: Mapped[list] = mapped_column(JSON)
+    # SHA-256 of the merchant facts the decision was made on. Before paying,
+    # the checkout is re-extracted and this hash compared: a changed cart is
+    # re-evaluated instead of paid for.
+    checkout_snapshot_hash: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class DecisionRow(Base):
@@ -221,6 +226,9 @@ class PurchaseRow(Base):
     """One purchase attempt, from submission to authorization/block/completion."""
 
     __tablename__ = "purchases"
+    # One purchase per (contract, idempotency key): a retried request can
+    # never create a second purchase, even if two retries race.
+    __table_args__ = (UniqueConstraint("contract_id", "idempotency_key", name="uq_purchase_idempotency"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     # The user (email) who owns this record. Every read and write checks it.
@@ -237,6 +245,8 @@ class PurchaseRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Supplied by the agent (required) or the user (optional). NULLs never collide.
+    idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
     data: Mapped[dict] = mapped_column(JSON)
 
 
@@ -511,6 +521,7 @@ def save_proposal(
     raw_payload: dict[str, Any],
     fields_set: set[str],
     purchase_id: str | None,
+    snapshot_hash: str | None = None,
 ) -> None:
     """Insert a parsed proposal, the raw payload as received, and which fields were explicitly sent."""
     session.add(
@@ -524,6 +535,7 @@ def save_proposal(
             data=_dump(proposal),
             raw_payload=raw_payload,
             fields_set=sorted(fields_set),  # sorted so the stored list is deterministic
+            checkout_snapshot_hash=snapshot_hash,
         )
     )
 
@@ -582,9 +594,17 @@ def _purchase_columns(purchase: Purchase) -> dict[str, Any]:
     }
 
 
-def save_purchase(session: Session, purchase: Purchase, owner: str = "") -> None:
+def save_purchase(session: Session, purchase: Purchase, owner: str = "", idempotency_key: str | None = None) -> None:
     """Insert a new purchase owned by `owner` (always the contract's owner)."""
-    session.add(PurchaseRow(id=purchase.id, owner=owner, **_purchase_columns(purchase)))
+    session.add(PurchaseRow(id=purchase.id, owner=owner, idempotency_key=idempotency_key, **_purchase_columns(purchase)))
+
+
+def find_purchase_by_idempotency_key(session: Session, contract_id: str, key: str) -> Purchase | None:
+    """The purchase already created for (contract, idempotency key), if any."""
+    row = session.scalar(
+        select(PurchaseRow).where(PurchaseRow.contract_id == contract_id, PurchaseRow.idempotency_key == key)
+    )
+    return Purchase.model_validate(row.data) if row else None
 
 
 def update_purchase(session: Session, purchase: Purchase) -> None:

@@ -193,12 +193,26 @@ def user_headers(email: str = TEST_USER) -> dict[str, str]:
     return bearer(token)
 
 
+# The extractor API tests use (section 7.6). POST /purchases no longer takes
+# a proposal from the caller, so tests choose what "the checkout" contains by
+# loading this StaticExtractor, which the api_app fixture installs through a
+# FastAPI dependency override.
+from handshake.extractor import StaticExtractor  # noqa: E402
+
+STATIC_EXTRACTOR = StaticExtractor()
+
+
 @pytest.fixture
 def api_app(test_db: Any) -> Any:
-    """A fresh FastAPI app built from the current settings."""
+    """A fresh FastAPI app built from the current settings, reading checkouts through STATIC_EXTRACTOR."""
     from handshake.api import create_app
+    from handshake.extractor import get_extractor
 
-    return create_app()
+    STATIC_EXTRACTOR.proposal = None
+    STATIC_EXTRACTOR.calls.clear()
+    app = create_app()
+    app.dependency_overrides[get_extractor] = lambda: STATIC_EXTRACTOR
+    return app
 
 
 @pytest.fixture

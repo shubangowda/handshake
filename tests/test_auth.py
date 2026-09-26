@@ -11,6 +11,7 @@ records that don't exist (404), and bad tokens are refused (401).
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import timedelta
 from typing import Any
 
@@ -19,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from handshake import auth, db, services
 from handshake.config import override_settings
-from conftest import api_draft_payload, proposal_payload
+from conftest import STATIC_EXTRACTOR, api_draft_payload, proposal_payload
 
 
 def sign(client: TestClient, **overrides: Any) -> str:
@@ -32,11 +33,13 @@ def sign(client: TestClient, **overrides: Any) -> str:
 
 
 def submit(client: TestClient, contract_id: str, mutate: Any = None) -> Any:
-    """Submit the passing proposal (optionally edited) against a contract."""
+    """Submit a purchase whose checkout (via the StaticExtractor) holds the passing proposal, optionally edited."""
     proposal = proposal_payload(contract_id)
     if mutate is not None:
         mutate(proposal)
-    return client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/c", "proposal": proposal})
+    STATIC_EXTRACTOR.set(proposal)
+    body = {"contract_id": contract_id, "checkout_url": "https://mocknike.example/c", "idempotency_key": f"key-{uuid.uuid4().hex}"}
+    return client.post("/purchases", json=body)
 
 
 def escalated(client: TestClient, **overrides: Any) -> tuple[str, str]:
