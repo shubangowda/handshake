@@ -85,6 +85,8 @@ class Settings:
     agent_owner: str = "demo@handshake.dev"  # which user the agent acts for
     agent_id: str = "agent_demo"  # the agent's identity; contracts bind to it
     mcp_http_token: str | None = None  # bearer token for MCP over HTTP
+    mcp_http_host: str = "127.0.0.1"  # where `handshake-mcp --transport http` listens
+    mcp_http_port: int = 8765
     agent_token_ttl_days: int = 7  # lifetime of an agent token issued through the device (OAuth) flow
     device_code_ttl_minutes: int = 10  # how long the user has to approve a "connect agent" request
     # Where the MCP server caches the agent token it got from the device flow (0600 file).
@@ -248,6 +250,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         agent_owner=(_optional(env, "HANDSHAKE_AGENT_OWNER") or Settings.agent_owner).lower(),
         agent_id=_optional(env, "HANDSHAKE_AGENT_ID") or Settings.agent_id,
         mcp_http_token=_optional(env, "HANDSHAKE_MCP_HTTP_TOKEN"),
+        mcp_http_host=_optional(env, "HANDSHAKE_MCP_HTTP_HOST") or Settings.mcp_http_host,
+        mcp_http_port=_number(env, "HANDSHAKE_MCP_HTTP_PORT", Settings.mcp_http_port, int),
         agent_token_ttl_days=_number(env, "HANDSHAKE_AGENT_TOKEN_TTL_DAYS", Settings.agent_token_ttl_days, int),
         device_code_ttl_minutes=_number(env, "HANDSHAKE_DEVICE_CODE_TTL_MINUTES", Settings.device_code_ttl_minutes, int),
         mcp_token_file=_optional(env, "HANDSHAKE_MCP_TOKEN_FILE") or Settings.mcp_token_file,

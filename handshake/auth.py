@@ -38,7 +38,7 @@ checks it on every read and write, and a record you don't own is reported as
 DEMO AUTH, NOT PRODUCTION AUTH
 ------------------------------
 demo-login hands a token to anyone who types an email address. That is fine
-for a hackathon demo on localhost and nothing more. It must be replaced by
+for a hackathon demo on a developer's own machine and nothing more. It must be replaced by
 passkeys or OAuth before real users (see README, "Future work").
 
 Token format

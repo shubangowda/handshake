@@ -87,7 +87,7 @@ def staged_text(path: str, scan_all: bool) -> str | None:
     if result.returncode != 0:
         return None
     raw = result.stdout
-    if b"\x00" in raw[:8000]:
+    if b"\x00" in raw[:8192]:
         return None  # binary (images); secrets of the kinds above are text
     return raw.decode("utf-8", errors="replace")
 

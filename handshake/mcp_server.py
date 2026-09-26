@@ -482,8 +482,8 @@ def main(argv: list[str] | None = None) -> int:
     """Run the MCP server: stdio by default, or streamable HTTP with --transport http."""
     parser = argparse.ArgumentParser(prog="handshake-mcp", description="Handshake MCP server (agent proposes; Handshake decides).")
     parser.add_argument("--transport", choices=("stdio", "http"), default="stdio")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", default=None, help="HTTP host (default: HANDSHAKE_MCP_HTTP_HOST)")
+    parser.add_argument("--port", type=int, default=None, help="HTTP port (default: HANDSHAKE_MCP_HTTP_PORT)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="handshake-mcp %(levelname)s %(message)s")
@@ -500,7 +500,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     import uvicorn
 
-    uvicorn.run(_http_app(server, settings.mcp_http_token), host=args.host, port=args.port, log_level="info")
+    host = args.host or settings.mcp_http_host
+    port = args.port or settings.mcp_http_port
+    uvicorn.run(_http_app(server, settings.mcp_http_token), host=host, port=port, log_level="info")
     return 0
 
 

@@ -108,10 +108,10 @@ class Extractor(Protocol):
 #
 # SSRF ("server-side request forgery"): if the backend fetched any URL it was
 # handed, an attacker could point it at internal services (a cloud metadata
-# endpoint at 169.254.169.254, a database admin page on localhost) and use
+# endpoint at 169.254.169.254, a database admin page on the loopback address) and use
 # Handshake as a proxy into the private network. So before ANY fetch:
 #   - only http/https
-#   - the origin must be on HANDSHAKE_ALLOWED_MERCHANT_ORIGINS (localhost is
+#   - the origin must be on HANDSHAKE_ALLOWED_MERCHANT_ORIGINS (the local machine is
 #     allowed only because the dev config lists the mock merchant there)
 #   - no usernames/passwords in URLs
 #   - link-local / metadata IPs are refused even if someone allowlisted them

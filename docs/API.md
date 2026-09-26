@@ -11,13 +11,15 @@ This is the single source of truth for every backend endpoint. The frontend's `l
 
 **Ownership.** You only ever see your own records. Someone else's id returns the same 404 as a missing one.
 
+**Agent binding.** A signed contract names one agent (`agent_key`). If the signer names none, it is bound to `HANDSHAKE_AGENT_ID` (default `agent_demo`). An agent's identity is the static token's `HANDSHAKE_AGENT_ID`, or, for device-flow tokens, the `client_id` it connected with. The MCP server uses `HANDSHAKE_AGENT_ID` as its `client_id`. Any other agent gets 403 `agent_not_authorized` on that contract.
+
 **User-only actions.** Signing, editing drafts, amending, revoking, approving, rejecting, approving devices, and simulated approval are user-only. If the agent attempts one, it gets **403 `agent_not_permitted`**, and the attempt is recorded in the evidence (`data.kind = "agent_action_denied"`).
 
 ## Auth and connecting agents
 
 | Route | Who | Request | Response |
 |---|---|---|---|
-| `POST /auth/demo-login` | anyone | `{"email"}` | `{"token", "token_type": "bearer", "email", "role": "user", "expires_at", "demo_auth": true}` |
+| `POST /auth/demo-login` | anyone | `{"email"}` | `{"token", "token_type": "bearer", "email", "role": "user", "expires_at", "demo_auth": true}`. `expires_at` is **Unix seconds**; every other time in this API is an ISO 8601 string. |
 | `GET /auth/me` | any token | – | `{"email", "role": "user" or "agent", "agent_id"}` |
 | `GET /.well-known/oauth-authorization-server` | anyone | – | OAuth discovery metadata (the device and token endpoints) |
 | `POST /oauth/device_authorization` | anyone (the MCP server) | `{"client_id", "client_name"?}` | `{"device_code", "user_code", "verification_uri", "verification_uri_complete", "expires_in", "interval"}` |
@@ -30,7 +32,7 @@ This is the single source of truth for every backend endpoint. The frontend's `l
 | Route | Who | Request | Response |
 |---|---|---|---|
 | `POST /drafts/compile` | user or agent | `{"intent"}` | 201 **DraftRecord** + `compiler_source` (`"openai"` or `"fixture"`). Compile failures return 422, 502, 503, or 504 with `details.draft_created: false`. |
-| `GET /drafts` | user or agent | – | `[DraftRecord]`, newest first |
+| `GET /drafts` | user or agent | – | `[DraftRecord]`, newest first. Signed drafts are still included; their `signed_contract_id` is set. |
 | `GET /drafts/{id}` | user or agent | – | DraftRecord |
 | `PATCH /drafts/{id}` | user | **DraftPatch** `{goal?, target?, hard_cap_all_in?, max_shipping?, deliver_by?, constraints?}` (unknown keys → 422) | DraftRecord. Edited values get `source: "user"`, and lint re-runs. Returns 409 `already_signed` for a signed draft. |
 | `POST /contracts` | user | a `ContractDraft`, or `{"draft": ContractDraft, "assumptions", "clarifications_needed", "compiler_notes"}` | 201 `{"draft_id", "draft", "assumptions", "clarifications_needed", "compiler_notes", "review_url", "blocking_issues", "previous_contract_id", "record": DraftRecord}` |
@@ -97,7 +99,7 @@ Results whose names start with `checkout_link_` come from the **checkout-link pa
 - the link's origin belongs to the merchant the page claims to be, and the contract allows that merchant;
 - the link matches the agent's own `selection_report`.
 
-**Evidence events** always use the models.py `event_type`. For steps models.py has no type for, `data.kind` carries the precise subtype: `payment_requested`, `simulated_provider_approval`, `payment_approved`, `payment_denied`, `payment_expired`, `checkout_revalidated`, `checkout_changed`, `credential_ready`, `credential_released`, `payment_submitted`, `payment_outcome_unknown`, `receipt_verified`, `receipt_mismatch`, `purchase_declined`, `contract_amended`, `draft_edited`, `agent_action_denied`, and `extraction_failed`. Human decisions set `data.human_approval` or `data.human_rejection`. No event ever contains a card number, CVC, full expiry, Link session token, or card file path.
+**Evidence events** always use the models.py `event_type`. For steps models.py has no type for, `data.kind` carries the precise subtype: `payment_requested`, `simulated_provider_approval`, `payment_approved`, `payment_denied`, `payment_expired`, `checkout_revalidated`, `checkout_changed`, `credential_ready`, `credential_released`, `payment_submitted`, `payment_outcome_unknown`, `payment_request_uncertain`, `payment_request_failed`, `payment_not_made`, `order_not_verified`, `order_mismatch`, `contract_tampered`, `contract_no_longer_valid`, `credential_retrieval_failed`, `payment_refused`, `receipt_verified`, `receipt_mismatch`, `purchase_declined`, `contract_amended`, `draft_edited`, `agent_action_denied`, and `extraction_failed`. Human decisions set `data.human_approval` or `data.human_rejection`. No event ever contains a card number, CVC, full expiry, Link session token, or card file path.
 
 ### CredentialRelease (the only response that contains card values)
 
