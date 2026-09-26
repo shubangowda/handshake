@@ -20,7 +20,7 @@ This file explains why the integrated Handshake works the way it does. Most entr
 | Errors | Printed as `{"code": "…", "message": "…"}`. |
 | Statuses | `created`, `pending_approval`, `requires_action`, `approved`, `submitted`, `succeeded`, `denied`, `declined`, `canceled`, `expired`, `failed`. These are mapped in `payments.LINK_STATUS_MAP`. Any other value is treated as `unknown`, and an unknown status never advances a payment. |
 | Limits (README) | 50,000 cents maximum per request. The approval window is 10 minutes. Cards are valid for 12 hours. There is a $500 daily limit, at most 30 active or 10 approved requests at once, and at most 50 creations per hour. |
-| Test mode (README) | Test mode "will return test payment credentials (e.g. test card `4000009990001984`)" and "will not charge the underlying payment method". |
+| Test mode (README) | Test mode "will return test payment credentials (e.g. test card `4000009990001984`)" and "will not charge the underlying payment method". **That example number fails the Luhn check** (verified). The mock merchant's `/pay` therefore accepts Luhn-valid numbers **plus** the documented Link test numbers (`merchant.LINK_TEST_CARDS`); otherwise a real Link test card would be declined. |
 
 **Capabilities not claimed.** Link issues a single-use test card. Handshake does not claim merchant locking, exact spend limits, or an expiry that the CLI doesn't report. The 50,000-cent limit is enforced by Handshake itself (`HANDSHAKE_LINK_MAX_MINOR_UNITS`) as well as documented by Link.
 

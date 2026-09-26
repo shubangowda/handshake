@@ -206,6 +206,18 @@ def luhn_ok(digits: str) -> bool:
     return total % 10 == 0
 
 
+# Stripe's Link README gives 4000009990001984 as an example test-mode card. It
+# does NOT pass the Luhn check (verified), so a Luhn-only rule would reject a
+# real Link test card. This store accepts Luhn-valid numbers plus the
+# documented Link test numbers. It never charges anything either way.
+LINK_TEST_CARDS = {"4000009990001984"}
+
+
+def card_number_acceptable(digits: str) -> bool:
+    """A test card this mock store accepts: Luhn-valid, or a documented Link test-mode number."""
+    return 13 <= len(digits) <= 19 and (luhn_ok(digits) or digits in LINK_TEST_CARDS)
+
+
 def expiry_in_future(month: int, year: int, now: datetime) -> bool:
     """A card is valid through the END of its expiry month."""
     if not 1 <= month <= 12:
@@ -405,7 +417,7 @@ def create_app() -> FastAPI:
                 return {**session.order, "idempotent_replay": True}
 
             digits = "".join(ch for ch in body.card_number if ch.isdigit())
-            if not (13 <= len(digits) <= 19) or not luhn_ok(digits):
+            if not card_number_acceptable(digits):
                 raise HTTPException(402, detail={"error": "card_declined", "message": "The card number is not valid."})
             if not expiry_in_future(body.exp_month, body.exp_year, datetime.now(timezone.utc)):
                 raise HTTPException(402, detail={"error": "card_expired", "message": "The card has expired."})

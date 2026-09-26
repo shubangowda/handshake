@@ -305,6 +305,13 @@ def test_pay_rejections(merchant_client: TestClient, changes: dict[str, Any], st
     assert merchant_client.get(f"/api/checkout/{sid}/order").json()["order"] is None
 
 
+def test_link_test_card_is_accepted_though_not_luhn_valid(merchant_client: TestClient) -> None:
+    """Stripe's documented Link test card fails Luhn; the mock store accepts it anyway (and only it)."""
+    sid = new_session(merchant_client)["session_id"]
+    response = merchant_client.post(f"/api/checkout/{sid}/pay", json=pay_body(card_number="4000009990001984"))
+    assert response.status_code == 200 and response.json()["last4"] == "1984"
+
+
 def test_dev_scenario_change_changes_the_snapshot(merchant_app: Any, merchant_client: TestClient) -> None:
     """The dev route changes a cart after creation; the extractor sees a new snapshot hash."""
     session = new_session(merchant_client)
