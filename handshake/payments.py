@@ -236,6 +236,57 @@ def parse_auth_status(output: str) -> dict[str, Any]:
     return status
 
 
+def parse_cli_json(text: str) -> Any:
+    """
+    Parse Link CLI stdout: one JSON document, or JSON lines (one update per line).
+
+    Verified on link-cli 0.23.0: `spend-request create --format json` prints a
+    single JSON document that is a LIST of streamed updates (one item for a
+    request awaiting approval), while `cancel` prints a bare object.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        lines = [line for line in text.splitlines() if line.strip()]
+        try:
+            return [json.loads(line) for line in lines]
+        except json.JSONDecodeError:
+            raise PaymentError("link_malformed_output", "The Link CLI returned output that isn't JSON.")
+
+
+def latest_update(data: Any) -> Any:
+    """
+    The current state from Link output that may be ONE object or a LIST of
+    streamed updates. Like auth status: the last update wins.
+    """
+    if isinstance(data, list):
+        updates = [item for item in data if isinstance(item, dict)]
+        if not updates:
+            raise PaymentError("link_malformed_output", "The Link CLI returned an empty list of updates.")
+        return updates[-1]
+    return data
+
+
+def spend_request_from_output(data: Any) -> dict[str, Any]:
+    """A spend request object from create/retrieve output, in either shape. Raises if there is none."""
+    item = latest_update(data)
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("status"), str):
+        raise PaymentError("link_malformed_output", "The Link CLI returned a spend request without an id or status.")
+    return item
+
+
+def spend_requests_from_list_output(data: Any) -> list[dict[str, Any]]:
+    """The spend requests from `spend-request list` output: {"data": [...]}, [...], or [{"data": [...]}]."""
+    if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict) and isinstance(data[0].get("data"), list):
+        data = data[0]
+    if isinstance(data, dict):
+        data = data.get("data", [])
+    return [item for item in data or [] if isinstance(item, dict) and "id" in item]
+
+
 def build_context(goal: str, merchant_name: str, item_names: list[str], total_text: str) -> str:
     """
     The truthful description the user reads when approving in Link (Link requires >= 100 characters).
@@ -366,14 +417,17 @@ class LinkTestProvider:
             process.kill()
             await process.wait()
             raise PaymentUncertain("link_timeout", "The Link CLI did not answer in time.")
-        text = stdout.decode("utf-8", errors="replace").strip()
+        text = stdout.decode("utf-8", errors="replace")
         try:
-            data = json.loads(text) if text else None
-        except json.JSONDecodeError:
-            raise PaymentError("link_malformed_output", "The Link CLI returned output that isn't JSON.", {"stderr": sanitize(stderr.decode("utf-8", "replace"))})
-        # The CLI reports errors as {"code": ..., "message": ...} (verified).
-        if isinstance(data, dict) and "code" in data and "message" in data and "id" not in data:
-            raise PaymentError(f"link_{str(data['code']).lower()}", sanitize(str(data["message"])))
+            data = parse_cli_json(text)
+        except PaymentError as exc:
+            exc.details["stderr"] = sanitize(stderr.decode("utf-8", "replace"))
+            raise
+        # The CLI reports errors as {"code": ..., "message": ...} (verified),
+        # possibly as the last item of a list of streamed updates.
+        last = data[-1] if isinstance(data, list) and data else data
+        if isinstance(last, dict) and "code" in last and "message" in last and "id" not in last:
+            raise PaymentError(f"link_{str(last['code']).lower()}", sanitize(str(last["message"])))
         if process.returncode not in (0, None):
             raise PaymentError("link_cli_failed", f"The Link CLI exited with {process.returncode}.", {"stderr": sanitize(stderr.decode("utf-8", "replace"))})
         return data
@@ -386,9 +440,8 @@ class LinkTestProvider:
         return parse_auth_status(stdout.decode("utf-8", errors="replace"))
 
     def _to_request(self, data: Any) -> ProviderRequest:
-        """Normalize a Link spend request object."""
-        if not isinstance(data, dict) or not isinstance(data.get("id"), str) or not isinstance(data.get("status"), str):
-            raise PaymentError("link_malformed_output", "The Link CLI returned a spend request without an id or status.")
+        """Normalize Link output (an object or a list of streamed updates) into a ProviderRequest."""
+        data = spend_request_from_output(data)
         raw = data["status"]
         return ProviderRequest(
             request_id=data["id"],
@@ -415,9 +468,8 @@ class LinkTestProvider:
     async def reconcile(self, spec: SpendSpec) -> ProviderRequest | None:
         """Find a request we may have created before a timeout, by our metadata, without creating anything."""
         data = await self._run(["spend-request", "list", "--include-history"])
-        items = data.get("data") if isinstance(data, dict) else data
-        for item in items or []:
-            metadata = item.get("metadata") if isinstance(item, dict) else None
+        for item in spend_requests_from_list_output(data):
+            metadata = item.get("metadata")
             if isinstance(metadata, dict) and metadata.get("handshake_purchase_id") == spec.purchase_id:
                 return self._to_request(item)
         return None
@@ -686,6 +738,23 @@ def run_link(arguments: list[str], *, capture: bool = False) -> subprocess.Compl
     )
 
 
+def run_login() -> subprocess.CompletedProcess:
+    """
+    Log in to Link INTERACTIVELY, on the user's own terminal.
+
+    Deliberately WITHOUT --format json and without capturing output: the CLI
+    treats --format as "agent mode" and then collects its streamed updates
+    until the end (verified in link-cli 0.23.0), so the approval link and
+    code would only appear after login had already timed out. Interactive
+    mode prints them immediately.
+    """
+    return subprocess.run(
+        [*link_command(), "auth", "login", "--client-name", "Handshake (test mode)"],
+        check=True,
+        timeout=get_settings().link_timeout_seconds * 10,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Link account setup: status, login, payment-methods."""
     parser = argparse.ArgumentParser(description="Handshake: Link TEST MODE account setup")
@@ -702,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         if not status.get("authenticated"):
             if args.command != "login":
                 raise RuntimeError("Not authenticated. Run: python -m handshake.payments login")
-            run_link(["auth", "login", "--client-name", "Handshake (test mode)", "--interval", "5", "--timeout", "300"])
+            run_login()
             return 0
         if args.command == "login":
             print("Already authenticated with Link.")

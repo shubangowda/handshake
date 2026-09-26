@@ -77,11 +77,26 @@ def test_invalid_status_is_rejected(output: str) -> None:
 
 
 def test_list_response_starts_login() -> None:
-    """Unauthenticated (list form, as verified on the real CLI) -> the login command runs."""
-    with patch.object(payments, "run_link", return_value=SimpleNamespace(stdout='[{"authenticated": false}]')) as run:
+    """Unauthenticated (list form, as verified on the real CLI) -> the interactive login runs."""
+    with patch.object(payments, "run_link", return_value=SimpleNamespace(stdout='[{"authenticated": false}]')) as run, \
+            patch.object(payments, "run_login") as login:
         assert payments.main(["login"]) == 0
-        assert run.call_count == 2
-        assert run.call_args.args[0][:2] == ["auth", "login"]
+        run.assert_called_once()
+        login.assert_called_once()
+
+
+def test_login_prints_the_approval_link_on_the_terminal() -> None:
+    """
+    Login runs WITHOUT --format json and without capturing output: in JSON
+    ("agent") mode the CLI only prints its updates at the end, so the
+    approval link would never reach the user's terminal in time.
+    """
+    with patch.object(payments.subprocess, "run") as run:
+        payments.run_login()
+        command = run.call_args.args[0]
+        assert command[-4:-2] == ["auth", "login"] or "login" in command
+        assert "--format" not in command
+        assert "stdout" not in run.call_args.kwargs and "capture_output" not in run.call_args.kwargs
 
 
 def test_authenticated_list_does_not_start_login() -> None:
@@ -172,6 +187,10 @@ def test_payment_labels_everywhere(client: TestClient) -> None:
 # The Link adapter, against a fake link-cli
 # ============================================================
 
+# The REAL output of `link-cli@0.23.0 spend-request create --test --format json`,
+# captured on 2026-09-26 and sanitized (ids, approval path, and free text replaced).
+REAL_CREATE_OUTPUT = Path(__file__).parent / "fixtures" / "link_cli_0.23.0_spend_request_create.json"
+
 FAKE_CLI = r'''
 import json, os, sys, time
 log = os.environ["FAKE_LINK_LOG"]
@@ -184,8 +203,16 @@ if args[:2] == ["spend-request", "create"]:
         time.sleep(5)
     if behavior == "garbage":
         print("this is not json"); sys.exit(0)
-    print(json.dumps({"id": "lsrq_fake_1", "status": "pending_approval", "approval_url": "https://link.example/approve/lsrq_fake_1",
-                      "instruction": "Present the approval_url", "_next": {}}))
+    if behavior == "legacy_object":
+        print(json.dumps({"id": "lsrq_fake_1", "status": "pending_approval", "approval_url": "https://link.example/approve/lsrq_fake_1"}))
+    elif behavior == "jsonl":
+        print(json.dumps({"id": "lsrq_fake_1", "status": "created"}))
+        print(json.dumps({"id": "lsrq_fake_1", "status": "pending_approval", "approval_url": "https://link.example/approve/lsrq_fake_1"}))
+    elif behavior == "list_error":
+        print(json.dumps([{"code": "INVALID_INPUT", "message": "merchant-url is required"}]))
+    else:
+        # Default: replay the sanitized REAL output byte for byte.
+        sys.stdout.write(open(os.environ["FAKE_LINK_REAL_CREATE"]).read())
 elif args[:2] == ["spend-request", "list"]:
     print(json.dumps({"data": [{"id": "lsrq_fake_1", "status": "pending_approval", "created_at": "x", "updated_at": "x",
                                 "metadata": {"handshake_purchase_id": "purchase_abc"}}]}))
@@ -216,6 +243,7 @@ def fake_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     script.write_text(FAKE_CLI)
     log = tmp_path / "calls.jsonl"
     monkeypatch.setenv("FAKE_LINK_LOG", str(log))
+    monkeypatch.setenv("FAKE_LINK_REAL_CREATE", str(REAL_CREATE_OUTPUT))
     override_settings(link_cli=f"{sys.executable} {script}", link_timeout_seconds=2.0, link_tmp_dir=str(tmp_path / "private"))
     return log
 
@@ -229,7 +257,7 @@ def test_link_create_status_and_card_retrieval(fake_link: Path) -> None:
     """Create -> pending with an approval_url; retrieve -> approved; card read once from a private file and destroyed."""
     provider = LinkTestProvider()
     created = asyncio.run(provider.create_request(spec()))
-    assert (created.request_id, created.state, created.approval_url) == ("lsrq_fake_1", "pending", "https://link.example/approve/lsrq_fake_1")
+    assert (created.request_id, created.state, created.approval_url) == ("lsrq_SANITIZEDFIXTURE0001", "pending", "https://app.link.com/SANITIZED-APPROVAL-PATH")
     assert calls(fake_link)[0][-3:] == ["--test", "--format", "json"]
 
     assert asyncio.run(provider.get_status("lsrq_fake_1")).state == "approved"
@@ -560,3 +588,53 @@ def test_uncertain_pay_outcome_is_never_retried_blindly(test_db: Any, merchant_e
         for _ in range(3):
             user.post(f"/purchases/{created['purchase_id']}/payment/refresh")
         assert len(attempts) == 1
+
+
+# ============================================================
+# Regression: the REAL link-cli 0.23.0 output shape (purchase_93fb17da748a)
+# ============================================================
+
+
+def test_real_create_output_is_a_list_and_parses() -> None:
+    """
+    The live failure: create prints a JSON LIST of streamed updates, not a bare
+    object, and the old parser said "without an id or status". The sanitized
+    real output must now parse to the request id, pending, and the approval URL.
+    """
+    raw = REAL_CREATE_OUTPUT.read_text()
+    data = payments.parse_cli_json(raw)
+    assert isinstance(data, list) and len(data) == 1
+    request = LinkTestProvider()._to_request(data)
+    assert request.request_id == "lsrq_SANITIZEDFIXTURE0001"
+    assert request.raw_status == "pending_approval" and request.state == "pending"
+    assert request.approval_url == "https://app.link.com/SANITIZED-APPROVAL-PATH"
+
+
+@pytest.mark.parametrize("behavior, status", [("legacy_object", "pending"), ("jsonl", "pending")])
+def test_other_output_shapes_parse_too(fake_link: Path, monkeypatch: pytest.MonkeyPatch, behavior: str, status: str) -> None:
+    """A bare object and JSON lines (one update per line; the last wins) are accepted as well."""
+    monkeypatch.setenv("FAKE_LINK_BEHAVIOR", behavior)
+    created = asyncio.run(LinkTestProvider().create_request(spec()))
+    assert created.request_id == "lsrq_fake_1" and created.state == status
+
+
+def test_error_inside_a_list_is_reported(fake_link: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An error object wrapped in the update list is still a clean PaymentError with the CLI's code."""
+    monkeypatch.setenv("FAKE_LINK_BEHAVIOR", "list_error")
+    with pytest.raises(PaymentError) as caught:
+        asyncio.run(LinkTestProvider().create_request(spec()))
+    assert caught.value.code == "link_invalid_input"
+
+
+def test_empty_update_list_is_malformed() -> None:
+    """An empty list is not a spend request."""
+    with pytest.raises(PaymentError) as caught:
+        LinkTestProvider()._to_request([])
+    assert caught.value.code == "link_malformed_output"
+
+
+def test_list_output_shapes_for_reconcile() -> None:
+    """spend-request list may come back as {"data": [...]}, [...], or [{"data": [...]}]."""
+    item = {"id": "lsrq_a", "status": "pending_approval", "metadata": {"handshake_purchase_id": "p1"}}
+    for shape in ({"data": [item]}, [item], [{"data": [item]}]):
+        assert payments.spend_requests_from_list_output(shape) == [item]
