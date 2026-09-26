@@ -7,7 +7,7 @@ This file owns everything about storage: which database to connect to, what
 the tables look like, and small save/load helpers. It knows nothing about
 rules or HTTP.
 
-    main.py      -> gets a Session per request from get_session()
+    api.py       -> gets a Session per request from get_session()
     services.py  -> calls the save/load/update helpers below
     intent_diff  -> never touches the database (it stays pure)
 
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
@@ -46,7 +45,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.models import (
+from handshake.config import get_settings
+from handshake.models import (
     Contract,
     ContractDraft,
     ContractStatus,
@@ -57,7 +57,6 @@ from app.models import (
     ValidationDecision,
 )
 
-DEFAULT_DATABASE_URL = "sqlite:///./handshake.db"
 
 
 # ============================================================
@@ -74,10 +73,10 @@ SessionLocal: sessionmaker[Session] | None = None
 
 
 def configure(url: str | None = None) -> None:
-    """(Re)point this module at a database URL. With no argument, read DATABASE_URL from the environment."""
+    """(Re)point this module at a database URL. With no argument, use DATABASE_URL from config.py."""
     global engine, SessionLocal
     if url is None:
-        url = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+        url = get_settings().database_url
 
     # SQLite normally refuses to share a connection across threads. FastAPI's
     # TestClient and uvicorn's thread pool do exactly that, so we turn the

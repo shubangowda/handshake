@@ -1,12 +1,12 @@
 """
-main.py: the FastAPI app (HTTP layer).
+api.py: the FastAPI app (HTTP layer). It was backend/app/main.py before the integration.
 
 Job in the system
 -----------------
 This is the front door. It defines the URLs, parses request bodies, and
 turns results into JSON. It contains no business rules of its own:
 
-    HTTP request -> main.py route -> services.py -> intent_diff.py / db.py
+    HTTP request -> api.py route -> services.py -> intent_diff.py / db.py
                                   <- result or ServiceError
     HTTP response (JSON)
 
@@ -33,14 +33,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
-from app import db, services
-from app.models import (
+from handshake import db, services
+from handshake.config import get_settings
+from handshake.models import (
     Contract,
     PurchaseRequest,
     PurchaseStatusResponse,
     SignContractRequest,
 )
-from app.services import CredentialSummary, ServiceError
+from handshake.services import CredentialSummary, ServiceError
 
 logging.basicConfig(level=logging.INFO)
 
@@ -55,12 +56,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Handshake backend", version="0.2", lifespan=lifespan)
 
-# CORS lets a browser page on another origin (Rohan's frontend dev server)
-# call this API. Allowing every origin is fine for the hackathon; lock it
-# down to the real frontend origin before anything public.
+# CORS lets a browser page on another origin (Rohan's frontend, Sri's merchant
+# page) call this API. The allowed origins come from config.py: by default the
+# frontend and merchant URLs, and never a wildcard in prod (config refuses it).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(get_settings().effective_cors_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )

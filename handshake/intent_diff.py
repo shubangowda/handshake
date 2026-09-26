@@ -8,7 +8,7 @@ agent proposes a checkout, and an independent extractor turns that checkout
 into a TransactionProposal (structured facts). This file compares the two and
 answers one question: "does this checkout match what the user signed?"
 
-    main.py  (HTTP routes)
+    api.py   (HTTP routes)
       -> services.py  (purchase flow, database, evidence ledger)
            -> intent_diff.evaluate(contract, proposal)   <-- this file
            <- (ValidationDecision, PurchaseStatus outcome)
@@ -41,7 +41,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Callable
 
-from app.models import (
+from handshake.models import (
     Constraint,
     ConstraintOperator,
     ConstraintResult,

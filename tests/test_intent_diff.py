@@ -1,5 +1,5 @@
 """
-test_intent_diff.py: unit tests for the rule engine (app/intent_diff.py).
+test_intent_diff.py: unit tests for the rule engine (handshake/intent_diff.py).
 
 These tests never touch the database or HTTP. Each one builds the demo
 contract and a (possibly edited) proposal, calls evaluate() with a FIXED
@@ -15,9 +15,9 @@ from typing import Any, Callable
 
 import pytest
 
-from app import intent_diff
-from app.intent_diff import compute_outcome, decision_verdict, evaluate, explicit_fields, to_cents
-from app.models import (
+from handshake import intent_diff
+from handshake.intent_diff import compute_outcome, decision_verdict, evaluate, explicit_fields, to_cents
+from handshake.models import (
     Constraint,
     ConstraintResult,
     ConstraintSeverity,

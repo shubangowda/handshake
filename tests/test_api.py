@@ -19,7 +19,8 @@ import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
 
-from app import db, services
+from handshake import db, services
+from handshake.config import get_settings
 from conftest import Mutator, draft_payload, proposal_payload
 
 
@@ -655,7 +656,7 @@ def test_complete_after_credential_expiry(client: TestClient, monkeypatch: pytes
     """A charge after the credential's 15-minute window is rejected."""
     contract_id = sign(client)
     purchase_id = purchase(client, contract_id).json()["purchase_id"]
-    later = datetime.now(timezone.utc) + timedelta(minutes=services.CREDENTIAL_TTL_MINUTES + 1)
+    later = datetime.now(timezone.utc) + timedelta(minutes=get_settings().credential_ttl_minutes + 1)
     monkeypatch.setattr(services, "clock", lambda: later)
     response = client.post(f"/purchases/{purchase_id}/complete", json={"charged_amount": 128.39})
     assert response.status_code == 409

@@ -3,7 +3,7 @@ services.py: the business logic that ties the system together.
 
 Job in the system
 -----------------
-    main.py (HTTP routes)
+    api.py (HTTP routes)
       -> services.py (this file)
            -> intent_diff.py  : decides PASS/FAIL/UNVERIFIABLE (pure rules)
            -> db.py           : stores everything
@@ -23,7 +23,7 @@ Nothing here calls an LLM. The authorization decision comes only from
 intent_diff.evaluate(); this file just acts on its answer.
 
 Errors are raised as ServiceError(status_code, code, message, details), and
-main.py turns them into the standard JSON error shape.
+api.py turns them into the standard JSON error shape.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
 from datetime import datetime, timedelta
 from typing import Any
@@ -40,8 +39,9 @@ from typing import Any
 from pydantic import BaseModel, ValidationError, model_validator
 from sqlalchemy.orm import Session
 
-from app import db
-from app.intent_diff import (
+from handshake import db
+from handshake.config import DEV_SIGNING_SECRET, get_settings
+from handshake.intent_diff import (
     as_utc,
     cents_to_amount,
     compute_outcome,
@@ -54,7 +54,7 @@ from app.intent_diff import (
     result,
     to_cents,
 )
-from app.models import (
+from handshake.models import (
     CompilerOutput,
     ConstraintResult,
     ConstraintSeverity,
@@ -76,10 +76,6 @@ from app.models import (
 
 log = logging.getLogger("handshake")
 
-# How long an issued credential stays usable. Short on purpose: the agent
-# should pay right after authorization, and a stale credential is a risk.
-CREDENTIAL_TTL_MINUTES = 15
-
 # ------------------------------------------------------------
 # Signing secret
 # ------------------------------------------------------------
@@ -87,8 +83,8 @@ CREDENTIAL_TTL_MINUTES = 15
 # lives on this server. It proves the stored contract has not changed since
 # the server signed it. It does NOT prove the user signed it (that would need
 # a key the user holds, e.g. a passkey). Real user-held signatures are P2.
-_DEV_SIGNING_SECRET = "handshake-dev-secret-do-not-use-in-prod"
-SIGNING_SECRET = os.environ.get("HANDSHAKE_SIGNING_SECRET") or _DEV_SIGNING_SECRET
+# The secret itself comes from config.py (HANDSHAKE_SIGNING_SECRET); the
+# credential lifetime (HANDSHAKE_CREDENTIAL_TTL_MINUTES) does too.
 
 # Fields left out of the contract hash:
 #   status        changes over the lifecycle (active -> used/revoked/expired);
@@ -105,7 +101,7 @@ def clock() -> datetime:
 
 def warn_if_dev_secret() -> None:
     """Log a loud warning at startup if the hardcoded dev signing secret is in use."""
-    if SIGNING_SECRET == _DEV_SIGNING_SECRET:
+    if get_settings().signing_secret == DEV_SIGNING_SECRET:
         banner = "!" * 72
         log.warning(
             "\n%s\n  HANDSHAKE_SIGNING_SECRET is not set. Using the hardcoded DEV secret.\n"
@@ -116,7 +112,7 @@ def warn_if_dev_secret() -> None:
 
 
 class ServiceError(Exception):
-    """An expected rejection (404, 409, 422, ...). main.py converts it to the standard error JSON."""
+    """An expected rejection (404, 409, 422, ...). api.py converts it to the standard error JSON."""
 
     def __init__(self, status_code: int, code: str, message: str, details: dict[str, Any] | None = None) -> None:
         """Store the HTTP status, a machine-readable code, a human message, and optional details."""
@@ -158,14 +154,14 @@ def contract_hash(contract: Contract) -> str:
 
 def sign_hash(hash_hex: str) -> str:
     """
-    Demo signature: HMAC-SHA256 of the hash, keyed with SIGNING_SECRET.
+    Demo signature: HMAC-SHA256 of the hash, keyed with HANDSHAKE_SIGNING_SECRET.
 
     Why HMAC and not just the hash? Anyone can recompute a SHA-256, so an
     attacker who edits the contract could also update its hash. An HMAC needs
     the secret key to compute, so without the key a matching signature
     cannot be forged.
     """
-    key = SIGNING_SECRET.encode("utf-8")
+    key = get_settings().signing_secret.encode("utf-8")
     return hmac.new(key, hash_hex.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -478,7 +474,7 @@ def issue_credential(session: Session, proposal: TransactionProposal, purchase_i
         single_use=True,
         status=CredentialStatus.ACTIVE,
         created_at=now,
-        expires_at=now + timedelta(minutes=CREDENTIAL_TTL_MINUTES),
+        expires_at=now + timedelta(minutes=get_settings().credential_ttl_minutes),
         provider_reference=f"stub_{secrets.token_hex(12)}",  # internal only, never returned
     )
     db.save_credential(session, credential)

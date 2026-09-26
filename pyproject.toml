@@ -1,0 +1,49 @@
+# One Python project for all of Handshake: backend API, engine, compiler,
+# extractor, payments, mock merchant, and MCP server all live in the flat
+# `handshake` package. Versions are pinned to the ones installed and verified
+# with the full test suite.
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handshake"
+version = "0.2.0"
+description = "Handshake: the agent proposes, Handshake decides. Contract-bound authorization for AI shopping agents."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.54.0",
+    "pydantic==2.13.5",
+    "sqlalchemy==2.1.1",
+    "httpx==0.28.1",
+    "python-dotenv==1.2.3",
+    # Contract compiler (drafts only; never decides authorization).
+    "openai==3.19.2",
+    # MCP server. Pinned below 2.0 on purpose: mcp 2.x renamed FastMCP, and we
+    # keep Ajay's `mcp.server.fastmcp` API. 1.30.0 is the newest 1.x, verified.
+    "mcp==1.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+
+[project.scripts]
+# `handshake-mcp` starts the MCP server (stdio by default, --transport http optional).
+handshake-mcp = "handshake.mcp_server:main"
+
+[tool.setuptools]
+packages = ["handshake"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+filterwarnings = [
+    # Starlette's TestClient deprecation notice about httpx; not our code.
+    "ignore::DeprecationWarning:starlette.*",
+    "ignore::DeprecationWarning:fastapi.testclient",
+]

@@ -23,14 +23,18 @@ from typing import Any, Callable, Iterator
 
 import pytest
 
-# Make `import app...` work when pytest is run from the backend folder.
+# Make `import handshake...` work even without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# A fixed signing secret for tests (and it silences the dev-secret warning).
+# Test-only environment, set BEFORE any handshake module loads its settings:
+#   - never read a developer's personal .env (results must not depend on it)
+#   - fixed, distinct HMAC secrets (and it silences the dev-secret warning)
+os.environ["HANDSHAKE_SKIP_DOTENV"] = "1"
 os.environ.setdefault("HANDSHAKE_SIGNING_SECRET", "test-secret")
+os.environ.setdefault("HANDSHAKE_SESSION_SECRET", "test-session-secret")
 
-from app import db  # noqa: E402  (must come after the sys.path tweak)
-from app.models import Contract, ContractDraft, TransactionProposal  # noqa: E402
+from handshake import db  # noqa: E402  (must come after the environment setup)
+from handshake.models import Contract, ContractDraft, TransactionProposal  # noqa: E402
 
 # Every engine test evaluates at this exact moment, so results never depend
 # on when the tests happen to run.
@@ -145,7 +149,7 @@ def draft_json() -> dict[str, Any]:
 
 @pytest.fixture
 def test_db(tmp_path: Path) -> Iterator[Any]:
-    """Point the app at a brand-new SQLite file for this test only; never touches handshake.db."""
+    """Point the app at a brand-new SQLite file for this test only; never touches the dev database."""
     db.configure(f"sqlite:///{tmp_path / 'test.db'}")
     db.create_tables()
     yield db
@@ -157,7 +161,7 @@ def client(test_db: Any) -> Iterator[Any]:
     """A FastAPI TestClient using the temporary database."""
     from fastapi.testclient import TestClient
 
-    from app.main import app
+    from handshake.api import app
 
     with TestClient(app) as test_client:
         yield test_client
