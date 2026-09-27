@@ -37,8 +37,10 @@ primary_region = "iad"
   # who connect their own Link account. There is no live mode.
   HANDSHAKE_PAYMENT_MODE = "link_optional"
   HANDSHAKE_CREDENTIAL_MODE = "agent_visible"
-  # HANDSHAKE_GOOGLE_CLIENT_ID is passed by the script (--google-client-id).
-  # It is public (it ends up in the login page), but it is the owner's value.
+  # Sign in with Google: the owner's OAuth web client (public: it ends up in the
+  # login page). The script's --google-client-id overrides it for another client.
+  # Its authorized JavaScript origin must be the website (https://<prefix>.fly.dev).
+  HANDSHAKE_GOOGLE_CLIENT_ID = "455728697885-absi2vdkg06fep1iko8rmsgqi9sah0kg.apps.googleusercontent.com"
   # Prod refuses to start with neither it nor HANDSHAKE_ALLOW_DEMO_LOGIN=true
   # (the script's --allow-demo-login). Never set HANDSHAKE_AGENT_TOKEN here:
   # prod refuses it (agents connect per user through OAuth).

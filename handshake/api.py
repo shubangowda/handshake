@@ -302,7 +302,7 @@ def oauth_metadata() -> dict[str, Any]:
     """
     base = get_settings().api_url
     return {
-        "issuer": base,
+        "issuer": auth.issuer(),  # same string the MCP server's metadata names (trailing "/")
         "authorization_endpoint": f"{base}/oauth/authorize",
         "token_endpoint": f"{base}/oauth/token",
         "registration_endpoint": f"{base}/oauth/register",

@@ -66,7 +66,7 @@ def approve_and_get_code(anon: TestClient, user: TestClient, client_id: str, cha
     assert shown["client_name"] == "Muse" and shown["redirect_host"] == "agent.example"
     back = user.post("/oauth/authorize/decision", json={"request_id": request_id, "approve": True}).json()["redirect_to"]
     query = parse_qs(urlsplit(back).query)
-    assert back.startswith(REDIRECT) and query["state"] == ["st-123"] and query["iss"] == [get_settings().api_url]
+    assert back.startswith(REDIRECT) and query["state"] == ["st-123"] and query["iss"] == [auth.issuer()]
     return query["code"][0]
 
 
@@ -354,6 +354,12 @@ def hosted_app(api_app: Any) -> Any:
     return server.streamable_http_app()
 
 
+def anon_issuer(api_app: Any) -> str:
+    """The issuer the backend's own discovery document states."""
+    with TestClient(api_app) as anon:
+        return anon.get("/.well-known/oauth-authorization-server").json()["issuer"]
+
+
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}
 MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json", "Host": "mcp.handshake.test"}
@@ -367,8 +373,10 @@ def test_hosted_mcp_requires_a_token_and_advertises_how_to_get_one(api_app: Any)
         assert "resource_metadata=" in response.headers["www-authenticate"]
         meta = mcp.get("/.well-known/oauth-protected-resource/mcp").json()
         assert meta["resource"] == "https://mcp.handshake.test/mcp"
-        assert [s.rstrip("/") for s in meta["authorization_servers"]] == [get_settings().api_url]
-        assert mcp.get("/.well-known/oauth-protected-resource").json()["authorization_servers"] == [get_settings().api_url]
+        # Every document names the issuer identically (clients may compare these strings exactly).
+        issuer = anon_issuer(api_app)
+        assert meta["authorization_servers"] == [issuer] == [auth.issuer()]
+        assert mcp.get("/.well-known/oauth-protected-resource").json()["authorization_servers"] == [issuer]
         assert mcp.get("/.well-known/oauth-authorization-server").json()["registration_endpoint"].endswith("/oauth/register")
         assert mcp.get("/health").json()["status"] == "ok"
 

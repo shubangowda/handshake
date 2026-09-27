@@ -1,8 +1,8 @@
 """
 deploy_fly.py: deploy the whole Handshake stack to Fly.io, with one command.
 
-    python scripts/deploy_fly.py --google-client-id <id>.apps.googleusercontent.com
-    python scripts/deploy_fly.py --dry-run --google-client-id <id>   # print the plan, touch nothing
+    python scripts/deploy_fly.py                       # everything (Google client id comes from deploy/fly/api.toml)
+    python scripts/deploy_fly.py --dry-run             # print the plan, touch nothing
     python scripts/deploy_fly.py --only web                           # redeploy one app
     python scripts/deploy_fly.py --allow-demo-login                   # first smoke test, before a Google client exists
 
@@ -463,10 +463,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--prefix {args.prefix!r}: use lowercase letters, digits and dashes (3-42 characters, starting with a letter).", file=sys.stderr)
         return 2
     selected = [key for key in DEPLOY_ORDER if not args.only or key in args.only]
-    if "api" in selected and not (args.google_client_id or args.allow_demo_login):
-        # The API refuses to start in prod without a way to log in, so fail
-        # here rather than after a five-minute build.
-        print("Deploying the api needs --google-client-id (or --allow-demo-login for a private smoke test).", file=sys.stderr)
+    # deploy/fly/api.toml carries the owner's Google client id, so --google-client-id
+    # is only needed to use a different one. Without any way to log in the API would
+    # refuse to start in prod, so check the toml too rather than fail after a build.
+    has_google = args.google_client_id or "HANDSHAKE_GOOGLE_CLIENT_ID =" in (REPO / "deploy" / "fly" / "api.toml").read_text()
+    if "api" in selected and not (has_google or args.allow_demo_login):
+        print("Deploying the api needs a Google client id (deploy/fly/api.toml or --google-client-id), or --allow-demo-login for a private smoke test.", file=sys.stderr)
         return 2
     if "api" in selected and args.allow_demo_login:
         print("warning: --allow-demo-login lets anyone log in as any email address. Redeploy without it once Google sign-in works.", file=sys.stderr)

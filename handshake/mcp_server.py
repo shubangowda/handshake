@@ -569,7 +569,8 @@ def _add_hosted_routes(server: FastMCP, settings: Settings, resource: str, trans
     from starlette.responses import JSONResponse
 
     metadata = {
-        "resource": resource, "authorization_servers": [settings.api_url], "scopes_supported": ["handshake.agent"],
+        # Same normalized form ("…/") as the SDK's metadata route and the backend's issuer.
+        "resource": resource, "authorization_servers": [settings.api_url.rstrip("/") + "/"], "scopes_supported": ["handshake.agent"],
         "bearer_methods_supported": ["header"], "resource_name": "Handshake",
     }
 

@@ -551,6 +551,18 @@ def verify_google_credential(id_token: str) -> str:
 # reusing a refresh token revokes the whole grant (it was probably stolen).
 
 ACCESS_TOKEN_SECONDS = 3600
+
+
+def issuer() -> str:
+    """
+    Our OAuth issuer identifier, exactly as every document states it.
+
+    The MCP SDK publishes the authorization server as a normalized URL, which
+    always ends in "/" ("https://api.example/"). Clients may compare the
+    issuer in our metadata (and the `iss` we return, RFC 9207) to that string
+    exactly, so we use the same form everywhere.
+    """
+    return get_settings().api_url.rstrip("/") + "/"
 CUSTOM_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*$")
 FORBIDDEN_SCHEMES = {"javascript", "data", "file", "vbscript", "about", "blob"}
 
@@ -658,7 +670,7 @@ def start_authorization(session: Any, params: dict[str, str]) -> dict[str, Any]:
 
     def back(error: str, description: str) -> dict[str, Any]:
         """An error the client should see, sent to its (verified) redirect_uri."""
-        query = {"error": error, "error_description": description, "iss": get_settings().api_url}
+        query = {"error": error, "error_description": description, "iss": issuer()}
         if params.get("state"):
             query["state"] = params["state"]
         return {"redirect_error": f"{redirect_uri}{'&' if '?' in redirect_uri else '?'}{urlencode(query)}"}
@@ -720,7 +732,7 @@ def decide_authorization(session: Any, principal: Principal, request_id: str, ap
 
     _require_user(principal, "approve agents")
     row = _pending_request(session, request_id)
-    query: dict[str, str] = {"iss": get_settings().api_url}
+    query: dict[str, str] = {"iss": issuer()}
     if approve:
         code = secrets.token_urlsafe(32)
         row.status, row.owner, row.code_hash = "approved", principal.email, _hash_code(code)
