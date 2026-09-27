@@ -282,3 +282,21 @@ def merchant_env(api_app: Any) -> Iterator[Any]:
         yield TestClient(merchant_app, base_url=get_settings().merchant_url, follow_redirects=False)
     finally:
         extractor.set_merchant_client_factory(None)
+
+
+def fund(client: Any, contract_id: str) -> dict[str, Any]:
+    """
+    Approve the contract's funding (stub mode: "Simulated provider approval").
+    Signing requests the contract's single-use card; purchases need it approved
+    and stored first, exactly as the user does in Link.
+    """
+    response = client.post(f"/contracts/{contract_id}/funding/simulate-approval")
+    assert response.status_code == 200, response.json()
+    assert response.json()["state"] == "funded" and response.json()["card_stored"] is True
+    return response.json()
+
+
+def funded(client: Any, contract_id: str) -> str:
+    """Fund a just-signed contract and return its id (for one-line sign-then-fund in tests)."""
+    fund(client, contract_id)
+    return contract_id

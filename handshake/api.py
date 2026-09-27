@@ -39,7 +39,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
-from handshake import auth, compiler, db, services
+from handshake import auth, compiler, db, payments, services
 from handshake.auth import AuthError, Principal, current_principal
 from handshake.config import get_settings
 from handshake.extractor import Extractor, get_extractor
@@ -164,6 +164,7 @@ class ContractListItem(BaseModel):
     signed_at: datetime | None = None
     signed_contract_id: str | None = None
     draft_id: str | None = None
+    funding_state: str | None = None  # contracts only: not_funded / awaiting_approval / funded / released / used / ...
 
 
 # ============================================================
@@ -381,6 +382,7 @@ def list_contracts(
                 created_at=db.utc(row.created_at),
                 signed_at=db.utc(row.signed_at),
                 draft_id=row.draft_id,
+                funding_state=(db.current_funding(session, row.id).state if db.current_funding(session, row.id) else "not_funded"),
             )
         )
 
@@ -408,6 +410,10 @@ def get_contract(
             # The stored JSON was edited into something invalid: definitely tampered.
             contract = row.data
             verification = {"valid": False, "errors": _clean_errors(exc.errors(include_url=False))}
+        try:
+            funding = services.refresh_funding(session, row.id, principal.email)
+        except ServiceError:
+            funding = services.funding_for_api(db.current_funding(session, row.id))
         return {
             "kind": "contract",
             "id": row.id,
@@ -415,6 +421,7 @@ def get_contract(
             "draft_id": row.draft_id,
             "contract": contract,
             "verification": verification,
+            "funding": funding,
         }
 
     draft_row = db.get_draft_row(session, contract_id)
@@ -529,6 +536,55 @@ def patch_draft(
     require_user(session, principal, "edit a draft", draft_id=draft_id)
     patch = body.model_dump(mode="json", include=body.model_fields_set)
     return services.patch_draft(session, draft_id, patch, owner=principal.email)
+
+
+# ============================================================
+# The user's own Stripe Link account, and contract funding
+# ============================================================
+
+
+@router.post("/link/connect")
+def link_connect(session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)) -> dict[str, Any]:
+    """
+    Connect the logged-in user's OWN Stripe Link account (user only).
+
+    Returns Link's login link and phrase right away; the user approves in the
+    Link app, and Handshake keeps that login in the user's private Link
+    directory. Stub mode: simulated, instantly connected.
+    """
+    if principal.is_agent:
+        raise AuthError(403, "agent_not_permitted", "Only the user can connect their Link account.")
+    return payments.start_link_login(principal.email)
+
+
+@router.get("/link/status")
+def link_status(principal: Principal = Depends(current_principal)) -> dict[str, Any]:
+    """Whether the logged-in user's Link account is connected (the access token itself is never returned)."""
+    if principal.is_agent:
+        raise AuthError(403, "agent_not_permitted", "Only the user manages their Link account.")
+    return payments.link_connection(principal.email)
+
+
+@router.post("/link/disconnect")
+def link_disconnect(principal: Principal = Depends(current_principal)) -> dict[str, Any]:
+    """Log the user's Link account out of Handshake."""
+    if principal.is_agent:
+        raise AuthError(403, "agent_not_permitted", "Only the user manages their Link account.")
+    payments.disconnect_link(principal.email)
+    return payments.link_connection(principal.email)
+
+
+@router.get("/contracts/{contract_id}/funding")
+def get_funding(contract_id: str, session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)) -> dict[str, Any]:
+    """The contract's funding (refreshed): awaiting_approval, funded (card stored, locked), released, used, ... Never card data."""
+    return services.refresh_funding(session, contract_id, principal.email)
+
+
+@router.post("/contracts/{contract_id}/funding")
+def restart_funding(contract_id: str, session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)) -> dict[str, Any]:
+    """Fund the contract again (after a denied, expired, or used card). User only."""
+    require_user(session, principal, "fund a contract", contract_id=contract_id)
+    return services.restart_funding(session, contract_id, principal.email)
 
 
 @router.post("/contracts/{contract_id}/revoke", response_model=Contract)
@@ -734,21 +790,19 @@ def health() -> dict[str, Any]:
 stub_router = APIRouter()
 
 
-@stub_router.post("/purchases/{purchase_id}/payment/simulate-approval")
-def simulate_approval(
-    purchase_id: str,
+@stub_router.post("/contracts/{contract_id}/funding/simulate-approval")
+def simulate_funding_approval(
+    contract_id: str,
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
-    extractor: Extractor = Depends(get_extractor),
 ) -> dict[str, Any]:
     """
-    SIMULATED PROVIDER APPROVAL (stub mode only, user only). Stands in for the
-    user's approval tap in Link when no Link account is connected.
+    SIMULATED PROVIDER APPROVAL (stub mode only, user only). Stands in for
+    approving the contract's funding card in Link; the simulated card is then
+    stored, encrypted, on the contract.
     """
-    require_user(session, principal, "approve a payment", purchase_id=purchase_id)
-    purchase = services.simulate_approval(session, purchase_id, principal.email)
-    purchase = services.refresh_payment(session, purchase.id, principal.email, extractor)
-    return services.purchase_detail(session, purchase)
+    require_user(session, principal, "approve a payment", contract_id=contract_id)
+    return services.simulate_funding_approval(session, contract_id, principal.email)
 
 
 credential_router = APIRouter()
@@ -759,6 +813,7 @@ def release_credential(
     purchase_id: str,
     session: Session = Depends(db.get_session),
     principal: Principal = Depends(current_principal),
+    extractor: Extractor = Depends(get_extractor),
 ) -> JSONResponse:
     """
     AGENT-VISIBLE MODE ONLY, agent only, ONCE: the single-use Link TEST card for this purchase.
@@ -768,7 +823,7 @@ def release_credential(
     """
     if not principal.is_agent:
         raise ServiceError(403, "agent_only", "Only the shopping agent collects the card, and only once.")
-    release = services.release_credential(session, purchase_id, principal)
+    release = services.release_credential(session, purchase_id, principal, extractor)
     return JSONResponse(
         content=release.model_dump(mode="json"),
         headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},

@@ -123,8 +123,8 @@ class PaymentUncertain(PaymentError):
 class SpendSpec:
     """Everything needed to ask a provider for one single-use card."""
 
-    purchase_id: str
-    amount_minor: int  # integer cents, from the backend's already-validated authorized amount
+    reference_id: str  # the contract funding this card is for (idempotency + metadata)
+    amount_minor: int  # integer cents: the contract's all-in hard cap
     currency: str
     merchant_name: str
     merchant_url: str
@@ -133,8 +133,8 @@ class SpendSpec:
 
     @property
     def idempotency_key(self) -> str:
-        """One key per purchase: retrying creation can never mint a second request."""
-        return f"handshake-{self.purchase_id}"
+        """One key per funding: retrying creation can never mint a second request."""
+        return f"handshake-{self.reference_id}"
 
 
 @dataclass(frozen=True)
@@ -328,7 +328,7 @@ def build_create_command(spec: SpendSpec) -> list[str]:
         "--currency", spec.currency.lower(),
         "--context", spec.context,
         "--idempotency-key", spec.idempotency_key,
-        "--metadata", f"handshake_purchase_id:{spec.purchase_id}",
+        "--metadata", f"handshake_reference_id:{spec.reference_id}",
         "--total", f"type:total,display_text:Total,amount:{spec.amount_minor}",
         "--request-approval",
     ]
@@ -386,9 +386,24 @@ class LinkTestProvider:
     name = "link_test"
     label = "Stripe Link: TEST MODE"
 
-    def __init__(self, settings: Settings | None = None) -> None:
-        """The CLI command (pinned version) and limits come from config."""
+    def __init__(self, settings: Settings | None = None, home: str | None = None) -> None:
+        """
+        The CLI command (pinned version) and limits come from config.
+
+        `home` is the user's private Link directory (user_link_home). The CLI
+        keeps its login under $HOME, so running it with a per-user HOME is
+        what gives every Handshake user their OWN Link account.
+        """
         self.settings = settings or get_settings()
+        self.home = home
+
+    def _env(self) -> dict[str, str]:
+        """Environment for the CLI: the user's HOME, and the shared npx cache (so nothing is re-downloaded per user)."""
+        env = dict(os.environ)
+        if self.home:
+            env["HOME"] = self.home
+        env["npm_config_cache"] = self.settings.link_npm_cache
+        return env
 
     def _base_command(self) -> list[str]:
         """The configured CLI invocation, e.g. ['npx', '--yes', '@stripe/link-cli@0.23.0']."""
@@ -409,7 +424,7 @@ class LinkTestProvider:
         """
         command = [*self._base_command(), *args, "--format", "json"]
         process = await asyncio.create_subprocess_exec(
-            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL
+            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL, env=self._env()
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.settings.link_timeout_seconds)
@@ -435,7 +450,7 @@ class LinkTestProvider:
     async def auth_status(self) -> dict[str, Any]:
         """Whether this machine's Link CLI is logged in."""
         command = [*self._base_command(), "auth", "status", "--format", "json"]
-        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL)
+        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL, env=self._env())
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=self.settings.link_timeout_seconds)
         return parse_auth_status(stdout.decode("utf-8", errors="replace"))
 
@@ -470,7 +485,7 @@ class LinkTestProvider:
         data = await self._run(["spend-request", "list", "--include-history"])
         for item in spend_requests_from_list_output(data):
             metadata = item.get("metadata")
-            if isinstance(metadata, dict) and metadata.get("handshake_purchase_id") == spec.purchase_id:
+            if isinstance(metadata, dict) and metadata.get("handshake_reference_id") == spec.reference_id:
                 return self._to_request(item)
         return None
 
@@ -592,12 +607,206 @@ class StubProvider:
         cls._requests[request_id]["status"] = status
 
 
-def get_provider(settings: Settings | None = None) -> Provider:
-    """The provider for the configured payment mode (only 'stub' and 'link_test' exist)."""
+def get_provider(settings: Settings | None = None, owner: str | None = None) -> Provider:
+    """The provider for the configured payment mode, acting as `owner`'s own Link account."""
     settings = settings or get_settings()
     if settings.payment_mode == "link_test":
-        return LinkTestProvider(settings)
+        return LinkTestProvider(settings, home=user_link_home(owner) if owner else None)
     return StubProvider()
+
+
+def provider_named(name: str, owner: str | None) -> Provider:
+    """The provider a stored row was created with (a row never switches providers)."""
+    if name == "link_test":
+        return LinkTestProvider(home=user_link_home(owner) if owner else None)
+    return StubProvider()
+
+
+# ============================================================
+# Each user's own Link account (connected from the website)
+# ============================================================
+
+
+def user_link_home(email: str) -> str:
+    """
+    The private directory that acts as this user's HOME for the Link CLI.
+
+    Named by a hash of the email (so the path reveals nothing), created 0700.
+    The Link login the user approves is stored inside it, and only CLI calls
+    made on that user's behalf ever use it.
+    """
+    root = Path(get_settings().link_home_root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home = root / hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:24]
+    home.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(home, 0o700)
+    return str(home)
+
+
+@dataclass
+class LinkLogin:
+    """One in-progress "connect your Link account" login for one user."""
+
+    email: str
+    process: Any = None
+    verification_url: str | None = None
+    phrase: str | None = None
+    state: str = "starting"  # starting / pending / connected / failed / expired
+    error: str | None = None
+    started_at: float = 0.0
+    first_update: Any = None  # threading.Event set when the link (or a failure) is known
+
+
+_logins: dict[str, LinkLogin] = {}
+
+
+def _link_cli_for(email: str) -> tuple[list[str], dict[str, str]]:
+    """The CLI command prefix and environment for acting as `email`."""
+    provider = LinkTestProvider(home=user_link_home(email))
+    return shlex.split(get_settings().link_cli), provider._env()
+
+
+def _read_login_output(login: LinkLogin) -> None:
+    """
+    Background reader for `auth login --format jsonl` (verified: it STREAMS
+    one {"type": "chunk", "data": {...}} line per update, the first within
+    about a second, carrying verification_url and phrase).
+    """
+    try:
+        for line in login.process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            data = message.get("data") if isinstance(message, dict) else None
+            if isinstance(data, dict):
+                if isinstance(data.get("verification_url"), str):
+                    login.verification_url = data["verification_url"]
+                    login.phrase = data.get("phrase") if isinstance(data.get("phrase"), str) else login.phrase
+                    if login.state == "starting":
+                        login.state = "pending"
+                if data.get("authenticated") is True:
+                    login.state = "connected"
+                if "code" in data and "message" in data:
+                    login.state, login.error = "failed", sanitize(str(data["message"]))
+                login.first_update.set()
+            if isinstance(message, dict) and message.get("type") == "done" and login.state in ("starting", "pending"):
+                login.state = "expired"
+                login.first_update.set()
+    finally:
+        login.process.wait()
+        if login.state in ("starting", "pending"):
+            login.state = "expired"
+        login.first_update.set()
+
+
+def start_link_login(email: str, wait_seconds: float = 30.0) -> dict[str, Any]:
+    """
+    Start connecting `email`'s own Link account; return the Link login link and phrase to show them.
+
+    The CLI keeps polling in the background until the user approves in the
+    Link app (or it times out), and then saves the login in the user's
+    private HOME. Stub mode needs no Link account: it's simulated.
+    """
+    import threading
+    import time as _time
+
+    if get_settings().payment_mode != "link_test":
+        return {"state": "connected", "simulated": True, "provider_label": "Simulated provider"}
+    existing = _logins.get(email)
+    if existing and existing.state == "pending" and existing.process and existing.process.poll() is None:
+        return _login_view(existing)
+
+    command, env = _link_cli_for(email)
+    process = subprocess.Popen(
+        [*command, "auth", "login", "--client-name", "Handshake", "--interval", "3", "--timeout", "600", "--format", "jsonl"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True, env=env,
+    )
+    login = LinkLogin(email=email, process=process, started_at=_time.time(), first_update=threading.Event())
+    _logins[email] = login
+    threading.Thread(target=_read_login_output, args=(login,), daemon=True).start()
+    login.first_update.wait(timeout=wait_seconds)
+    return _login_view(login)
+
+
+def _login_view(login: LinkLogin) -> dict[str, Any]:
+    """What the website shows about a login in progress (to that user only)."""
+    return {"state": login.state, "verification_url": login.verification_url, "phrase": login.phrase,
+            "error": login.error, "provider_label": "Stripe Link: TEST MODE", "simulated": False}
+
+
+def link_connection(email: str) -> dict[str, Any]:
+    """Whether `email` has a connected Link account (the access token itself is never returned)."""
+    if get_settings().payment_mode != "link_test":
+        return {"connected": True, "simulated": True, "provider_label": "Simulated provider", "login": None}
+    login = _logins.get(email)
+    command, env = _link_cli_for(email)
+    try:
+        result = subprocess.run([*command, "auth", "status", "--format", "json"], capture_output=True, text=True,
+                                env=env, timeout=get_settings().link_timeout_seconds)
+        connected = bool(parse_auth_status(result.stdout).get("authenticated"))
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        connected = False
+    return {"connected": connected, "simulated": False, "provider_label": "Stripe Link: TEST MODE",
+            "login": _login_view(login) if login and not connected and login.state == "pending" else None}
+
+
+def disconnect_link(email: str) -> None:
+    """Log `email` out of Link (their saved Link login is removed)."""
+    if get_settings().payment_mode != "link_test":
+        return
+    command, env = _link_cli_for(email)
+    subprocess.run([*command, "auth", "logout", "--format", "json"], capture_output=True, text=True, env=env,
+                   timeout=get_settings().link_timeout_seconds)
+    _logins.pop(email, None)
+
+
+# ============================================================
+# The stored card: encrypted at rest, tied to its contract
+# ============================================================
+#
+# The owner decided the funded one-time card is stored on the contract. It
+# is stored ENCRYPTED (AES-256-GCM, key HANDSHAKE_CARD_ENCRYPTION_KEY), with
+# the contract and funding ids as authenticated data, so a ciphertext copied
+# onto another contract fails to decrypt. It is decrypted only at the moment
+# of release (agent-visible) or payment (executor), and wiped right after.
+
+
+def _card_key() -> bytes:
+    """The 32-byte AES key from config."""
+    import base64
+
+    return base64.b64decode(get_settings().card_encryption_key)
+
+
+def encrypt_card(card: CardSecret, contract_id: str, funding_id: str) -> str:
+    """Encrypt a card for storage. Returns base64(nonce + ciphertext)."""
+    import base64
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    plaintext = json.dumps({"number": card.number, "exp_month": card.exp_month, "exp_year": card.exp_year, "cvc": card.cvc,
+                            "valid_until": card.valid_until, "simulated": card.simulated, "brand": card.brand}).encode("utf-8")
+    nonce = os.urandom(12)
+    sealed = AESGCM(_card_key()).encrypt(nonce, plaintext, f"{contract_id}:{funding_id}".encode("utf-8"))
+    return base64.b64encode(nonce + sealed).decode("ascii")
+
+
+def decrypt_card(blob: str, contract_id: str, funding_id: str) -> CardSecret:
+    """Decrypt a stored card (only at release/payment time). Raises PaymentError if it was tampered with or moved."""
+    import base64
+
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    try:
+        raw = base64.b64decode(blob)
+        plaintext = AESGCM(_card_key()).decrypt(raw[:12], raw[12:], f"{contract_id}:{funding_id}".encode("utf-8"))
+    except (InvalidTag, ValueError):
+        raise PaymentError("card_unreadable", "The stored card could not be decrypted (wrong key, tampered, or moved).")
+    data = json.loads(plaintext)
+    return CardSecret(number=data["number"], exp_month=int(data["exp_month"]), exp_year=int(data["exp_year"]), cvc=str(data["cvc"]),
+                      valid_until=data.get("valid_until"), simulated=bool(data.get("simulated")), brand=data.get("brand"))
 
 
 # ============================================================
@@ -758,11 +967,17 @@ def run_login() -> subprocess.CompletedProcess:
 def main(argv: list[str] | None = None) -> int:
     """Link account setup: status, login, payment-methods."""
     parser = argparse.ArgumentParser(description="Handshake: Link TEST MODE account setup")
+    parser.add_argument("--email", help="Act as this Handshake user's own Link account (their private Link home)")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="Check whether this machine is logged in to Link")
     commands.add_parser("login", help="Connect your Link account in the browser")
     commands.add_parser("payment-methods", help="List available funding methods")
     args = parser.parse_args(argv)
+    if args.email:
+        # The same private HOME the backend uses for this user, so logging in
+        # here connects THAT user's Link account (like the website does).
+        os.environ["HOME"] = user_link_home(args.email)
+        os.environ["npm_config_cache"] = get_settings().link_npm_cache
     try:
         status = parse_auth_status(run_link(["auth", "status"], capture=True).stdout)
         if args.command == "status":

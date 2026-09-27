@@ -4,7 +4,8 @@ test_e2e.py: the eight red-team scenarios, end to end, fully in-process (HANDSHA
     user compiles (offline fixture compiler) and signs the section 12.1 demo contract
     agent creates a checkout at Sri's mock merchant and calls POST /purchases
     Handshake's REAL extractor reads the checkout (feed + page), the link parser
-    and the engine decide, and the stub provider plays Link.
+    and the engine decide, and the stub provider plays Link (the contract was
+    funded with its single-use card when the user signed).
 
 Each scenario gets a fresh contract (contracts are single use). The tests
 assert WHY each outcome happened (which checks failed or couldn't be
@@ -20,14 +21,14 @@ from fastapi.testclient import TestClient
 
 from handshake import compiler, db
 from handshake.config import get_settings, override_settings
-from conftest import AGENT_TOKEN, bearer, user_headers
+from conftest import AGENT_TOKEN, bearer, user_headers, funded
 
 
 def sign_demo_contract(user: TestClient) -> str:
     """Compile and sign the demo contract; return its id."""
     record = user.post("/drafts/compile", json={"intent": compiler.DEMO_INTENT}).json()
     assert record["blocking_issues"] == []
-    return user.post(f"/contracts/{record['id']}/sign").json()["id"]
+    return funded(user, user.post(f"/contracts/{record['id']}/sign").json()["id"])
 
 
 def request(agent: TestClient, merchant: TestClient, contract_id: str, scenario: str, key: str | None = None) -> dict[str, Any]:
@@ -105,14 +106,11 @@ def test_prompt_injection_is_stored_as_inert_text(user: TestClient, agent: TestC
 
 
 def test_valid_scenario_completes_with_verified_receipt(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
-    """valid: AUTHORIZED -> simulated Link approval -> card released once -> agent pays -> COMPLETED, receipt verified, contract used."""
+    """valid: (signed + funded) -> AUTHORIZED -> the stored card is released once -> agent pays -> COMPLETED, receipt verified, contract used."""
     contract_id = sign_demo_contract(user)
     detail = request(agent, merchant_env, contract_id, "valid")
     assert detail["status"] == "authorized" and not_passing(detail) == {}
-    assert detail["next_action"] == "wait_for_user_link_approval"
-
-    ready = user.post(f"/purchases/{detail['purchase_id']}/payment/simulate-approval").json()
-    assert ready["next_action"] == "get_payment_credential_and_pay"
+    assert detail["next_action"] == "get_payment_credential_and_pay"
     order = pay_as_agent(agent, merchant_env, detail["purchase_id"])
 
     done = agent.get(f"/purchases/{detail['purchase_id']}").json()
@@ -121,14 +119,8 @@ def test_valid_scenario_completes_with_verified_receipt(user: TestClient, agent:
     assert user.get(f"/contracts/{contract_id}").json()["status"] == "used"
     assert user.get(f"/evidence/{detail['purchase_id']}").json()["ledger_intact"] is True
 
-
-# ============================================================
-# The other flows of section 12.4
-# ============================================================
-
-
 def test_escalated_then_approved_then_paid(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
-    """unknown_seller escalates; the USER accepts the exception, then approves payment (stub), the agent pays, completed."""
+    """unknown_seller escalates; the USER accepts the exception (the contract was funded when they signed); the agent pays; completed."""
     detail = request(agent, merchant_env, sign_demo_contract(user), "unknown_seller")
     assert detail["next_action"] == "wait_for_user_decision"
 
@@ -136,12 +128,10 @@ def test_escalated_then_approved_then_paid(user: TestClient, agent: TestClient, 
     assert approved["status"] == "authorized"
     assert approved["resolution"]["action"] == "approve"
     assert approved["resolution"]["accepted_constraints"] == ["seller_requirement"]
-    assert approved["next_action"] == "wait_for_user_link_approval"  # consent #2 is still needed
+    assert approved["next_action"] == "get_payment_credential_and_pay"  # the stored card is now unlocked for this checkout
 
-    user.post(f"/purchases/{detail['purchase_id']}/payment/simulate-approval")
     pay_as_agent(agent, merchant_env, detail["purchase_id"])
     assert agent.get(f"/purchases/{detail['purchase_id']}").json()["status"] == "completed"
-
 
 def test_escalated_then_rejected(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
     """vague_delivery escalates; the user rejects it; nothing is requested or paid."""
@@ -160,21 +150,22 @@ def test_agent_cannot_approve_its_own_escalation(user: TestClient, agent: TestCl
 
 
 def test_cart_changed_after_authorization_is_blocked(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
-    """Authorized on the valid cart; the merchant then swaps in the price-bumped cart; revalidation catches it before payment."""
+    """Authorized on the valid cart; the merchant then swaps in the price-bumped cart; the re-read at card release catches it."""
     contract_id = sign_demo_contract(user)
     detail = request(agent, merchant_env, contract_id, "valid")
     session_id = detail["_checkout"]["session_id"]
     assert merchant_env.post(f"/api/dev/checkout/{session_id}/scenario", json={"scenario": "price_bump"}).status_code == 200
 
-    after = user.post(f"/purchases/{detail['purchase_id']}/payment/simulate-approval").json()
+    response = agent.post(f"/purchases/{detail['purchase_id']}/credential")
+    assert response.status_code == 409 and response.json()["error"] == "checkout_changed"
+    after = user.get(f"/purchases/{detail['purchase_id']}").json()
     assert after["payment_state"] == "checkout_changed" and after["status"] == "blocked"
-    assert agent.post(f"/purchases/{detail['purchase_id']}/credential").status_code == 409
     assert merchant_env.get(f"/api/checkout/{session_id}/order").json()["order"] is None
     assert user.get(f"/contracts/{contract_id}").json()["status"] == "active"  # freed for another try
-
+    assert after["funding"]["card_stored"] is True  # and the card is still locked on it
 
 def test_idempotent_request_purchase(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
-    """The same idempotency key returns the same purchase; there is one purchase and one spend request."""
+    """The same idempotency key returns the same purchase; there is one purchase and one payment."""
     contract_id = sign_demo_contract(user)
     checkout = merchant_env.post("/api/checkout-sessions", json={"scenario": "valid"}).json()
     body = {"contract_id": contract_id, "checkout_url": checkout["checkout_url"], "idempotency_key": "same-key-123456"}
@@ -187,13 +178,12 @@ def test_idempotent_request_purchase(user: TestClient, agent: TestClient, mercha
 
 
 def test_valid_flow_in_executor_mode(test_db: Any, merchant_env: TestClient) -> None:
-    """HANDSHAKE_CREDENTIAL_MODE=executor: the backend pays; the agent never gets a card."""
+    """HANDSHAKE_CREDENTIAL_MODE=executor: the backend pays with the stored card at authorization; the agent never gets it."""
     from handshake.api import create_app
 
     override_settings(credential_mode="executor")
     app = create_app()
     with TestClient(app, headers=user_headers()) as user, TestClient(app, headers=bearer(AGENT_TOKEN)) as agent:
         detail = request(agent, merchant_env, sign_demo_contract(user), "valid")
-        done = user.post(f"/purchases/{detail['purchase_id']}/payment/simulate-approval").json()
-        assert done["status"] == "completed" and done["payment"]["credential_released"] is False
+        assert detail["status"] == "completed" and detail["payment"]["credential_released"] is False
         assert agent.post(f"/purchases/{detail['purchase_id']}/credential").status_code == 404

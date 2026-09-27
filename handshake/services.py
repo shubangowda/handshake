@@ -49,6 +49,7 @@ from handshake.auth import Principal
 from handshake.config import DEV_SIGNING_SECRET, get_settings
 from handshake.intent_diff import (
     as_utc,
+    parse_datetime,
     cents_to_amount,
     compute_outcome,
     computed_total_cents,
@@ -612,6 +613,10 @@ def sign_draft(
     _check_owner(row.owner, owner, "draft_not_found", missing)
     if not agent_key:
         agent_key = get_settings().agent_id
+    # Signing FUNDS the contract from the user's own Link account, so in
+    # link_test mode that account must be connected first.
+    if row.signed_contract_id is None:
+        check_link_ready(row.owner)
     if row.signed_contract_id is not None:
         raise ServiceError(
             409, "already_signed", "This draft has already been signed.", {"contract_id": row.signed_contract_id}
@@ -699,7 +704,13 @@ def sign_draft(
             f"Replaced by the new version {contract.id}, which the user signed.",
             {"kind": "contract_amended", "replaced_by": contract.id},
         )
+        cancel_funding(session, replaced)
     session.commit()
+
+    # Sign = fund: request the single-use card for the hard cap from the
+    # user's Link account. The user approves it in Link; until then, the
+    # contract can't be spent against (contract_not_funded).
+    start_funding(session, contract, row.owner)
     return contract
 
 
@@ -739,17 +750,18 @@ def revoke_contract(session: Session, contract_id: str, owner: str | None) -> Co
     # released a card yet. (Ones already paying are left to reconcile.)
     canceled_payments: list[str] = []
     for payment in db.list_open_payments_for_contract(session, contract_id):
-        if payment.state in (payments.AWAITING_APPROVAL, payments.APPROVED, payments.CREDENTIAL_READY):
-            _cancel_provider_request(payment)
+        if payment.state == payments.CREDENTIAL_READY:
             if db.claim_payment_state(session, payment.id, (payment.state,), payments.DENIED):
                 canceled_payments.append(payment.purchase_id)
                 purchase = db.load_purchase(session, payment.purchase_id)
                 if purchase is not None and purchase.status == PurchaseStatus.AUTHORIZED:
                     _set_purchase(session, purchase, status=PurchaseStatus.BLOCKED, error="Contract revoked before payment.", completed_at=clock())
 
+    canceled_funding = cancel_funding(session, contract_id)  # cancels the Link request and WIPES any stored card
     log_event(
         session, contract_id, EvidenceEventType.CONTRACT_REVOKED,
-        "User revoked the contract.", {"revoked_credentials": revoked_ids, "canceled_payments": canceled_payments},
+        "User revoked the contract.",
+        {"revoked_credentials": revoked_ids, "canceled_payments": canceled_payments, "canceled_funding": canceled_funding},
     )
     session.commit()
     return db.load_contract(session, contract_id)
@@ -1039,6 +1051,19 @@ def _load_contract_for_purchase(
             f"contract_{status}",  # contract_used / contract_revoked / contract_expired
             f"Contract is {status}, not active; no purchase can be made against it.",
             {"contract_status": status},
+        )
+
+    # The contract must be FUNDED: its single-use card approved in Link and
+    # stored. Without it there is nothing to pay with, so don't even look.
+    refresh_funding(session, contract.id, None)
+    if usable_funding(session, contract.id) is None:
+        funding = db.current_funding(session, contract.id)
+        raise _record_rejected_attempt(
+            session, row, PurchaseStatus.BLOCKED, 409, "contract_not_funded",
+            "The contract isn't funded yet: the user must approve its single-use card in Link before anything can be bought.",
+            checkout_url, raw_proposal,
+            {"funding_state": funding.state if funding else "not_funded", "review_url": review_url_for(contract.id)},
+            idempotency_key=idempotency_key,
         )
 
     # A signed contract names the ONE agent allowed to spend against it
@@ -1525,6 +1550,9 @@ def approve_purchase(session: Session, purchase_id: str, note: str | None = None
             {"contract_status": status},
         )
 
+    if usable_funding(session, contract.id) is None:
+        raise ServiceError(409, "contract_not_funded", "The contract's funded card isn't available; fund the contract again first.")
+
     # --- The facts the user is approving ---------------------------------
     proposal_row = db.get_proposal_row(session, purchase.proposal_id) if purchase.proposal_id else None
     if proposal_row is None:
@@ -1710,18 +1738,29 @@ def complete_purchase(session: Session, purchase_id: str, charged_amount: float)
 
 
 # ============================================================
-# Payments: the state machine after AUTHORIZED (section 9)
+# Payments: fund at signing, release at authorization
 # ============================================================
 #
-#   awaiting_approval -> approved -> revalidating -> credential_ready -> paying -> paid -> completed
-#                                                   (agent_visible only)
-#   side exits: denied, expired, checkout_changed, failed, unknown
+# The owner's payment model (it replaces the per-purchase Link request):
 #
-# PurchaseStatus (models.py) stays AUTHORIZED through all of this, and only
-# becomes COMPLETED after Handshake verifies the merchant's order itself.
-# refresh_payment() is the one function that advances the machine; the
-# frontend and the MCP server poll it, and GET /purchases/{id} runs it too.
-# It is idempotent: calling it again in a stable state changes nothing.
+#   1. SIGN = FUND. Signing a contract asks the user's OWN Link account for
+#      one single-use TEST card for the contract's all-in hard cap. The user
+#      approves it in Link (stub mode: "Simulated provider approval"). Handshake
+#      then retrieves the card and stores it on the contract, ENCRYPTED.
+#         contract_funding: awaiting_approval -> funded -> released -> used
+#
+#   2. The card stays LOCKED in the database. The agent requests a purchase;
+#      Handshake reads the checkout and decides. Only an AUTHORIZED checkout
+#      unlocks the card, once:
+#         payments: credential_ready -> paying -> paid -> completed   (agent_visible)
+#                   paying -> paid -> completed                       (executor: the backend pays)
+#         side exits: denied (declined), checkout_changed, failed, unknown
+#
+# Purchases against a contract that isn't funded are refused (contract_not_funded).
+# PurchaseStatus (models.py) stays AUTHORIZED until the order is verified.
+
+FUNDING_ACTIVE = ("awaiting_approval", "funded")
+CARD_VALIDITY = timedelta(hours=12)  # Link: cards are valid 12 hours from request creation (verified in its README)
 
 
 def _run_async(coro: Any) -> Any:
@@ -1741,21 +1780,250 @@ def _run_async(coro: Any) -> Any:
         return pool.submit(asyncio.run, coro).result()
 
 
-def _provider_for(row: db.PaymentRow) -> payments.Provider:
-    """The provider that owns this payment row (a row never switches providers)."""
-    if row.provider == "link_test":
-        return payments.LinkTestProvider()
-    return payments.StubProvider()
+# ------------------------------------------------------------
+# Contract funding (step 1)
+# ------------------------------------------------------------
 
 
-def _cancel_provider_request(row: db.PaymentRow) -> None:
-    """Best effort: cancel the provider request so the user isn't asked to approve something dead."""
-    if not row.provider_request_id:
+def _funding_event(session: Session, funding: db.ContractFundingRow, event_type: EvidenceEventType, kind: str, message: str, **data: Any) -> None:
+    """A contract-level funding event. Never card data: at most last4."""
+    log_event(
+        session, funding.contract_id, event_type, message,
+        {"kind": kind, "funding_id": funding.id, "funding_state": funding.state, "provider": funding.provider,
+         "provider_request_id": funding.provider_request_id, **data},
+    )
+
+
+def _set_funding(funding: db.ContractFundingRow, **changes: Any) -> None:
+    """Update a funding row and stamp updated_at."""
+    for key, value in changes.items():
+        setattr(funding, key, value)
+    funding.updated_at = clock()
+
+
+def _funding_merchant(contract: Contract) -> tuple[str, str]:
+    """
+    Who the card is for, as Link shows it to the user when approving. The
+    contract's first allowed merchant (and its known site), or a truthful
+    'any merchant your contract allows'.
+    """
+    settings = get_settings()
+    if contract.merchants.allow:
+        name = contract.merchants.allow[0]
+        for origin, identity in settings.effective_merchant_identities.items():
+            if identity.strip().lower() == name.strip().lower():
+                return name, origin
+        return name, settings.frontend_url
+    return "Any merchant your Handshake contract allows", settings.frontend_url
+
+
+def check_link_ready(owner: str) -> None:
+    """In link_test mode, the user must have connected their own Link account before signing (and funding)."""
+    if get_settings().payment_mode != "link_test":
         return
+    if not payments.link_connection(owner)["connected"]:
+        raise ServiceError(
+            409, "link_not_connected",
+            "Connect your Stripe Link account first: signing funds the contract with a single-use Link test card.",
+        )
+
+
+def start_funding(session: Session, contract: Contract, owner: str) -> db.ContractFundingRow:
+    """
+    Ask the user's Link account for one single-use TEST card for the contract's all-in cap.
+
+    The row is committed BEFORE the provider is called, and the provider's
+    request id is committed the moment it returns, so nothing is ever lost or
+    requested twice for the same funding.
+    """
+    existing = db.current_funding(session, contract.id)
+    if existing is not None and existing.state in FUNDING_ACTIVE:
+        return existing
+
+    settings = get_settings()
+    provider = payments.get_provider(settings, owner)
+    merchant_name, merchant_url = _funding_merchant(contract)
+    amount_minor = to_cents(contract.spend.hard_cap_all_in)
+    now = clock()
+    funding = db.ContractFundingRow(
+        id=generate_id("funding"), contract_id=contract.id, owner=owner, provider=provider.name, state="awaiting_approval",
+        amount_minor=amount_minor, currency=contract.spend.currency.upper(), merchant_name=merchant_name, merchant_url=merchant_url,
+        created_at=now, updated_at=now,
+    )
+    session.add(funding)
+    session.commit()
+
+    context = (
+        f"Funding a Handshake contract you just signed: '{contract.goal}'. This single-use test-mode card covers at most "
+        f"{fmt_money(amount_minor, funding.currency)} all-in. Handshake keeps it locked and releases it only for a checkout "
+        "that it has independently verified against your contract."
+    )
+    spec = payments.SpendSpec(
+        reference_id=funding.id, amount_minor=amount_minor, currency=funding.currency, merchant_name=merchant_name,
+        merchant_url=merchant_url, context=context, line_items=((contract.goal[:80], amount_minor, 1),),
+    )
     try:
-        _run_async(_provider_for(row).cancel(row.provider_request_id))
-    except payments.PaymentError:
-        pass
+        request = _run_async(provider.create_request(spec))
+    except payments.PaymentUncertain as exc:
+        try:
+            request = _run_async(provider.reconcile(spec))
+        except payments.PaymentError:
+            request = None
+        if request is None:
+            _set_funding(funding, state="failed", last_error=f"Funding request could not be confirmed: {exc.message}")
+            _funding_event(session, funding, EvidenceEventType.CONTRACT_SIGNED, "funding_failed", "The Link funding request could not be confirmed.")
+            session.commit()
+            return funding
+    except payments.PaymentError as exc:
+        _set_funding(funding, state="failed", last_error=exc.message[:300])
+        _funding_event(session, funding, EvidenceEventType.CONTRACT_SIGNED, "funding_failed", f"The payment provider refused the funding request: {exc.message}")
+        session.commit()
+        return funding
+
+    approval_url = request.approval_url if provider.name == "link_test" else review_url_for(contract.id)
+    _set_funding(funding, provider_request_id=request.request_id, approval_url=approval_url)
+    session.commit()
+    _funding_event(
+        session, funding, EvidenceEventType.CONTRACT_SIGNED, "funding_requested",
+        f"{provider.label}: a single-use card for up to {fmt_money(amount_minor, funding.currency)} was requested to fund this contract. "
+        "Approve it to activate the contract.", approval_url=approval_url,
+    )
+    session.commit()
+    return funding
+
+
+def restart_funding(session: Session, contract_id: str, owner: str | None) -> dict[str, Any]:
+    """Fund an active contract again (the previous card was denied, expired, failed, or already used). User only."""
+    contract = _require_contract(session, contract_id, owner)
+    if contract.status != ContractStatus.ACTIVE:
+        raise ServiceError(409, "contract_not_active", f"Only an active contract can be funded; this one is {contract.status.value}.")
+    row = db.get_contract_row(session, contract_id)
+    check_link_ready(row.owner)
+    start_funding(session, contract, row.owner)
+    return refresh_funding(session, contract_id, owner)
+
+
+def refresh_funding(session: Session, contract_id: str, owner: str | None) -> dict[str, Any]:
+    """
+    Poll the provider for a contract's funding. Once approved, retrieve the
+    single-use card, store it ENCRYPTED on the contract, and mark it funded.
+    Idempotent: safe to call as often as the frontend likes.
+    """
+    contract = _require_contract(session, contract_id, owner)
+    funding = db.current_funding(session, contract.id)
+    if funding is None:
+        return funding_for_api(None)
+
+    # A stored card that has passed its validity window is no longer usable.
+    if funding.state == "funded" and funding.valid_until is not None and db.utc(funding.valid_until) <= clock():
+        _set_funding(funding, state="expired", card_ciphertext=None)
+        _funding_event(session, funding, EvidenceEventType.CONTRACT_SIGNED, "funding_expired", "The funded card expired unused; fund the contract again to buy.")
+        session.commit()
+
+    if funding.state == "awaiting_approval" and funding.provider_request_id:
+        provider = payments.provider_named(funding.provider, funding.owner)
+        try:
+            status = _run_async(provider.get_status(funding.provider_request_id))
+        except payments.PaymentError as exc:
+            _set_funding(funding, last_error=payments.sanitize(exc.message))
+            session.commit()
+            return funding_for_api(funding)
+
+        if status.state == payments.P_APPROVED:
+            try:
+                card = _run_async(provider.retrieve_card(funding.provider_request_id))
+            except payments.PaymentError as exc:
+                _set_funding(funding, last_error=f"Card retrieval failed ({exc.code}); will retry.")
+                session.commit()
+                return funding_for_api(funding)
+            try:
+                valid_until = parse_datetime(card.valid_until)[0] if card.valid_until else funding.created_at + CARD_VALIDITY
+            except ValueError:
+                valid_until = db.utc(funding.created_at) + CARD_VALIDITY
+            if db.claim_funding_state(session, funding.id, ("awaiting_approval",), "funded"):
+                _set_funding(funding, card_ciphertext=payments.encrypt_card(card, contract.id, funding.id), card_last4=card.last4,
+                             card_brand=card.brand, valid_until=valid_until, last_error=None)
+                _funding_event(session, funding, EvidenceEventType.CREDENTIAL_CREATED, "card_stored",
+                               f"You approved the funding. The single-use card (ending {card.last4}) is stored, encrypted and locked, "
+                               "until Handshake authorizes a checkout.", last4=card.last4, simulated=card.simulated)
+                session.commit()
+            del card
+        elif status.state in (payments.P_DENIED, payments.P_EXPIRED, payments.P_FAILED):
+            new_state = {"denied": "denied", "expired": "expired", "failed": "failed"}[status.state]
+            if db.claim_funding_state(session, funding.id, ("awaiting_approval",), new_state):
+                _funding_event(session, funding, EvidenceEventType.CONTRACT_SIGNED, f"funding_{new_state}",
+                               f"The funding request was {new_state} in {provider.label}; fund the contract again to buy.")
+                session.commit()
+        elif status.state == payments.P_UNKNOWN:
+            _set_funding(funding, last_error=f"Unrecognized provider status {status.raw_status!r}; waiting.")
+            session.commit()
+    return funding_for_api(db.current_funding(session, contract.id))
+
+
+def simulate_funding_approval(session: Session, contract_id: str, owner: str | None) -> dict[str, Any]:
+    """STUB MODE ONLY: stand in for the user's approval tap in Link. Labeled 'Simulated provider approval' everywhere."""
+    contract = _require_contract(session, contract_id, owner)
+    funding = db.current_funding(session, contract.id)
+    if funding is None or funding.provider != "stub":
+        raise ServiceError(409, "not_simulated", "Only a simulated funding request can be approved this way.")
+    if funding.state != "awaiting_approval" or not funding.provider_request_id:
+        raise ServiceError(409, "funding_not_awaiting_approval", f"The funding is {funding.state}, not waiting for approval.")
+    payments.StubProvider.simulate(funding.provider_request_id, "approved")
+    _funding_event(session, funding, EvidenceEventType.CONTRACT_SIGNED, "simulated_provider_approval",
+                   "Simulated provider approval: the user approved the (simulated) funding.")
+    session.commit()
+    return refresh_funding(session, contract_id, owner)
+
+
+def cancel_funding(session: Session, contract_id: str) -> str | None:
+    """On revoke: cancel a pending Link request and wipe a stored card. Returns the funding id touched, if any."""
+    funding = db.current_funding(session, contract_id)
+    if funding is None or funding.state not in FUNDING_ACTIVE:
+        return None
+    if funding.provider_request_id:
+        try:
+            _run_async(payments.provider_named(funding.provider, funding.owner).cancel(funding.provider_request_id))
+        except payments.PaymentError:
+            pass
+    _set_funding(funding, state="canceled", card_ciphertext=None)
+    return funding.id
+
+
+def funding_for_api(funding: db.ContractFundingRow | None) -> dict[str, Any]:
+    """A contract's funding as the frontend and agent see it. Never card data: at most last4."""
+    if funding is None:
+        return {"state": "not_funded", "card_stored": False}
+    return {
+        "funding_id": funding.id,
+        "state": funding.state,
+        "provider": funding.provider,
+        "provider_label": "Stripe Link: TEST MODE" if funding.provider == "link_test" else "Simulated provider",
+        "approval_url": funding.approval_url,
+        "provider_reference": funding.provider_request_id,
+        "amount": float(Decimal(funding.amount_minor) / 100),
+        "currency": funding.currency,
+        "merchant_name": funding.merchant_name,
+        "card_stored": funding.card_ciphertext is not None,
+        "card_last4": funding.card_last4,
+        "valid_until": db.utc(funding.valid_until).isoformat() if funding.valid_until else None,
+        "released_purchase_id": funding.released_purchase_id,
+        "last_error": funding.last_error,
+    }
+
+
+def usable_funding(session: Session, contract_id: str) -> db.ContractFundingRow | None:
+    """The contract's funding if it holds a stored, unexpired card right now; otherwise None."""
+    funding = db.current_funding(session, contract_id)
+    if funding is None or funding.state != "funded" or funding.card_ciphertext is None:
+        return None
+    if funding.valid_until is not None and db.utc(funding.valid_until) <= clock():
+        return None
+    return funding
+
+
+# ------------------------------------------------------------
+# Purchase payments (step 2)
+# ------------------------------------------------------------
 
 
 def _payment_event(session: Session, row: db.PaymentRow, contract_id: str, event_type: EvidenceEventType, kind: str, message: str, **data: Any) -> None:
@@ -1776,10 +2044,9 @@ def _set_payment(session: Session, row: db.PaymentRow, **changes: Any) -> None:
 
 def _release_reservation(session: Session, contract_id: str) -> bool:
     """
-    Give a single-use contract back (USED -> ACTIVE) after a payment that
-    guaranteed no money moved (denied, expired, checkout changed, failed
-    before any order). The purchase holding the reservation is terminal, so
-    the user's authorization is usable again. Conditional UPDATE, as always.
+    Give a single-use contract back (USED -> ACTIVE) after a purchase that
+    guaranteed no money moved (declined, checkout changed, failed before any
+    order). Its funded card, if still stored, stays available for the next try.
     """
     return db.claim_contract_status(session, contract_id, ContractStatus.USED, ContractStatus.ACTIVE)
 
@@ -1795,11 +2062,7 @@ def _end_payment(
     release: bool = True,
     **data: Any,
 ) -> Purchase:
-    """
-    Finish a payment WITHOUT a completed order: record why, close the
-    purchase, revoke Handshake's credential, and (if no money moved) release
-    the single-use contract.
-    """
+    """Finish a purchase payment WITHOUT a completed order: record why, close the purchase, revoke the grant, maybe free the contract."""
     contract_id = purchase.contract_id
     _set_payment(session, row, state=state, last_error=message[:300])
     if purchase.status == PurchaseStatus.AUTHORIZED:
@@ -1812,234 +2075,77 @@ def _end_payment(
         contract = db.load_contract(session, contract_id)
         if contract is not None and contract.single_use:
             released = _release_reservation(session, contract_id)
-    event_type = EvidenceEventType.PURCHASE_BLOCKED
-    _payment_event(session, row, contract_id, event_type, kind, message, contract_released=released, **data)
+    _payment_event(session, row, contract_id, EvidenceEventType.PURCHASE_BLOCKED, kind, message, contract_released=released, **data)
     session.commit()
     return purchase
-
-
-def _spend_spec(purchase: Purchase, contract: Contract, proposal: TransactionProposal, amount_minor: int) -> payments.SpendSpec:
-    """What we ask the provider for: the exact authorized amount and a truthful description."""
-    checkout_url = proposal.source_url or ""
-    parts = checkout_url.split("/")
-    merchant_url = "/".join(parts[:3]) if len(parts) >= 3 else checkout_url
-    items = tuple((item.name, to_cents(item.unit_price), item.quantity) for item in proposal.line_items)
-    context = payments.build_context(
-        contract.goal, proposal.merchant.name, [item.name for item in proposal.line_items], fmt_money(amount_minor, proposal.currency)
-    )
-    return payments.SpendSpec(
-        purchase_id=purchase.id, amount_minor=amount_minor, currency=proposal.currency.upper(),
-        merchant_name=proposal.merchant.name, merchant_url=merchant_url, context=context, line_items=items,
-    )
 
 
 def start_payment(session: Session, purchase: Purchase, contract: Contract, proposal: TransactionProposal) -> Purchase:
     """
-    AUTHORIZED -> ask the provider for a single-use TEST card that the USER must approve.
+    AUTHORIZED -> unlock the contract's stored card for THIS checkout.
 
-    The payment row is committed BEFORE the provider is called, and the
-    request id is committed the moment it comes back, so a crash can never
-    lose a request or cause a second one. Only one payment per purchase, ever.
+    agent_visible: the card is now collectable once (credential_ready).
+    executor: the backend pays the merchant with it right away.
+    Only one payment per purchase, ever.
     """
     if db.get_payment(session, purchase.id) is not None:
-        return purchase  # never a second spend request for the same purchase
-
-    settings = get_settings()
-    provider = payments.get_provider(settings)
+        return purchase
+    funding = usable_funding(session, contract.id)
     amount_minor = to_cents(purchase.authorized_amount)
     now = clock()
     row = db.PaymentRow(
-        id=generate_id("payment"), purchase_id=purchase.id, provider=provider.name, state=payments.AWAITING_APPROVAL,
-        amount_minor=amount_minor, pay_amount_minor=amount_minor, currency=proposal.currency.upper(),
-        checkout_url=proposal.source_url, created_at=now, updated_at=now,
+        id=generate_id("payment"), purchase_id=purchase.id,
+        provider=funding.provider if funding else get_settings().payment_mode,
+        provider_request_id=funding.provider_request_id if funding else None,
+        state=payments.CREDENTIAL_READY, amount_minor=amount_minor, pay_amount_minor=amount_minor,
+        currency=proposal.currency.upper(), checkout_url=proposal.source_url, created_at=now, updated_at=now,
     )
     session.add(row)
     session.commit()
 
-    spec = _spend_spec(purchase, contract, proposal, amount_minor)
-    try:
-        request = _run_async(provider.create_request(spec))
-    except payments.PaymentUncertain as exc:
-        # We don't know if Link created it. Look before ever trying again.
-        try:
-            request = _run_async(provider.reconcile(spec))
-        except payments.PaymentError:
-            request = None
-        if request is None:
-            _set_payment(session, row, state=payments.UNKNOWN, last_error=exc.message)
-            _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "payment_request_uncertain",
-                           "The payment request's creation could not be confirmed; Handshake will reconcile before anything else.")
-            session.commit()
-            return purchase
-    except payments.PaymentError as exc:
-        return _end_payment(session, row, purchase, payments.FAILED, "payment_request_failed",
-                            f"The payment provider refused the request: {exc.message}", error_code=exc.code)
+    if funding is None:
+        # The card expired or was used between the request and now.
+        return _end_payment(session, row, purchase, payments.FAILED, "funding_unavailable",
+                            "The contract's funded card is no longer available; fund the contract again.")
 
-    # Persist the provider's id immediately, before any polling.
-    approval_url = request.approval_url
-    if provider.name == "stub":
-        approval_url = purchase_url_for(purchase.id)  # the "Simulated provider approval" button lives there
-    _set_payment(session, row, provider_request_id=request.request_id, approval_url=approval_url)
-    session.commit()
+    if get_settings().credential_mode == "agent_visible":
+        _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "credential_ready",
+                       f"Handshake authorized this checkout. The contract's stored card (ending {funding.card_last4}) is unlocked for the "
+                       f"agent to collect once and pay exactly {fmt_money(amount_minor, row.currency)}.")
+        session.commit()
+        return purchase
 
-    _payment_event(
-        session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "payment_requested",
-        f"{provider.label}: a single-use card for {fmt_money(amount_minor, spec.currency)} was requested. "
-        "It is waiting for your approval.",
-        approval_url=approval_url, amount=fmt_money(amount_minor, spec.currency),
-    )
-    session.commit()
-    return purchase
+    return _execute_payment(session, row, purchase, funding)
 
 
 def refresh_payment(session: Session, purchase_id: str, owner: str | None = None, extractor: Extractor | None = None) -> Purchase:
-    """
-    Advance the payment state machine as far as it can go right now. Idempotent.
-
-    Polled by the frontend and the MCP server, and run on GET /purchases/{id}.
-    Each step re-reads the row, so two refreshes racing are safe: the atomic
-    state claims decide who does a step.
-    """
+    """Advance a purchase's payment as far as it can go right now (idempotent). Polled by the frontend and the MCP server."""
     purchase = get_owned_purchase(session, purchase_id, owner)
-    for _ in range(8):  # a few steps per call is plenty; each loop makes progress or stops
+    for _ in range(6):
         row = db.get_payment(session, purchase.id)
         if row is None or row.state in payments.TERMINAL_STATES:
             break
         before = row.state
-        purchase = _payment_step(session, row, purchase, extractor)
+        purchase = _payment_step(session, row, purchase)
         session.refresh(row)
         if row.state == before:
             break
     return purchase
 
 
-def _payment_step(session: Session, row: db.PaymentRow, purchase: Purchase, extractor: Extractor | None) -> Purchase:
-    """Do ONE transition from the payment's current state (see the diagram above)."""
-    provider = _provider_for(row)
-
-    if row.state == payments.AWAITING_APPROVAL:
-        if not row.provider_request_id:
-            return purchase
-        try:
-            status = _run_async(provider.get_status(row.provider_request_id))
-        except payments.PaymentError as exc:
-            _set_payment(session, row, last_error=payments.sanitize(exc.message))
-            session.commit()
-            return purchase
-        if status.state == payments.P_APPROVED:
-            if db.claim_payment_state(session, row.id, (payments.AWAITING_APPROVAL,), payments.APPROVED):
-                _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "payment_approved",
-                               f"The payment was approved in {provider.label}.")
-                session.commit()
-        elif status.state == payments.P_DENIED:
-            purchase = _end_payment(session, row, purchase, payments.DENIED, "payment_denied", "The payment was declined in Link.")
-        elif status.state == payments.P_EXPIRED:
-            purchase = _end_payment(session, row, purchase, payments.EXPIRED, "payment_expired", "The payment approval expired before you approved it.")
-        elif status.state == payments.P_FAILED:
-            purchase = _end_payment(session, row, purchase, payments.FAILED, "payment_request_failed", "The payment provider reported a failure.")
-        elif status.state == payments.P_UNKNOWN:
-            _set_payment(session, row, last_error=f"Unrecognized provider status {status.raw_status!r}; waiting.")
-            session.commit()
-        return purchase
-
-    if row.state == payments.APPROVED:
-        if not db.claim_payment_state(session, row.id, (payments.APPROVED,), payments.REVALIDATING):
-            return purchase
-        session.commit()
-        return _revalidate_and_continue(session, row, purchase, extractor)
-
-    if row.state == payments.REVALIDATING:
-        # A previous refresh died mid-revalidation; start it over.
-        return _revalidate_and_continue(session, row, purchase, extractor)
-
+def _payment_step(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
+    """Do ONE transition from the payment's current state."""
     if row.state == payments.CREDENTIAL_READY:
         credential = db.load_credential(session, purchase.credential_id)
         if credential is not None and as_utc(credential.expires_at)[0] <= clock():
-            _cancel_provider_request(row)
-            return _end_payment(session, row, purchase, payments.EXPIRED, "payment_expired",
+            return _end_payment(session, row, purchase, payments.EXPIRED, "authorization_expired",
                                 "The authorization expired before the agent collected the card.")
-        return purchase  # waiting for the agent to collect the card
-
+        return purchase
     if row.state in (payments.PAYING, payments.UNKNOWN):
         return _look_for_order(session, row, purchase)
-
     if row.state == payments.PAID:
         return _verify_and_complete(session, row, purchase)
-
     return purchase
-
-
-def _revalidate_and_continue(session: Session, row: db.PaymentRow, purchase: Purchase, extractor: Extractor | None) -> Purchase:
-    """
-    After the user approves in Link and BEFORE any card moves: is everything still true?
-
-    1. The contract still verifies and is not revoked or expired.
-    2. The checkout is re-extracted. If its snapshot hash matches, nothing
-       changed. If it changed, the engine runs again on the new facts; if the
-       new outcome isn't AUTHORIZED or the total rose at all, stop at
-       checkout_changed and pay nothing.
-    """
-    contract_row = db.get_contract_row(session, purchase.contract_id)
-    try:
-        contract = db.contract_from_row(contract_row)
-    except ValidationError:
-        return _end_payment(session, row, purchase, payments.FAILED, "contract_tampered", "The contract no longer verifies; nothing was paid.", release=False)
-    if not verify_contract(contract)["valid"]:
-        return _end_payment(session, row, purchase, payments.FAILED, "contract_tampered", "The contract no longer verifies; nothing was paid.", release=False)
-    if contract.status in (ContractStatus.REVOKED, ContractStatus.EXPIRED) or (
-        contract.expires_at is not None and as_utc(contract.expires_at)[0] <= clock()
-    ):
-        _cancel_provider_request(row)
-        return _end_payment(session, row, purchase, payments.FAILED, "contract_no_longer_valid",
-                            "The contract was revoked or expired before payment; nothing was paid.", release=False)
-
-    proposal_row = db.get_proposal_row(session, purchase.proposal_id)
-    if extractor is None:
-        from handshake.extractor import get_extractor
-
-        extractor = get_extractor()
-    try:
-        extraction = extractor.extract(row.checkout_url or "", contract.id)
-    except ExtractionError as exc:
-        # Can't look at the checkout, so can't pay for it. Try again next refresh.
-        db.claim_payment_state(session, row.id, (payments.REVALIDATING,), payments.APPROVED)
-        _set_payment(session, row, last_error=f"Could not re-read the checkout: {exc.message}")
-        session.commit()
-        return purchase
-
-    authorized_minor = row.amount_minor
-    changed = extraction.snapshot_hash != proposal_row.checkout_snapshot_hash
-    if changed:
-        new_outcome, new_total, reasons = _re_evaluate(contract, extraction.raw_proposal)
-        if new_outcome != PurchaseStatus.AUTHORIZED or new_total is None or new_total > authorized_minor:
-            _cancel_provider_request(row)
-            return _end_payment(
-                session, row, purchase, payments.CHECKOUT_CHANGED, "checkout_changed",
-                "The checkout changed after authorization and no longer matches the contract; nothing was paid.",
-                purchase_status=PurchaseStatus.BLOCKED,
-                new_outcome=new_outcome.value if new_outcome else None,
-                new_total=fmt_money(new_total, row.currency) if new_total is not None else None,
-                authorized=fmt_money(authorized_minor, row.currency), reasons=reasons,
-                new_snapshot_hash=extraction.snapshot_hash,
-            )
-        _set_payment(session, row, pay_amount_minor=new_total)
-
-    _payment_event(
-        session, row, purchase.contract_id, EvidenceEventType.VALIDATION_COMPLETED, "checkout_revalidated",
-        "The checkout was read again before payment and still matches the contract." if not changed
-        else "The checkout changed but still satisfies the contract at no higher cost.",
-        unchanged=not changed, snapshot_hash=extraction.snapshot_hash,
-    )
-
-    if get_settings().credential_mode == "agent_visible":
-        db.claim_payment_state(session, row.id, (payments.REVALIDATING,), payments.CREDENTIAL_READY)
-        _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "credential_ready",
-                       "The single-use card is ready for the agent to collect once and pay this exact checkout.")
-        session.commit()
-        return purchase
-
-    session.commit()
-    return _execute_payment(session, row, purchase)
 
 
 def _re_evaluate(contract: Contract, raw_proposal: dict[str, Any]) -> tuple[PurchaseStatus | None, int | None, list[str]]:
@@ -2053,37 +2159,49 @@ def _re_evaluate(contract: Contract, raw_proposal: dict[str, Any]) -> tuple[Purc
     return outcome, payable_total_cents(proposal), reasons
 
 
-def _execute_payment(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
+def _take_card(session: Session, funding: db.ContractFundingRow, purchase_id: str) -> payments.CardSecret:
     """
-    EXECUTOR mode: the backend retrieves the card and pays the merchant itself.
-    The card never enters any agent's context. It lives only inside this function.
+    Take the stored card out of the database, exactly once: funded -> released
+    is an atomic claim, the ciphertext is decrypted in memory and WIPED from
+    the row in the same transaction. Raises ServiceError if it's gone.
     """
-    if not db.claim_payment_state(session, row.id, (payments.REVALIDATING,), payments.PAYING):
-        return purchase
-    session.commit()  # "paying" is on disk BEFORE the pay call, so a crash means "check for an order"
+    if not db.claim_funding_state(session, funding.id, ("funded",), "released"):
+        raise ServiceError(409, "credential_already_released", "The contract's card was already released. It is never sent twice.")
+    session.refresh(funding)
+    if funding.card_ciphertext is None:
+        raise ServiceError(409, "card_not_stored", "The contract has no stored card.")
+    card = payments.decrypt_card(funding.card_ciphertext, funding.contract_id, funding.id)
+    _set_funding(funding, card_ciphertext=None, released_purchase_id=purchase_id)
+    return card
 
+
+def _execute_payment(session: Session, row: db.PaymentRow, purchase: Purchase, funding: db.ContractFundingRow) -> Purchase:
+    """EXECUTOR mode: the backend pays the merchant with the stored card. The card never enters an agent's context."""
+    if not db.claim_payment_state(session, row.id, (payments.CREDENTIAL_READY,), payments.PAYING):
+        return purchase
     try:
-        card = _run_async(_provider_for(row).retrieve_card(row.provider_request_id or ""))
-    except payments.PaymentError as exc:
-        return _end_payment(session, row, purchase, payments.FAILED, "credential_retrieval_failed",
-                            f"The card could not be retrieved ({exc.code}); nothing was paid.")
+        card = _take_card(session, funding, purchase.id)
+    except (ServiceError, payments.PaymentError) as exc:
+        session.rollback()
+        return _end_payment(session, row, purchase, payments.FAILED, "card_unavailable", f"The stored card could not be used: {exc}; nothing was paid.")
+    session.commit()  # card released + "paying" on disk BEFORE the pay call: a crash means "check for an order"
+
     try:
         order = payments.pay_merchant(row.checkout_url or "", card, row.pay_amount_minor, row.currency)
     except payments.PaymentUncertain as exc:
-        # Maybe charged, maybe not. NEVER retry blindly: the next refresh asks the merchant.
         _set_payment(session, row, state=payments.UNKNOWN, last_error=exc.message, card_last4=card.last4)
         _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_USED, "payment_outcome_unknown",
                        "The merchant did not confirm the payment. Handshake will check for an order; it will not pay again.", last4=card.last4)
         session.commit()
         return purchase
     except payments.PaymentError as exc:
-        return _end_payment(session, row, purchase, payments.FAILED, "payment_refused", f"The merchant refused the payment ({exc.code}).")
+        return _end_payment(session, row, purchase, payments.FAILED, "payment_refused", f"The merchant refused the payment ({exc.code}).", release=False)
     finally:
         del card
 
     _set_payment(session, row, state=payments.PAID, order_id=str(order.get("order_id")), card_last4=str(order.get("last4") or "")[-4:] or None)
     _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_USED, "payment_submitted",
-                   "Handshake's executor paid the merchant with the single-use card.", order_id=row.order_id, last4=row.card_last4)
+                   "Handshake's executor paid the merchant with the contract's single-use card.", order_id=row.order_id, last4=row.card_last4)
     session.commit()
     return _verify_and_complete(session, row, purchase)
 
@@ -2091,26 +2209,9 @@ def _execute_payment(session: Session, row: db.PaymentRow, purchase: Purchase) -
 def _look_for_order(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
     """
     PAYING or UNKNOWN: ask the MERCHANT whether this checkout has an order.
-
-    This resolves an uncertain outcome before anything else happens: an order
-    means it was paid; no order after an uncertain call means it wasn't (and
-    we still never pay again on our own). For a request whose creation was
-    uncertain, reconcile with the provider instead.
+    An order means it was paid; no order after an uncertain call means it
+    wasn't (and Handshake never pays again on its own).
     """
-    if row.state == payments.UNKNOWN and not row.provider_request_id:
-        contract = db.load_contract(session, purchase.contract_id)
-        proposal = TransactionProposal.model_validate(db.get_proposal_row(session, purchase.proposal_id).data)
-        try:
-            found = _run_async(_provider_for(row).reconcile(_spend_spec(purchase, contract, proposal, row.amount_minor)))
-        except payments.PaymentError:
-            return purchase
-        if found is None:
-            return _end_payment(session, row, purchase, payments.FAILED, "payment_request_failed",
-                                "The payment request was never created; nothing was paid.")
-        _set_payment(session, row, provider_request_id=found.request_id, approval_url=found.approval_url, state=payments.AWAITING_APPROVAL)
-        session.commit()
-        return purchase
-
     try:
         order = payments.find_session_order(row.checkout_url or "")
     except payments.PaymentError as exc:
@@ -2120,8 +2221,9 @@ def _look_for_order(session: Session, row: db.PaymentRow, purchase: Purchase) ->
     if order is None:
         if row.state == payments.UNKNOWN:
             return _end_payment(session, row, purchase, payments.FAILED, "payment_not_made",
-                                "The merchant has no order for this checkout, so the uncertain payment did not happen. Nothing will be retried automatically.")
-        return purchase  # agent hasn't paid yet
+                                "The merchant has no order for this checkout, so the uncertain payment did not happen. Nothing will be retried automatically.",
+                                release=False)
+        return purchase  # the agent hasn't paid yet
     _set_payment(session, row, state=payments.PAID, order_id=str(order.get("order_id")), card_last4=(str(order.get("last4") or "")[-4:] or row.card_last4))
     _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_USED, "payment_submitted",
                    "The merchant reports an order for this checkout.", order_id=row.order_id, last4=row.card_last4)
@@ -2131,11 +2233,8 @@ def _look_for_order(session: Session, row: db.PaymentRow, purchase: Purchase) ->
 
 def _verify_and_complete(session: Session, row: db.PaymentRow, purchase: Purchase) -> Purchase:
     """
-    PAID: verify the order with the merchant INDEPENDENTLY, then reconcile.
-
-    Reconciliation reuses complete_purchase(): an overcharge of even one cent
-    fails the purchase and revokes the credential. Money did move then, so
-    the contract is NOT released.
+    PAID: verify the order with the merchant INDEPENDENTLY, then reconcile
+    (an overcharge of even one cent fails the purchase and revokes the grant).
     """
     try:
         order = payments.get_order(row.checkout_url or "", row.order_id or "")
@@ -2148,25 +2247,20 @@ def _verify_and_complete(session: Session, row: db.PaymentRow, purchase: Purchas
                             f"The merchant could not confirm order {row.order_id}: {exc.message}", release=False)
 
     if order.get("session_id") != (row.checkout_url or "").rstrip("/").rsplit("/", 1)[-1] or str(order.get("currency", "")).upper() != row.currency:
-        return _end_payment(session, row, purchase, payments.FAILED, "order_mismatch",
-                            "The merchant's order does not belong to this checkout.", release=False)
+        return _end_payment(session, row, purchase, payments.FAILED, "order_mismatch", "The merchant's order does not belong to this checkout.", release=False)
 
     outcome = complete_purchase(session, purchase.id, float(order.get("amount_charged") or 0))
     purchase = outcome["purchase"]
     receipt = {
-        "order_id": order.get("order_id"),
-        "amount_charged": order.get("amount_charged"),
-        "currency": order.get("currency"),
-        "last4": order.get("last4"),
-        "status": order.get("status"),
-        "verified_at": clock().isoformat(),
+        "order_id": order.get("order_id"), "amount_charged": order.get("amount_charged"), "currency": order.get("currency"),
+        "last4": order.get("last4"), "status": order.get("status"), "verified_at": clock().isoformat(),
         "test_mode": bool(order.get("test_mode", True)),
     }
+    funding = db.current_funding(session, purchase.contract_id)
+    if funding is not None and funding.released_purchase_id == purchase.id and funding.state == "released":
+        _set_funding(funding, state="used")
     if purchase.status == PurchaseStatus.COMPLETED:
         _set_payment(session, row, state=payments.COMPLETED, receipt=receipt, card_last4=str(order.get("last4") or row.card_last4 or "") or None)
-        contract = db.load_contract(session, purchase.contract_id)
-        if contract is not None and contract.single_use and contract.status == ContractStatus.ACTIVE:
-            db.claim_single_use_contract(session, contract.id)  # already USED via the reservation; this is a no-op then
         _payment_event(session, row, purchase.contract_id, EvidenceEventType.PAYMENT_COMPLETED, "receipt_verified",
                        f"Order {order.get('order_id')} verified with the merchant: {fmt_money(to_cents(order.get('amount_charged') or 0), row.currency)} charged.",
                        receipt=receipt)
@@ -2178,18 +2272,18 @@ def _verify_and_complete(session: Session, row: db.PaymentRow, purchase: Purchas
     return purchase
 
 
-# ============================================================
-# Agent-visible mode: the one-time card release (section 9.6)
-# ============================================================
+# ------------------------------------------------------------
+# Agent-visible mode: the one-time card release
+# ------------------------------------------------------------
 
 
 class CredentialRelease(BaseModel):
     """
     The ONLY response in Handshake that contains card values. Sensitive.
 
-    It is returned once, to the owning agent, for one purchase, and is never
-    cached, logged, stored, or put into evidence. Every other response
-    carries at most last4.
+    Returned once, to the contract's bound agent, for one authorized checkout;
+    never cached, logged, or put into evidence. (The card itself was stored,
+    encrypted, on the contract since funding; it is wiped as it is released.)
     """
 
     purchase_id: str
@@ -2211,14 +2305,13 @@ class CredentialRelease(BaseModel):
     instructions: str
 
 
-def release_credential(session: Session, purchase_id: str, principal: Principal) -> CredentialRelease:
+def release_credential(session: Session, purchase_id: str, principal: Principal, extractor: Extractor | None = None) -> CredentialRelease:
     """
-    Release the single-use TEST card to the owning agent, exactly once, for exactly this purchase.
+    Unlock the contract's stored card for the owning agent, exactly once, for exactly this AUTHORIZED checkout.
 
-    Requires: the caller is the agent the contract is bound to; the payment
-    is credential_ready (approved in Link AND revalidated); the contract still
-    verifies. The credential_ready -> paying claim is atomic, so a second call
-    (or two at once) gets 409 credential_already_released and no card values.
+    Before any card moves: the contract must still verify, and the checkout is
+    READ AGAIN. If it changed and no longer matches (or costs more), the
+    purchase stops at checkout_changed and the card stays locked for another try.
     """
     purchase = get_owned_purchase(session, purchase_id, principal.email)
     contract = _require_contract(session, purchase.contract_id, principal.email)
@@ -2226,8 +2319,8 @@ def release_credential(session: Session, purchase_id: str, principal: Principal)
         raise ServiceError(403, "agent_not_authorized", "Only the agent this contract is bound to can collect its card.")
 
     row = db.get_payment(session, purchase.id)
-    if row is None or row.state in (payments.AWAITING_APPROVAL, payments.APPROVED, payments.REVALIDATING):
-        raise ServiceError(409, "payment_not_ready", "The card isn't available yet: the user must approve the payment and Handshake must recheck the checkout.")
+    if row is None:
+        raise ServiceError(409, "payment_not_ready", "Handshake hasn't authorized a checkout for this purchase, so the card stays locked.")
     if row.credential_released_at is not None or row.state in (payments.PAYING, payments.PAID, payments.COMPLETED, payments.UNKNOWN):
         raise ServiceError(409, "credential_already_released", "The card for this purchase was already released. It is never sent twice.")
     if row.state != payments.CREDENTIAL_READY:
@@ -2237,84 +2330,76 @@ def release_credential(session: Session, purchase_id: str, principal: Principal)
     credential = db.load_credential(session, purchase.credential_id)
     if credential is None or credential.status != CredentialStatus.ACTIVE or as_utc(credential.expires_at)[0] <= clock():
         raise ServiceError(409, "authorization_expired", "The authorization for this purchase is no longer active.")
+    funding = usable_funding(session, contract.id)
+    if funding is None:
+        raise ServiceError(409, "contract_not_funded", "The contract's funded card is no longer available; the user must fund it again.")
 
-    # The one-time claim. Whoever flips credential_ready -> paying first gets the card.
-    if not db.claim_payment_state(session, row.id, (payments.CREDENTIAL_READY,), payments.PAYING):
-        raise ServiceError(409, "credential_already_released", "The card for this purchase was already released. It is never sent twice.")
-    session.commit()
+    # --- Read the checkout again before the card moves -----------------
+    if extractor is None:
+        from handshake.extractor import get_extractor
 
+        extractor = get_extractor()
+    proposal_row = db.get_proposal_row(session, purchase.proposal_id)
     try:
-        card = _run_async(_provider_for(row).retrieve_card(row.provider_request_id or ""))
-    except payments.PaymentError as exc:
-        # Nothing was delivered, so put the payment back and let the agent try again.
-        db.claim_payment_state(session, row.id, (payments.PAYING,), payments.CREDENTIAL_READY)
-        _set_payment(session, row, last_error=f"Card retrieval failed ({exc.code}).")
-        session.commit()
-        raise ServiceError(502, "credential_retrieval_failed", "The card could not be retrieved from the provider. Try again shortly.")
+        extraction = extractor.extract(row.checkout_url or "", contract.id)
+    except ExtractionError as exc:
+        raise ServiceError(502, "checkout_unreachable", f"Handshake couldn't re-read the checkout before releasing the card: {exc.message}")
+    if extraction.snapshot_hash != proposal_row.checkout_snapshot_hash:
+        new_outcome, new_total, reasons = _re_evaluate(contract, extraction.raw_proposal)
+        if new_outcome != PurchaseStatus.AUTHORIZED or new_total is None or new_total > row.amount_minor:
+            _end_payment(
+                session, row, purchase, payments.CHECKOUT_CHANGED, "checkout_changed",
+                "The checkout changed after authorization and no longer matches the contract; the card stays locked.",
+                purchase_status=PurchaseStatus.BLOCKED, new_outcome=new_outcome.value if new_outcome else None,
+                new_total=fmt_money(new_total, row.currency) if new_total is not None else None,
+                authorized=fmt_money(row.amount_minor, row.currency), reasons=reasons, new_snapshot_hash=extraction.snapshot_hash,
+            )
+            raise ServiceError(409, "checkout_changed", "The checkout changed after authorization and no longer matches the contract. Request the purchase again.")
+        _set_payment(session, row, pay_amount_minor=new_total)
+    _payment_event(session, row, purchase.contract_id, EvidenceEventType.VALIDATION_COMPLETED, "checkout_revalidated",
+                   "The checkout was read again just before the card was released and still matches the contract.",
+                   snapshot_hash=extraction.snapshot_hash)
 
+    # --- The one-time release ----------------------------------------------
+    if not db.claim_payment_state(session, row.id, (payments.CREDENTIAL_READY,), payments.PAYING):
+        session.rollback()
+        raise ServiceError(409, "credential_already_released", "The card for this purchase was already released. It is never sent twice.")
+    try:
+        card = _take_card(session, funding, purchase.id)
+    except (ServiceError, payments.PaymentError) as exc:
+        session.rollback()
+        raise ServiceError(409, "card_unavailable", f"The stored card could not be released: {exc}")
     _set_payment(session, row, credential_released_at=clock(), card_last4=card.last4)
     _payment_event(session, row, purchase.contract_id, EvidenceEventType.CREDENTIAL_CREATED, "credential_released",
-                   f"The single-use card (ending {card.last4}) was released once to {principal.label} for this checkout only.",
-                   last4=card.last4, simulated=card.simulated)
+                   f"The contract's single-use card (ending {card.last4}) was released once to {principal.label} for this checkout only, "
+                   "and wiped from Handshake's database.", last4=card.last4, simulated=card.simulated)
     session.commit()
 
     endpoints = payments.merchant_endpoints(row.checkout_url or "")
-    settings = get_settings()
-    return CredentialRelease(
-        purchase_id=purchase.id,
-        contract_id=purchase.contract_id,
-        merchant_name=purchase.merchant_name or "",
-        checkout_url=row.checkout_url or "",
-        pay_url=endpoints["pay_url"],
-        amount=float(Decimal(row.pay_amount_minor) / 100),
-        currency=row.currency,
-        card_number=card.number,
-        exp_month=card.exp_month,
-        exp_year=card.exp_year,
-        cvc=card.cvc,
-        card_valid_until=card.valid_until,
-        authorization_expires_at=credential.expires_at,
-        simulated=card.simulated,
-        mode_label=settings.payment_label,
+    release = CredentialRelease(
+        purchase_id=purchase.id, contract_id=purchase.contract_id, merchant_name=purchase.merchant_name or "",
+        checkout_url=row.checkout_url or "", pay_url=endpoints["pay_url"], amount=float(Decimal(row.pay_amount_minor) / 100),
+        currency=row.currency, card_number=card.number, exp_month=card.exp_month, exp_year=card.exp_year, cvc=card.cvc,
+        card_valid_until=card.valid_until, authorization_expires_at=credential.expires_at, simulated=card.simulated,
+        mode_label=get_settings().payment_label,
         instructions=(
             "Use these card values ONCE, only for this checkout: POST them to pay_url with exactly this amount and currency. "
             "Do not repeat them in chat, logs, or any other tool. Then poll get_purchase_status until it is completed. "
             "If the payment outcome is uncertain, do NOT pay again; poll status instead."
         ),
     )
-
-
-def simulate_approval(session: Session, purchase_id: str, owner: str | None) -> Purchase:
-    """
-    STUB MODE ONLY: stand in for the user's approval tap in Link. Labeled "Simulated provider approval" everywhere.
-    """
-    purchase = get_owned_purchase(session, purchase_id, owner)
-    row = db.get_payment(session, purchase.id)
-    if row is None or row.provider != "stub":
-        raise ServiceError(409, "not_simulated", "Only a simulated payment can be approved this way.")
-    if row.state != payments.AWAITING_APPROVAL or not row.provider_request_id:
-        raise ServiceError(409, "payment_not_awaiting_approval", f"The payment is {row.state}, not waiting for approval.")
-    payments.StubProvider.simulate(row.provider_request_id, "approved")
-    _payment_event(session, row, purchase.contract_id, EvidenceEventType.PURCHASE_AUTHORIZED, "simulated_provider_approval",
-                   "Simulated provider approval: the user approved the (simulated) payment.")
-    session.commit()
-    return purchase
+    del card
+    return release
 
 
 def decline_authorized_purchase(session: Session, purchase: Purchase, note: str | None) -> dict[str, Any]:
     """
-    The user declines an AUTHORIZED purchase before any card has moved ("Not this one").
-
-    Only while the payment hasn't started (awaiting approval, approved, or
-    card ready but not collected). The claim to DENIED is atomic, so it can't
-    race a card release: one of them wins.
+    The user declines an AUTHORIZED purchase before the card is released ("Not this one").
+    The card stays locked on the contract for the agent's next try.
     """
     row = db.get_payment(session, purchase.id)
-    not_started = (payments.AWAITING_APPROVAL, payments.APPROVED, payments.CREDENTIAL_READY)
-    if row is not None and not db.claim_payment_state(session, row.id, not_started, payments.DENIED):
-        raise ServiceError(409, "payment_already_started", "The payment is already under way and can no longer be declined.")
-    if row is not None:
-        _cancel_provider_request(row)
+    if row is not None and not db.claim_payment_state(session, row.id, (payments.CREDENTIAL_READY,), payments.DENIED):
+        raise ServiceError(409, "payment_already_started", "The card was already released for this purchase; it can no longer be declined.")
     decision = db.load_decision(session, purchase.decision_id)
     purchase = _set_purchase(session, purchase, status=PurchaseStatus.BLOCKED, error="Declined by the user before payment.", completed_at=clock())
     credential = db.load_credential(session, purchase.credential_id)
@@ -2324,7 +2409,7 @@ def decline_authorized_purchase(session: Session, purchase: Purchase, note: str 
     released = bool(contract and contract.single_use and _release_reservation(session, purchase.contract_id))
     log_event(
         session, purchase.contract_id, EvidenceEventType.PURCHASE_BLOCKED,
-        "You declined this purchase before payment. The agent can keep looking under the same contract.",
+        "You declined this purchase before payment. The card stays locked on the contract; the agent can keep looking.",
         {"kind": "purchase_declined", "human_rejection": True, "note": note, "contract_released": released},
         purchase.id,
     )
@@ -2464,6 +2549,7 @@ def next_action_for(purchase: Purchase, payment: db.PaymentRow | None) -> str:
         payments.APPROVED: "wait_for_revalidation",
         payments.REVALIDATING: "wait_for_revalidation",
         payments.CREDENTIAL_READY: "get_payment_credential_and_pay" if get_settings().credential_mode == "agent_visible" else "wait_for_payment",
+        payments.CHECKOUT_CHANGED: "request_purchase_again",
         payments.PAYING: "wait_for_merchant_order",
         payments.PAID: "wait_for_order_verification",
         payments.UNKNOWN: "wait_for_reconciliation",
@@ -2500,6 +2586,7 @@ def purchase_detail(session: Session, purchase: Purchase, **extra: Any) -> dict[
         "payment_state": payment.state if payment else None,
         "approval_url": payment.approval_url if payment else None,
         "resolution": resolution_from_evidence(session, purchase.id),
+        "funding": funding_for_api(db.current_funding(session, purchase.contract_id)),
         "next_action": next_action_for(purchase, payment),
         "review_url": purchase_url_for(purchase.id),
     }
@@ -2576,7 +2663,7 @@ def evidence_chain(session: Session, purchase_id: str, owner: str | None = None)
     # for the draft are stored under the draft id, so we look there too.
     rows_by_id: dict[str, db.EvidenceRow] = {}
     for row in db.list_evidence_for_contract(session, contract_row.id):
-        if row.event_type in CONTRACT_LEVEL_EVENTS and row.purchase_id is None:
+        if row.purchase_id is None:  # contract-level: signing, funding, card stored, revocation
             rows_by_id[row.id] = row
     if contract_row.draft_id:
         for row in db.list_evidence_for_contract(session, contract_row.draft_id):

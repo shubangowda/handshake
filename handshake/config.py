@@ -47,6 +47,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # (HANDSHAKE_ENV=prod) the app refuses to start while any of them is in use.
 DEV_SIGNING_SECRET = "handshake-dev-signing-secret-do-not-use-in-prod"
 DEV_SESSION_SECRET = "handshake-dev-session-secret-do-not-use-in-prod"
+# 32 bytes, base64. Encrypts the funded one-time card stored on a contract.
+DEV_CARD_KEY = "aGFuZHNoYWtlLWRldi1jYXJkLWtleS0zMmJ5dGVzISE="
 
 # The only payment modes that exist. There is deliberately no "live" value:
 # this codebase never requests a real card (see payments.py).
@@ -99,6 +101,11 @@ class Settings:
     link_max_minor_units: int = 50000  # our own ceiling on a spend request
     link_timeout_seconds: float = 60.0
     link_tmp_dir: str = str(REPO_ROOT / ".link-tmp")  # private dir for card files
+    # Each Handshake user gets their OWN Link login: the CLI runs with HOME set
+    # to <link_home_root>/<hash of the user's email>, so credentials never mix.
+    link_home_root: str = str(REPO_ROOT / ".handshake-state" / "link-homes")
+    link_npm_cache: str = str(Path.home() / ".npm")  # shared npx cache (users' homes stay empty)
+    card_encryption_key: str = DEV_CARD_KEY  # AES-256-GCM key for stored cards (base64, 32 bytes)
 
     # --- Compiler -----------------------------------------------------------
     compiler: str = "openai"  # "openai" (falls back to fixture with no key) or "fixture"
@@ -261,6 +268,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         link_max_minor_units=_number(env, "HANDSHAKE_LINK_MAX_MINOR_UNITS", Settings.link_max_minor_units, int),
         link_timeout_seconds=_number(env, "HANDSHAKE_LINK_TIMEOUT_SECONDS", Settings.link_timeout_seconds, float),
         link_tmp_dir=_optional(env, "HANDSHAKE_LINK_TMP_DIR") or Settings.link_tmp_dir,
+        link_home_root=_optional(env, "HANDSHAKE_LINK_HOME_ROOT") or Settings.link_home_root,
+        link_npm_cache=_optional(env, "HANDSHAKE_LINK_NPM_CACHE") or Settings.link_npm_cache,
+        card_encryption_key=_optional(env, "HANDSHAKE_CARD_ENCRYPTION_KEY") or DEV_CARD_KEY,
         compiler=_choice(env, "HANDSHAKE_COMPILER", "openai", COMPILER_MODES),
         compiler_model=_optional(env, "HANDSHAKE_COMPILER_MODEL") or Settings.compiler_model,
         compiler_service_tier=_optional(env, "HANDSHAKE_COMPILER_SERVICE_TIER"),
@@ -288,6 +298,15 @@ def validate(settings: Settings) -> None:
     if settings.signing_secret == settings.session_secret:
         raise ConfigError("HANDSHAKE_SESSION_SECRET must differ from HANDSHAKE_SIGNING_SECRET.")
 
+    import base64
+    import binascii
+
+    try:
+        if len(base64.b64decode(settings.card_encryption_key, validate=True)) != 32:
+            raise ValueError
+    except (ValueError, binascii.Error):
+        raise ConfigError("HANDSHAKE_CARD_ENCRYPTION_KEY must be 32 random bytes, base64-encoded.")
+
     if settings.link_max_minor_units < 1:
         raise ConfigError("HANDSHAKE_LINK_MAX_MINOR_UNITS must be at least 1.")
 
@@ -305,6 +324,8 @@ def validate(settings: Settings) -> None:
             problems.append("HANDSHAKE_SIGNING_SECRET is the public dev default")
         if settings.session_secret == DEV_SESSION_SECRET:
             problems.append("HANDSHAKE_SESSION_SECRET is the public dev default")
+        if settings.card_encryption_key == DEV_CARD_KEY:
+            problems.append("HANDSHAKE_CARD_ENCRYPTION_KEY is the public dev default")
         if not settings.agent_token:
             problems.append("HANDSHAKE_AGENT_TOKEN is not set")
         if "*" in settings.effective_cors_origins:

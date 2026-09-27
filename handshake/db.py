@@ -300,6 +300,66 @@ class PaymentRow(Base):
     receipt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+class ContractFundingRow(Base):
+    """
+    How a signed contract is paid for: ONE single-use Link TEST card for the
+    contract's all-in hard cap, requested when the user signs and approved by
+    the user in Link.
+
+    The card is stored here, ENCRYPTED (card_ciphertext, AES-256-GCM, see
+    payments.encrypt_card), from the moment Link approves it until Handshake
+    releases it for an authorized checkout (or the contract is revoked), when
+    the ciphertext is wiped. Only last4 is kept in the clear.
+
+    States: awaiting_approval -> funded -> released -> used
+            side exits: denied, expired, failed, canceled
+    """
+
+    __tablename__ = "contract_funding"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    contract_id: Mapped[str] = mapped_column(String, index=True)
+    owner: Mapped[str] = mapped_column(String, index=True)
+    provider: Mapped[str] = mapped_column(String)  # "stub" or "link_test"
+    provider_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    state: Mapped[str] = mapped_column(String, index=True)
+    amount_minor: Mapped[int] = mapped_column(Integer)  # the contract's hard cap, integer cents
+    currency: Mapped[str] = mapped_column(String)
+    merchant_name: Mapped[str] = mapped_column(String)
+    merchant_url: Mapped[str] = mapped_column(Text)
+    approval_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    card_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)  # encrypted card, or None once wiped
+    card_last4: Mapped[str | None] = mapped_column(String, nullable=True)
+    card_brand: Mapped[str | None] = mapped_column(String, nullable=True)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    released_purchase_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+def current_funding(session: Session, contract_id: str) -> ContractFundingRow | None:
+    """The newest funding attempt for a contract (a contract can be funded again after a card is used)."""
+    return session.scalar(
+        select(ContractFundingRow).where(ContractFundingRow.contract_id == contract_id).order_by(ContractFundingRow.created_at.desc()).limit(1)
+    )
+
+
+def claim_funding_state(session: Session, funding_id: str, from_states: tuple[str, ...], to_state: str) -> bool:
+    """Atomically move a funding row between states (the same conditional-UPDATE pattern). Caller commits."""
+    statement = (
+        update(ContractFundingRow)
+        .where(ContractFundingRow.id == funding_id)
+        .where(ContractFundingRow.state.in_(from_states))
+        .values(state=to_state, updated_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    )
+    if session.execute(statement).rowcount != 1:
+        return False
+    session.refresh(session.get(ContractFundingRow, funding_id))
+    return True
+
+
 class DeviceAuthorizationRow(Base):
     """
     One "connect this agent to my Handshake account" request (OAuth 2.0 device

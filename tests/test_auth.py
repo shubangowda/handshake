@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from handshake import auth, db, services
 from handshake.config import override_settings
-from conftest import STATIC_EXTRACTOR, api_draft_payload, proposal_payload
+from conftest import STATIC_EXTRACTOR, api_draft_payload, fund, proposal_payload, funded
 
 
 def sign(client: TestClient, **overrides: Any) -> str:
@@ -29,6 +29,7 @@ def sign(client: TestClient, **overrides: Any) -> str:
     assert client.post("/contracts", json=draft).status_code == 201
     response = client.post(f"/contracts/{draft['id']}/sign")
     assert response.status_code == 200, response.json()
+    fund(client, response.json()["id"])
     return response.json()["id"]
 
 
@@ -133,7 +134,7 @@ def test_agent_can_read_and_request(client: TestClient, agent_client: TestClient
 def test_wrong_agent_key_is_rejected(client: TestClient, agent_client: TestClient) -> None:
     """A contract signed for another agent can't be used by this one, and the refusal is recorded."""
     assert client.post("/contracts", json=api_draft_payload()).status_code == 201
-    contract_id = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes", "agent_key": "agent_other"}).json()["id"]
+    contract_id = funded(client, client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes", "agent_key": "agent_other"}).json()["id"])
 
     response = submit(agent_client, contract_id)
     assert response.status_code == 403

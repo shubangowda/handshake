@@ -21,7 +21,7 @@ from httpx import Response
 
 from handshake import db, services
 from handshake.config import get_settings
-from conftest import STATIC_EXTRACTOR, Mutator, api_draft_payload, proposal_payload
+from conftest import STATIC_EXTRACTOR, Mutator, api_draft_payload, fund, proposal_payload
 
 
 # ------------------------------------------------------------
@@ -35,6 +35,7 @@ def sign(client: TestClient, **draft_overrides: Any) -> str:
     assert client.post("/contracts", json=draft).status_code == 201
     response = client.post(f"/contracts/{draft['id']}/sign", json={"draft_id": draft["id"], "agent_key": "agent_1"})
     assert response.status_code == 200, response.json()
+    fund(client, response.json()["id"])  # sign = fund: approve the contract's card (simulated)
     return response.json()["id"]
 
 
@@ -121,14 +122,17 @@ def complete(purchase_id: str, charged_amount: float) -> ServiceResult:
 HAPPY_PATH_EVENTS = [
     "contract_created",
     "contract_signed",
+    # Sign = fund (contract-level): the card is requested, approved (simulated), and stored.
+    "contract_signed",  # data.kind funding_requested
+    "contract_signed",  # data.kind simulated_provider_approval
+    "credential_created",  # data.kind card_stored (encrypted, locked)
     "shopping_started",
     "proposal_created",
     "validation_started",
     "validation_completed",
     "purchase_authorized",
     "credential_created",
-    # Added by the payment flow (section 9): the Link TEST / simulated spend
-    # request, recorded as a purchase_authorized event with data.kind "payment_requested".
+    # The authorized checkout unlocks the stored card for the agent: data.kind "credential_ready".
     "purchase_authorized",
 ]
 
@@ -146,6 +150,7 @@ def test_full_happy_path_end_to_end(client: TestClient) -> None:
     signed = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes"})
     assert signed.status_code == 200
     contract_id = signed.json()["id"]
+    fund(client, contract_id)
 
     response = purchase(client, contract_id)
     assert response.status_code == 200, response.json()
@@ -260,7 +265,7 @@ def find_credential_leaks(value: Any, path: str = "$") -> list[str]:
             lowered = str(key).lower()
             tokens = set(re.split(r"[_\-\s.]+", lowered))
             squashed = re.sub(r"[_\-\s.]", "", lowered)
-            if path.endswith(".payment") and lowered == "provider_reference" and (inner is None or PROVIDER_REQUEST_ID.match(str(inner))):
+            if (path.endswith(".payment") or path.endswith(".funding") or path == "$") and lowered == "provider_reference" and (inner is None or PROVIDER_REQUEST_ID.match(str(inner))):
                 continue
             if tokens & FORBIDDEN_KEY_TOKENS or any(p in squashed for p in FORBIDDEN_KEY_PHRASES):
                 leaks.append(f"{path}.{key}")
@@ -281,6 +286,7 @@ def test_no_raw_credential_in_any_happy_path_response(client: TestClient) -> Non
     signed = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes"}).json()
     bodies["POST /contracts/{id}/sign"] = signed
     contract_id = signed["id"]
+    bodies["POST /contracts/{id}/funding/simulate-approval"] = fund(client, contract_id)
     bodies["GET /contracts"] = client.get("/contracts").json()
     bodies["GET /contracts/{id}"] = client.get(f"/contracts/{contract_id}").json()
 
@@ -632,7 +638,7 @@ def test_missing_selection_report_is_flagged_not_blocked(client: TestClient) -> 
     contract_id = sign(client)
     body = purchase(client, contract_id).json()
     assert body["status"] == "authorized"
-    started = client.get(f"/evidence/{body['purchase_id']}").json()["events"][2]
+    started = next(e for e in client.get(f"/evidence/{body['purchase_id']}").json()["events"] if e["event_type"] == "shopping_started")
     assert started["event_type"] == "shopping_started"
     assert started["data"]["selection_disclosure_missing"] is True
 
@@ -666,7 +672,8 @@ def test_evidence_chain_includes_objects_inline(client: TestClient) -> None:
     assert evidence["contract"]["id"] == contract_id
     assert evidence["proposal"]["id"] == "proposal_demo_pass"
     assert len(evidence["decision"]["results"]) == 14
-    assert len(evidence["events"][5]["data"]["results"]) == 14  # validation_completed carries every result
+    completed = next(e for e in evidence["events"] if e["event_type"] == "validation_completed")
+    assert len(completed["data"]["results"]) == 14  # validation_completed carries every result
     assert evidence["ledger_intact"] is True
     assert evidence["contract_verification"]["valid"] is True
 
@@ -792,9 +799,9 @@ def test_approve_escalated_purchase_issues_credential(client: TestClient) -> Non
     # Evidence: escalated, then the human approval, then the credential.
     evidence = client.get(f"/evidence/{purchase_id}").json()
     types = [e["event_type"] for e in evidence["events"]]
-    # ...then the payment request (section 9) is appended after the credential.
+    # ...then the authorized checkout unlocks the contract's stored card.
     assert types[-4:] == ["purchase_escalated", "purchase_authorized", "credential_created", "purchase_authorized"]
-    assert evidence["events"][-1]["data"]["kind"] == "payment_requested"
+    assert evidence["events"][-1]["data"]["kind"] == "credential_ready"  # the stored card is unlocked for this checkout
     approval = evidence["events"][-3]["data"]
     assert approval["human_approval"] is True
     assert approval["note"] == "I checked, no add-ons."

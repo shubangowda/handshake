@@ -18,7 +18,10 @@ import io
 import json
 import logging
 import re
+import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -40,7 +43,7 @@ from handshake.payments import (
     build_retrieve_command,
     parse_auth_status,
 )
-from conftest import AGENT_TOKEN, STATIC_EXTRACTOR, api_draft_payload, bearer, proposal_payload
+from conftest import AGENT_TOKEN, STATIC_EXTRACTOR, api_draft_payload, bearer, fund, funded, proposal_payload
 
 # A whole-token 13-19 digit number (\b: not a digit run inside a hex hash) that passes Luhn.
 CARD_LIKE = re.compile(r"\b\d{13,19}\b")
@@ -130,7 +133,7 @@ def test_setup_cli_can_no_longer_create_requests() -> None:
 def spec(**changes: Any) -> SpendSpec:
     """A valid spend request spec."""
     base = dict(
-        purchase_id="purchase_abc", amount_minor=12839, currency="USD", merchant_name="Amazon.com",
+        reference_id="funding_abc", amount_minor=13500, currency="USD", merchant_name="Amazon.com",
         merchant_url="http://localhost:3001", context="x" * 120,
         line_items=(("Pegasus 41", 11999, 1),),
     )
@@ -156,7 +159,7 @@ def test_every_create_command_is_test_mode_and_never_auto_approves(variant: dict
     flags = [arg for index, arg in enumerate(command) if arg.startswith("--") and (index == 0 or not command[index - 1].startswith("--"))]
     assert "--approve" not in flags
     assert "--request-approval" in command
-    assert command[command.index("--idempotency-key") + 1] == "handshake-purchase_abc"
+    assert command[command.index("--idempotency-key") + 1] == "handshake-funding_abc"
     assert command[command.index("--credential-type") + 1] == "card"
 
 
@@ -195,7 +198,7 @@ FAKE_CLI = r'''
 import json, os, sys, time
 log = os.environ["FAKE_LINK_LOG"]
 with open(log, "a") as handle:
-    handle.write(json.dumps(sys.argv[1:]) + "\n")
+    handle.write(json.dumps({"args": sys.argv[1:], "home": os.environ.get("HOME"), "npm_cache": os.environ.get("npm_config_cache")}) + "\n")
 behavior = os.environ.get("FAKE_LINK_BEHAVIOR", "ok")
 args = sys.argv[1:]
 if args[:2] == ["spend-request", "create"]:
@@ -215,7 +218,7 @@ if args[:2] == ["spend-request", "create"]:
         sys.stdout.write(open(os.environ["FAKE_LINK_REAL_CREATE"]).read())
 elif args[:2] == ["spend-request", "list"]:
     print(json.dumps({"data": [{"id": "lsrq_fake_1", "status": "pending_approval", "created_at": "x", "updated_at": "x",
-                                "metadata": {"handshake_purchase_id": "purchase_abc"}}]}))
+                                "metadata": {"handshake_reference_id": "funding_abc"}}]}))
 elif args[:2] == ["spend-request", "retrieve"]:
     status = os.environ.get("FAKE_LINK_STATUS", "approved")
     if "--output-file" in args:
@@ -229,6 +232,22 @@ elif args[:2] == ["spend-request", "retrieve"]:
         print(json.dumps({"id": args[2], "status": status, "card": {"last4": "1984"}, "card_output_file": path}))
     else:
         print(json.dumps({"id": args[2], "status": status, "created_at": "x", "updated_at": "x"}))
+elif args[:2] == ["auth", "login"]:
+    # Like the real CLI with --format jsonl: stream the link at once, then "approve" and save the login in HOME.
+    print(json.dumps({"type": "chunk", "data": {"verification_url": "https://app.link.com/device/SANITIZED", "phrase": "brave-test-phrase",
+                                                "instruction": "Present the verification_url"}}), flush=True)
+    time.sleep(0.3)
+    os.makedirs(os.environ["HOME"], exist_ok=True)
+    open(os.path.join(os.environ["HOME"], "linked"), "w").write("yes")
+    print(json.dumps({"type": "chunk", "data": {"authenticated": True, "credentials_path": "x"}}), flush=True)
+    print(json.dumps({"type": "done", "ok": True}), flush=True)
+elif args[:2] == ["auth", "status"]:
+    linked = os.path.exists(os.path.join(os.environ.get("HOME", "/nonexistent"), "linked"))
+    print(json.dumps([{"authenticated": linked, "access_token": "FAKE-TOK" if linked else None}]))
+elif args[:2] == ["auth", "logout"]:
+    path = os.path.join(os.environ["HOME"], "linked")
+    if os.path.exists(path): os.remove(path)
+    print(json.dumps({"authenticated": False}))
 elif args[:2] == ["spend-request", "cancel"]:
     print(json.dumps({"id": args[2], "status": "canceled"}))
 else:
@@ -244,13 +263,19 @@ def fake_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     log = tmp_path / "calls.jsonl"
     monkeypatch.setenv("FAKE_LINK_LOG", str(log))
     monkeypatch.setenv("FAKE_LINK_REAL_CREATE", str(REAL_CREATE_OUTPUT))
-    override_settings(link_cli=f"{sys.executable} {script}", link_timeout_seconds=2.0, link_tmp_dir=str(tmp_path / "private"))
+    override_settings(link_cli=f"{sys.executable} {script}", link_timeout_seconds=2.0, link_tmp_dir=str(tmp_path / "private"),
+                      link_home_root=str(tmp_path / "homes"))
     return log
+
+
+def invocations(log: Path) -> list[dict[str, Any]]:
+    """Every fake-CLI invocation: its args, HOME, and npm cache."""
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
 
 def calls(log: Path) -> list[list[str]]:
     """The argument lists the fake CLI was invoked with."""
-    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return [entry["args"] for entry in invocations(log)]
 
 
 def test_link_create_status_and_card_retrieval(fake_link: Path) -> None:
@@ -324,19 +349,85 @@ def test_sanitize_strips_card_numbers_and_secrets() -> None:
 
 
 # ============================================================
-# The state machine, through the API (stub provider)
+# Each user's own Link account (connected from the website)
 # ============================================================
 
 
-def signed_contract(client: TestClient, **overrides: Any) -> str:
-    """Sign the demo draft (the fixture contract with Mock Nike) and return its id."""
+def test_each_user_gets_a_private_link_home(fake_link: Path) -> None:
+    """Two users -> two different private HOMEs (0700), named by a hash that reveals no email."""
+    alice, bob = payments.user_link_home("alice@example.com"), payments.user_link_home("Bob@Example.com ")
+    assert alice != bob and "alice" not in alice
+    assert payments.user_link_home("bob@example.com") == bob  # normalized email -> same home
+    assert oct(os.stat(alice).st_mode & 0o777) == "0o700"
+
+
+def test_cli_runs_as_the_user_with_the_shared_npm_cache(fake_link: Path) -> None:
+    """Every Link call for a user sets HOME to that user's private dir (their own Link login)."""
+    provider = LinkTestProvider(home=payments.user_link_home("alice@example.com"))
+    asyncio.run(provider.create_request(spec()))
+    entry = invocations(fake_link)[-1]
+    assert entry["home"] == payments.user_link_home("alice@example.com")
+    assert entry["npm_cache"] == get_settings().link_npm_cache
+
+
+def test_website_login_streams_the_link_then_connects(fake_link: Path) -> None:
+    """start_link_login returns Link's login link and phrase right away; once approved, status says connected."""
+    override_settings(payment_mode="link_test")
+    email = "carol@example.com"
+    assert payments.link_connection(email)["connected"] is False
+    started = payments.start_link_login(email)
+    assert started["verification_url"] == "https://app.link.com/device/SANITIZED" and started["phrase"] == "brave-test-phrase"
+    for _ in range(50):
+        if payments.link_connection(email)["connected"]:
+            break
+        time.sleep(0.1)
+    status = payments.link_connection(email)
+    assert status["connected"] is True
+    assert "access_token" not in json.dumps(status) and "FAKE-TOK" not in json.dumps(status)
+    assert payments.link_connection("dave@example.com")["connected"] is False  # another user is NOT connected
+    payments.disconnect_link(email)
+    assert payments.link_connection(email)["connected"] is False
+
+
+def test_link_routes_are_user_only(client: TestClient, agent_client: TestClient) -> None:
+    """The agent can't connect, read, or disconnect the user's Link account."""
+    for method, path in (("post", "/link/connect"), ("get", "/link/status"), ("post", "/link/disconnect")):
+        assert getattr(agent_client, method)(path).status_code == 403
+    assert client.get("/link/status").json()["simulated"] is True  # stub mode
+
+
+def test_signing_requires_a_connected_link_account_in_link_test_mode(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sign = fund, so in link_test mode an unconnected user can't sign (and nothing is created)."""
+    override_settings(payment_mode="link_test")
+    monkeypatch.setattr(payments, "link_connection", lambda email: {"connected": False})
+    assert client.post("/contracts", json=api_draft_payload()).status_code == 201
+    response = client.post("/contracts/draft_demo_shoes/sign")
+    assert response.status_code == 409 and response.json()["error"] == "link_not_connected"
+    assert client.get("/contracts/draft_demo_shoes").json()["signed_contract_id"] is None
+
+
+# ============================================================
+# Sign = fund: the card is stored, encrypted, on the contract
+# ============================================================
+
+
+def sign_only(client: TestClient, **overrides: Any) -> str:
+    """Sign the fixture draft WITHOUT approving its funding."""
     draft = {**api_draft_payload(), **overrides}
     assert client.post("/contracts", json=draft).status_code == 201
     return client.post(f"/contracts/{draft['id']}/sign").json()["id"]
 
 
+def funding_row(contract_id: str) -> db.ContractFundingRow:
+    """The current funding row, fresh from the database."""
+    with db.SessionLocal() as session:
+        row = db.current_funding(session, contract_id)
+        session.expunge(row)
+        return row
+
+
 def authorized_purchase(client: TestClient, contract_id: str) -> dict[str, Any]:
-    """An AUTHORIZED purchase through the static extractor."""
+    """An AUTHORIZED purchase through the static extractor (the contract must be funded)."""
     STATIC_EXTRACTOR.set(proposal_payload(contract_id))
     body = client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout"}).json()
     assert body["status"] == "authorized", body
@@ -351,66 +442,140 @@ def payment_row(purchase_id: str) -> db.PaymentRow:
         return row
 
 
-def test_authorized_purchase_awaits_approval(client: TestClient) -> None:
-    """AUTHORIZED -> a simulated spend request exists, waiting for the user; the agent is told to wait."""
-    body = authorized_purchase(client, signed_contract(client))
-    assert body["payment_state"] == "awaiting_approval"
-    assert body["next_action"] == "wait_for_user_link_approval"
-    assert body["approval_url"].endswith(f"/purchases/{body['purchase_id']}")  # stub: the frontend's button
-    assert body["payment"]["provider_label"] == "Simulated provider"
-    # Polling while pending changes nothing (idempotent).
-    again = client.post(f"/purchases/{body['purchase_id']}/payment/refresh").json()
-    assert again["payment_state"] == "awaiting_approval"
+def test_signing_requests_a_card_for_the_hard_cap(client: TestClient) -> None:
+    """Signing asks for one single-use card for the contract's all-in cap, waiting for the user's approval."""
+    contract_id = sign_only(client)
+    funding = client.get(f"/contracts/{contract_id}/funding").json()
+    assert funding["state"] == "awaiting_approval" and funding["amount"] == 135.0 and funding["card_stored"] is False
+    assert funding["approval_url"].endswith(f"/contracts/{contract_id}")  # stub: the approve button is on the contract page
+    assert client.get(f"/contracts/{contract_id}").json()["funding"]["state"] == "awaiting_approval"
 
 
-def test_denied_approval_fails_purchase_and_frees_contract(client: TestClient) -> None:
-    """Denied in the provider -> payment denied, purchase failed, credential revoked, contract usable again."""
-    contract_id = signed_contract(client)
-    body = authorized_purchase(client, contract_id)
-    StubProvider.simulate(payment_row(body["purchase_id"]).provider_request_id, "denied")
-    after = client.get(f"/purchases/{body['purchase_id']}").json()
-    assert after["payment_state"] == "denied" and after["status"] == "failed"
-    assert after["credential"]["status"] == "revoked"
-    assert client.get(f"/contracts/{contract_id}").json()["status"] == "active"
+def test_unfunded_contract_refuses_purchases(client: TestClient) -> None:
+    """Nothing can be bought until the card is approved and stored; the refusal is recorded."""
+    contract_id = sign_only(client)
+    STATIC_EXTRACTOR.set(proposal_payload(contract_id))
+    response = client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout"})
+    assert response.status_code == 409 and response.json()["error"] == "contract_not_funded"
+    assert response.json()["details"]["funding_state"] == "awaiting_approval"
+    assert client.get(f"/purchases/{response.json()['details']['purchase_id']}").json()["status"] == "blocked"
 
 
-def test_expired_approval(client: TestClient) -> None:
-    """Expired in the provider -> payment expired, and the agent is told to request again."""
-    body = authorized_purchase(client, signed_contract(client))
-    StubProvider.simulate(payment_row(body["purchase_id"]).provider_request_id, "expired")
-    after = client.get(f"/purchases/{body['purchase_id']}").json()
-    assert after["payment_state"] == "expired" and after["next_action"] == "request_purchase_again"
+def test_approved_funding_stores_the_card_encrypted(client: TestClient) -> None:
+    """After approval the card is on the contract, encrypted; only last4 is readable, and it can't be moved to another contract."""
+    contract_id = sign_only(client)
+    funding = fund(client, contract_id)
+    assert funding["card_last4"] == "4242" and funding["valid_until"]
+    row = funding_row(contract_id)
+    assert row.card_ciphertext and payments.STUB_TEST_CARD not in row.card_ciphertext
+    card = payments.decrypt_card(row.card_ciphertext, contract_id, row.id)
+    assert card.number == payments.STUB_TEST_CARD and card.simulated
+    with pytest.raises(PaymentError):
+        payments.decrypt_card(row.card_ciphertext, "contract_other", row.id)  # bound to its contract
+    kinds = [e["data"].get("kind") for e in _contract_events(contract_id)]
+    assert kinds[-3:] == ["funding_requested", "simulated_provider_approval", "card_stored"]
 
 
-def test_no_card_before_approval(client: TestClient, agent_client: TestClient) -> None:
-    """The agent can't collect a card while the user hasn't approved."""
-    body = authorized_purchase(client, signed_contract(client))
-    response = agent_client.post(f"/purchases/{body['purchase_id']}/credential")
-    assert response.status_code == 409 and response.json()["error"] == "payment_not_ready"
+def _contract_events(contract_id: str) -> list[dict[str, Any]]:
+    """Stored evidence events for a contract."""
+    with db.SessionLocal() as session:
+        return [row.data for row in db.list_evidence_for_contract(session, contract_id)]
 
 
-def test_simulated_approval_is_user_only(client: TestClient, agent_client: TestClient) -> None:
-    """The agent can't approve its own payment, even the simulated one."""
-    body = authorized_purchase(client, signed_contract(client))
-    response = agent_client.post(f"/purchases/{body['purchase_id']}/payment/simulate-approval")
+def test_simulated_funding_approval_is_user_only(client: TestClient, agent_client: TestClient) -> None:
+    """The agent can't approve the payment for its own contract, even the simulated one."""
+    contract_id = sign_only(client)
+    response = agent_client.post(f"/contracts/{contract_id}/funding/simulate-approval")
     assert response.status_code == 403 and response.json()["error"] == "agent_not_permitted"
 
 
-def test_approval_then_revalidation_then_card_ready(client: TestClient, agent_client: TestClient) -> None:
-    """Simulated approval -> checkout re-read (unchanged) -> card ready for the agent, exactly once."""
-    body = authorized_purchase(client, signed_contract(client))
-    ready = client.post(f"/purchases/{body['purchase_id']}/payment/simulate-approval").json()
-    assert ready["payment_state"] == "credential_ready"
-    assert ready["next_action"] == "get_payment_credential_and_pay"
-    kinds = [e["data"].get("kind") for e in client.get(f"/evidence/{body['purchase_id']}").json()["events"]]
-    assert kinds[-4:] == ["simulated_provider_approval", "payment_approved", "checkout_revalidated", "credential_ready"]
+@pytest.mark.parametrize("outcome", ["denied", "expired"])
+def test_denied_or_expired_funding_can_be_retried(client: TestClient, outcome: str) -> None:
+    """A denied or expired funding leaves the contract unfunded; funding it again starts a fresh request."""
+    contract_id = sign_only(client)
+    first_id = funding_row(contract_id).id
+    StubProvider.simulate(funding_row(contract_id).provider_request_id, outcome)
+    assert client.get(f"/contracts/{contract_id}/funding").json()["state"] == outcome
+    retried = client.post(f"/contracts/{contract_id}/funding").json()
+    assert retried["state"] == "awaiting_approval" and retried["funding_id"] != first_id
+    assert fund(client, contract_id)["state"] == "funded"
 
+
+def test_card_validity_window_is_enforced(client: TestClient) -> None:
+    """A stored card past its validity (Link: 12 hours) expires, is wiped, and blocks purchases."""
+    contract_id = funded(client, sign_only(client))
+    with db.SessionLocal() as session:
+        row = db.current_funding(session, contract_id)
+        row.valid_until = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        session.commit()
+    assert client.get(f"/contracts/{contract_id}/funding").json()["state"] == "expired"
+    assert funding_row(contract_id).card_ciphertext is None
+    STATIC_EXTRACTOR.set(proposal_payload(contract_id))
+    assert client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout"}).json()["error"] == "contract_not_funded"
+
+
+def test_card_retrieval_failure_at_funding_is_retried(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If Link approves but the card can't be retrieved yet, funding stays pending (with the error) and succeeds on the next refresh."""
+    contract_id = sign_only(client)
+    original = StubProvider.retrieve_card
+
+    async def broken(self: Any, request_id: str) -> Any:
+        """The provider fails to hand over the card this time."""
+        raise PaymentError("card_missing", "no card yet")
+
+    monkeypatch.setattr(StubProvider, "retrieve_card", broken)
+    pending = client.post(f"/contracts/{contract_id}/funding/simulate-approval").json()
+    assert pending["state"] == "awaiting_approval" and "retrieval failed" in pending["last_error"]
+    monkeypatch.setattr(StubProvider, "retrieve_card", original)
+    assert client.get(f"/contracts/{contract_id}/funding").json()["state"] == "funded"
+
+
+def test_revoking_cancels_funding_and_wipes_the_card(client: TestClient) -> None:
+    """Revoke: the stored card is wiped and the provider request cancelled."""
+    contract_id = funded(client, sign_only(client))
+    request_id = funding_row(contract_id).provider_request_id
+    client.post(f"/contracts/{contract_id}/revoke")
+    row = funding_row(contract_id)
+    assert row.state == "canceled" and row.card_ciphertext is None
+    assert StubProvider._requests[request_id]["status"] == "canceled"
+
+
+# ============================================================
+# The card unlocks only for an AUTHORIZED checkout, once
+# ============================================================
+
+
+def test_authorized_checkout_unlocks_the_card(client: TestClient) -> None:
+    """AUTHORIZED -> the agent may now collect the stored card (credential_ready)."""
+    body = authorized_purchase(client, funded(client, sign_only(client)))
+    assert body["payment_state"] == "credential_ready" and body["next_action"] == "get_payment_credential_and_pay"
+    assert body["funding"]["card_stored"] is True
+
+
+def test_card_stays_locked_without_an_authorized_checkout(client: TestClient, agent_client: TestClient) -> None:
+    """Blocked or escalated purchases never unlock the card."""
+    contract_id = funded(client, sign_only(client))
+    checkout = proposal_payload(contract_id)
+    checkout.pop("addons_detected")  # escalates
+    STATIC_EXTRACTOR.set(checkout)
+    escalated = client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout"}).json()
+    assert escalated["status"] == "escalated"
+    response = agent_client.post(f"/purchases/{escalated['purchase_id']}/credential")
+    assert response.status_code == 409 and response.json()["error"] == "payment_not_ready"
+    assert funding_row(contract_id).card_ciphertext is not None  # still locked in the database
+
+
+def test_card_released_once_and_wiped(client: TestClient, agent_client: TestClient) -> None:
+    """The release decrypts the stored card, wipes it from the database, and never sends it twice."""
+    contract_id = funded(client, sign_only(client))
+    body = authorized_purchase(client, contract_id)
     first = agent_client.post(f"/purchases/{body['purchase_id']}/credential")
-    assert first.status_code == 200
-    assert first.headers["cache-control"].startswith("no-store")
+    assert first.status_code == 200 and first.headers["cache-control"].startswith("no-store")
     card = first.json()
     assert card["card_number"] == payments.STUB_TEST_CARD and card["simulated"] is True
     assert card["amount"] == 128.39 and card["pay_url"].endswith("/pay")
+    row = funding_row(contract_id)
+    assert row.state == "released" and row.card_ciphertext is None and row.released_purchase_id == body["purchase_id"]
 
     second = agent_client.post(f"/purchases/{body['purchase_id']}/credential")
     assert second.status_code == 409 and second.json()["error"] == "credential_already_released"
@@ -419,66 +584,44 @@ def test_approval_then_revalidation_then_card_ready(client: TestClient, agent_cl
 
 def test_user_cannot_collect_the_card(client: TestClient) -> None:
     """Only the agent collects the card (the user never needs it)."""
-    body = authorized_purchase(client, signed_contract(client))
-    client.post(f"/purchases/{body['purchase_id']}/payment/simulate-approval")
+    body = authorized_purchase(client, funded(client, sign_only(client)))
     assert client.post(f"/purchases/{body['purchase_id']}/credential").status_code == 403
 
 
 def test_foreign_agent_binding_cannot_collect(client: TestClient, agent_client: TestClient) -> None:
-    """A contract bound to a different agent: this agent can't collect its card (or even request against it)."""
+    """A contract bound to a different agent: this agent can't collect its card."""
     assert client.post("/contracts", json=api_draft_payload()).status_code == 201
-    contract_id = client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes", "agent_key": "agent_other"}).json()["id"]
+    contract_id = funded(client, client.post("/contracts/draft_demo_shoes/sign", json={"draft_id": "draft_demo_shoes", "agent_key": "agent_other"}).json()["id"])
     body = authorized_purchase(client, contract_id)  # the USER may still request it
-    client.post(f"/purchases/{body['purchase_id']}/payment/simulate-approval")
     response = agent_client.post(f"/purchases/{body['purchase_id']}/credential")
     assert response.status_code == 403 and response.json()["error"] == "agent_not_authorized"
 
 
-def test_card_retrieval_failure_allows_a_retry(client: TestClient, agent_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """If the provider can't hand over the card, nothing was released: the payment goes back to ready."""
-    body = authorized_purchase(client, signed_contract(client))
-    client.post(f"/purchases/{body['purchase_id']}/payment/simulate-approval")
-
-    async def broken(self: Any, request_id: str) -> Any:
-        """The provider fails to retrieve the card."""
-        raise PaymentError("card_missing", "no card")
-
-    monkeypatch.setattr(StubProvider, "retrieve_card", broken)
+def test_cart_changed_before_release_keeps_the_card_locked(client: TestClient, agent_client: TestClient) -> None:
+    """The checkout is read again at release; a price bump blocks the purchase and the card stays stored for another try."""
+    contract_id = funded(client, sign_only(client))
+    body = authorized_purchase(client, contract_id)
+    pricier = proposal_payload(contract_id)
+    pricier["fees"], pricier["total"] = 15.00, 143.39
+    STATIC_EXTRACTOR.set(pricier)
     response = agent_client.post(f"/purchases/{body['purchase_id']}/credential")
-    assert response.status_code == 502 and response.json()["error"] == "credential_retrieval_failed"
-    assert payment_row(body["purchase_id"]).state == "credential_ready"
-
-
-def test_cart_changed_after_authorization_is_blocked_at_revalidation(client: TestClient) -> None:
-    """The merchant raises the price after authorization: revalidation re-runs the engine and pays nothing."""
-    contract_id = signed_contract(client)
-    body = authorized_purchase(client, contract_id)
-
-    def pricier(p: dict[str, Any]) -> dict[str, Any]:
-        """The same checkout, now with a surprise fee that busts the cap."""
-        p["fees"] = 15.00
-        p["total"] = 143.39
-        return p
-
-    STATIC_EXTRACTOR.set(pricier(proposal_payload(contract_id)))
-    after = client.post(f"/purchases/{body['purchase_id']}/payment/simulate-approval").json()
-    assert after["payment_state"] == "checkout_changed"
-    assert after["status"] == "blocked"
-    assert after["next_action"] == "request_purchase_again"
+    assert response.status_code == 409 and response.json()["error"] == "checkout_changed"
+    after = client.get(f"/purchases/{body['purchase_id']}").json()
+    assert after["status"] == "blocked" and after["payment_state"] == "checkout_changed"
     event = client.get(f"/evidence/{body['purchase_id']}").json()["events"][-1]
-    assert event["data"]["kind"] == "checkout_changed"
     assert any("exceeds the signed all-in cap" in reason for reason in event["data"]["reasons"])
+    assert funding_row(contract_id).card_ciphertext is not None
+    assert client.get(f"/contracts/{contract_id}").json()["status"] == "active"
 
 
-def test_decline_before_payment(client: TestClient) -> None:
-    """'Not this one': the user declines an authorized purchase; the provider request is cancelled."""
-    contract_id = signed_contract(client)
+def test_decline_before_release_keeps_the_card(client: TestClient) -> None:
+    """'Not this one': the purchase is declined, the contract freed, and the card stays locked on it."""
+    contract_id = funded(client, sign_only(client))
     body = authorized_purchase(client, contract_id)
-    request_id = payment_row(body["purchase_id"]).provider_request_id
     declined = client.post(f"/purchases/{body['purchase_id']}/reject").json()
     assert declined["status"] == "blocked" and declined["payment_state"] == "denied"
     assert declined["resolution"]["action"] == "decline"
-    assert StubProvider._requests[request_id]["status"] == "canceled"
+    assert funding_row(contract_id).state == "funded"
     assert client.get(f"/contracts/{contract_id}").json()["status"] == "active"
 
 
@@ -488,31 +631,26 @@ def test_decline_before_payment(client: TestClient) -> None:
 
 
 def demo_contract(client: TestClient) -> str:
-    """Compile (offline fixture) and sign the section 12.1 demo contract."""
+    """Compile (offline fixture), sign, and fund the section 12.1 demo contract."""
     record = client.post("/drafts/compile", json={"intent": compiler.DEMO_INTENT}).json()
-    return client.post(f"/contracts/{record['id']}/sign").json()["id"]
+    return funded(client, client.post(f"/contracts/{record['id']}/sign").json()["id"])
 
 
 def test_agent_visible_run_completes_with_verified_receipt(
     client: TestClient, agent_client: TestClient, merchant_env: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    valid scenario, default agent_visible mode: authorize -> simulated approval ->
-    revalidate -> card released once -> the AGENT pays the merchant -> Handshake
-    finds and verifies the order -> completed, receipt stored, contract used.
-    Then sweep every DB row, response, and log line for card data.
+    valid scenario, default agent_visible mode: sign + fund -> the agent requests
+    -> AUTHORIZED -> the card is released once -> the AGENT pays -> Handshake
+    verifies the order -> completed. Then sweep every DB row, response, and log
+    for plaintext card data.
     """
     caplog.set_level(logging.DEBUG)
     contract_id = demo_contract(client)
     checkout = merchant_env.post("/api/checkout-sessions", json={"scenario": "valid"}).json()
     created = agent_client.post("/purchases", json={"contract_id": contract_id, "checkout_url": checkout["checkout_url"], "idempotency_key": "e2e-valid-0001"}).json()
-    assert created["status"] == "authorized", created["summary"]
-    link_results = [r for r in created["decision"]["results"] if r["constraint"].startswith("checkout_link")]
-    assert [r["verdict"] for r in link_results] == ["pass", "pass"]
+    assert created["status"] == "authorized" and created["next_action"] == "get_payment_credential_and_pay"
     purchase_id = created["purchase_id"]
-
-    ready = client.post(f"/purchases/{purchase_id}/payment/simulate-approval").json()
-    assert ready["payment_state"] == "credential_ready"
 
     release = agent_client.post(f"/purchases/{purchase_id}/credential").json()
     order = merchant_env.post(release["pay_url"].replace(get_settings().merchant_url, ""), json={
@@ -522,22 +660,21 @@ def test_agent_visible_run_completes_with_verified_receipt(
     assert order["last4"] == "4242"
 
     done = agent_client.get(f"/purchases/{purchase_id}").json()
-    assert done["status"] == "completed" and done["payment_state"] == "completed"
-    assert done["next_action"] == "completed"
+    assert done["status"] == "completed" and done["payment_state"] == "completed" and done["next_action"] == "completed"
     assert done["payment"]["receipt"]["order_id"] == order["order_id"]
-    assert done["payment"]["last4"] == "4242"
+    assert done["funding"]["state"] == "used"
     assert client.get(f"/contracts/{contract_id}").json()["status"] == "used"
     kinds = [e["data"].get("kind") for e in client.get(f"/evidence/{purchase_id}").json()["events"]]
-    for kind in ("payment_requested", "payment_approved", "checkout_revalidated", "credential_released", "payment_submitted", "receipt_verified"):
+    for kind in ("funding_requested", "card_stored", "credential_ready", "checkout_revalidated", "credential_released", "payment_submitted", "receipt_verified"):
         assert kind in kinds, kind
 
-    # --- The sweep: card data exists ONLY in the one-time release response ---
+    # --- The sweep: plaintext card data exists ONLY in the one-time release response ---
     blobs: list[str] = []
     with db.SessionLocal() as session:
-        for table in (db.DraftRow, db.ContractRow, db.ProposalRow, db.DecisionRow, db.PurchaseRow, db.CredentialRow, db.EvidenceRow, db.PaymentRow):
+        for table in (db.DraftRow, db.ContractRow, db.ProposalRow, db.DecisionRow, db.PurchaseRow, db.CredentialRow, db.EvidenceRow, db.PaymentRow, db.ContractFundingRow):
             for row in session.query(table).all():
                 blobs.append(json.dumps({c.name: getattr(row, c.name) for c in row.__table__.columns}, default=str))
-    blobs += [json.dumps(client.get(path).json()) for path in (f"/purchases/{purchase_id}", f"/evidence/{purchase_id}", "/purchases", f"/contracts/{contract_id}")]
+    blobs += [json.dumps(client.get(path).json()) for path in (f"/purchases/{purchase_id}", f"/evidence/{purchase_id}", "/purchases", f"/contracts/{contract_id}", f"/contracts/{contract_id}/funding")]
     blobs += [record.getMessage() for record in caplog.records]
     everything = "\n".join(blobs)
     assert payments.STUB_TEST_CARD not in everything
@@ -545,26 +682,24 @@ def test_agent_visible_run_completes_with_verified_receipt(
     assert '"cvc"' not in everything and "card_number" not in everything
 
 
-def test_executor_mode_completes_without_the_agent_seeing_a_card(test_db: Any, merchant_env: TestClient) -> None:
-    """HANDSHAKE_CREDENTIAL_MODE=executor: no /credential route; the backend pays and verifies by itself."""
+def test_executor_mode_pays_at_authorization(test_db: Any, merchant_env: TestClient) -> None:
+    """HANDSHAKE_CREDENTIAL_MODE=executor: no /credential route; the backend pays with the stored card and verifies, right away."""
     from conftest import user_headers
     from handshake.api import create_app
 
     override_settings(credential_mode="executor")
-    app = create_app()  # the real extractor (no override) -> the in-process merchant via the shared factory
+    app = create_app()
     with TestClient(app, headers=user_headers()) as user, TestClient(app, headers=bearer(AGENT_TOKEN)) as agent:
         contract_id = demo_contract(user)
         checkout = merchant_env.post("/api/checkout-sessions", json={"scenario": "valid"}).json()
         created = agent.post("/purchases", json={"contract_id": contract_id, "checkout_url": checkout["checkout_url"], "idempotency_key": "e2e-exec-0001"}).json()
-        assert created["status"] == "authorized"
+        assert created["status"] == "completed" and created["payment_state"] == "completed"
+        assert created["payment"]["receipt"]["amount_charged"] == 128.39
         assert agent.post(f"/purchases/{created['purchase_id']}/credential").status_code == 404  # route absent
-        done = user.post(f"/purchases/{created['purchase_id']}/payment/simulate-approval").json()
-        assert done["status"] == "completed" and done["payment_state"] == "completed"
-        assert done["payment"]["receipt"]["amount_charged"] == 128.39
 
 
 def test_uncertain_pay_outcome_is_never_retried_blindly(test_db: Any, merchant_env: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Executor mode: the pay call times out. Handshake asks the merchant; with no order, it fails, and it never pays twice."""
+    """Executor mode: the pay call times out. Handshake asks the merchant; with no order it fails, and it never pays twice."""
     from conftest import user_headers
     from handshake.api import create_app
 
@@ -582,9 +717,9 @@ def test_uncertain_pay_outcome_is_never_retried_blindly(test_db: Any, merchant_e
         contract_id = demo_contract(user)
         checkout = merchant_env.post("/api/checkout-sessions", json={"scenario": "valid"}).json()
         created = agent.post("/purchases", json={"contract_id": contract_id, "checkout_url": checkout["checkout_url"], "idempotency_key": "e2e-flaky-0001"}).json()
-        after = user.post(f"/purchases/{created['purchase_id']}/payment/simulate-approval").json()
-        # The same refresh loop immediately checked the merchant, found no order, and stopped.
-        assert after["payment_state"] == "failed"
+        assert created["payment_state"] == "unknown"
+        after = user.post(f"/purchases/{created['purchase_id']}/payment/refresh").json()
+        assert after["payment_state"] == "failed"  # the merchant has no order, so it didn't happen
         for _ in range(3):
             user.post(f"/purchases/{created['purchase_id']}/payment/refresh")
         assert len(attempts) == 1

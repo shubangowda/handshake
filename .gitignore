@@ -11,6 +11,7 @@
 # Link CLI temp card files, sessions, and any private key material
 .link-tmp/
 **/.link-tmp/
+.handshake-state/
 *.pem
 *.key
 link-card*.json

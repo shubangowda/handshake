@@ -10,10 +10,11 @@ For each scenario, with a FRESH contract (contracts are single use):
     1. log in as the user (demo auth) and seed + sign the section 12.1 demo contract
     2. create a checkout session at the mock merchant
     3. request the purchase AS THE AGENT, with an idempotency key
-    4. for valid: approve the payment (stub: "Simulated provider approval";
-       link_test: print the Link approval URL and wait), then either collect the
-       card once and pay the merchant's pay API as the agent (agent_visible), or
-       let the backend pay (executor), and poll until completed
+    (sign = fund: approve the contract's single-use card; stub: "Simulated
+       provider approval"; link_test: the Link approval URL is printed and we wait)
+    4. for valid: either collect the stored card once and pay the merchant's
+       pay API as the agent (agent_visible), or let the backend pay (executor),
+       and poll until completed
 It prints a table (scenario, expected, actual, main reason, purchase page) and
 exits nonzero on any mismatch. URLs come from config.py, never from literals.
 
@@ -67,14 +68,35 @@ class Demo:
             raise SystemExit(f"The agent token acts for {me.get('email')!r}; run with --email {me.get('email')}.")
         self.agent = {"Authorization": f"Bearer {settings.agent_token}"}
 
-    def sign_demo_contract(self) -> str:
-        """Seed the exact section 12.1 contract (same builder as the fixture compiler) and sign it as the user."""
+    def sign_demo_contract(self, payment_mode: str) -> str:
+        """
+        Seed the exact section 12.1 contract (same builder as the fixture compiler), sign it as the user,
+        and FUND it: signing requests the contract's single-use card, which the user approves
+        (stub: "Simulated provider approval"; link_test: in the Link app, and we wait).
+        """
         draft = compiler.demo_contract_draft()
         created = self.api.post("/contracts", json=draft.model_dump(mode="json"), headers=self.user)
         created.raise_for_status()
         signed = self.api.post(f"/contracts/{draft.id}/sign", headers=self.user)
+        if signed.status_code == 409 and signed.json().get("error") == "link_not_connected":
+            raise SystemExit("Connect your Stripe Link account first (frontend: Connect Stripe Link, or `python -m handshake.payments login --email <you>`).")
         signed.raise_for_status()
-        return signed.json()["id"]
+        contract_id = signed.json()["id"]
+        if payment_mode == "stub":
+            self.api.post(f"/contracts/{contract_id}/funding/simulate-approval", headers=self.user).raise_for_status()
+        else:
+            funding = self.api.get(f"/contracts/{contract_id}/funding", headers=self.user).json()
+            print(f"    APPROVE NOW in Link (TEST MODE), {funding.get('amount')} {funding.get('currency')} to fund the contract: {funding.get('approval_url')}", flush=True)
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                funding = self.api.get(f"/contracts/{contract_id}/funding", headers=self.user).json()
+                if funding["state"] != "awaiting_approval":
+                    break
+                time.sleep(2)
+            if funding["state"] != "funded":
+                raise SystemExit(f"Funding ended as {funding['state']}: {funding.get('last_error') or ''}")
+            print(f"    Funded: card ending {funding.get('card_last4')} stored (encrypted) on the contract.", flush=True)
+        return contract_id
 
     def purchase(self, contract_id: str, scenario: str) -> dict[str, Any]:
         """Open a checkout for the scenario and request it as the agent."""
@@ -93,13 +115,9 @@ class Demo:
         return response.json()
 
     def complete_valid(self, detail: dict[str, Any], credential_mode: str, payment_mode: str) -> dict[str, Any]:
-        """Take an AUTHORIZED purchase all the way to completed."""
+        """Take an AUTHORIZED purchase all the way to completed (the card was funded at signing)."""
         purchase_id = detail["purchase_id"]
-        if payment_mode == "stub":
-            self.api.post(f"/purchases/{purchase_id}/payment/simulate-approval", headers=self.user).raise_for_status()
-        else:
-            print(f"    Approve the payment in Link (TEST MODE): {detail.get('approval_url')}")
-        deadline = time.time() + (600 if payment_mode == "link_test" else 30)
+        deadline = time.time() + 60
         while time.time() < deadline:
             detail = self.status(purchase_id, self.agent)
             if detail["next_action"] == "get_payment_credential_and_pay" and credential_mode == "agent_visible":
@@ -158,8 +176,8 @@ def main() -> int:
     rows: list[tuple[str, str, str, str, str]] = []
     mismatches = 0
     for scenario in ([args.scenario] if args.scenario else list(EXPECTED)):
-        detail = demo.purchase(demo.sign_demo_contract(), scenario)
-        if scenario == "valid" and detail["status"] == "authorized":
+        detail = demo.purchase(demo.sign_demo_contract(health["payment_mode"]), scenario)
+        if scenario == "valid" and detail["status"] in ("authorized", "completed"):
             detail = demo.complete_valid(detail, health["credential_mode"], health["payment_mode"])
         actual = detail["status"]
         if actual != EXPECTED[scenario]:

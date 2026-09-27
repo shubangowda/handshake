@@ -367,6 +367,7 @@ def build_server(settings: Settings | None = None, backend: HandshakeBackend | N
                 "status": data.get("status"),
                 "summary": contract_summary(body) if isinstance(body, dict) else None,
                 "verification": data.get("verification"),
+                "funding": data.get("funding"),  # state + last4 only; the card itself stays locked
                 "signed_contract_id": data.get("signed_contract_id"),
                 "contract": body,
             }

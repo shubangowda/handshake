@@ -31,7 +31,7 @@ from handshake.extractor import (
 )
 from handshake.intent_diff import explicit_fields
 from handshake.models import TransactionProposal
-from conftest import STATIC_EXTRACTOR, api_draft_payload, proposal_payload
+from conftest import STATIC_EXTRACTOR, api_draft_payload, proposal_payload, funded
 
 
 # ------------------------------------------------------------
@@ -325,7 +325,10 @@ def test_dev_scenario_change_changes_the_snapshot(merchant_app: Any, merchant_cl
 def test_dev_route_is_hidden_in_prod(merchant_client: TestClient) -> None:
     """Outside dev, the cart can't be changed through the dev route."""
     session = new_session(merchant_client)
-    override_settings(env="prod", signing_secret="prod-sign", session_secret="prod-session", agent_token="t", cors_origins=("https://app.example",))
+    import base64
+
+    override_settings(env="prod", signing_secret="prod-sign", session_secret="prod-session", agent_token="t", cors_origins=("https://app.example",),
+                      card_encryption_key=base64.b64encode(b"p" * 32).decode())
     assert merchant_client.post(f"/api/dev/checkout/{session['session_id']}/scenario", json={"scenario": "price_bump"}).status_code == 404
 
 
@@ -343,7 +346,7 @@ def sign(client: TestClient) -> str:
     """Create and sign the demo draft; return the contract id."""
     draft = api_draft_payload()
     assert client.post("/contracts", json=draft).status_code == 201
-    return client.post(f"/contracts/{draft['id']}/sign").json()["id"]
+    return funded(client, client.post(f"/contracts/{draft['id']}/sign").json()["id"])
 
 
 def test_disallowed_checkout_url_is_422_with_evidence(api_app: Any, client: TestClient) -> None:
@@ -515,7 +518,7 @@ def test_link_mismatch_blocks_a_purchase_end_to_end(client: TestClient, agent_cl
     from handshake import compiler as compiler_module
 
     record = client.post("/drafts/compile", json={"intent": compiler_module.DEMO_INTENT}).json()
-    contract_id = client.post(f"/contracts/{record['id']}/sign").json()["id"]
+    contract_id = funded(client, client.post(f"/contracts/{record['id']}/sign").json()["id"])
     checkout = merchant_env.post("/api/checkout-sessions", json={"scenario": "valid"}).json()
     report = selection(contract_id, name="Air Max 90", url=checkout["checkout_url"]).model_dump(mode="json")
     body = agent_client.post("/purchases", json={

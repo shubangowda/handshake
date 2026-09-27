@@ -25,7 +25,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from handshake import compiler, payments
 from handshake.config import get_settings, override_settings
 from handshake.mcp_server import HandshakeBackend, build_server
-from conftest import STATIC_EXTRACTOR, proposal_payload
+from conftest import STATIC_EXTRACTOR, proposal_payload, funded
 
 CARD_FIELDS = ("card_number", "cvc", "exp_month", "exp_year")
 
@@ -60,7 +60,7 @@ def run_with_session(api_app: Any, tmp_path: Path, scenario: Any) -> Any:
 def signed_demo_contract(client: TestClient) -> str:
     """The user compiles (offline fixture) and signs the demo contract."""
     record = client.post("/drafts/compile", json={"intent": compiler.DEMO_INTENT}).json()
-    return client.post(f"/contracts/{record['id']}/sign").json()["id"]
+    return funded(client, client.post(f"/contracts/{record['id']}/sign").json()["id"])
 
 
 def assert_no_card_data(value: Any) -> None:
@@ -123,12 +123,12 @@ def test_draft_then_purchase_through_mcp(api_app: Any, client: TestClient, tmp_p
         assert draft["status"] == "draft" and draft["review_url"].endswith(f"/contracts/{draft['draft_id']}")
         assert "Pegasus 41" in draft["summary"] and "$135.00" in draft["summary"]
 
-        contract_id = client.post(f"/contracts/{draft['draft_id']}/sign").json()["id"]  # the USER signs
+        contract_id = funded(client, client.post(f"/contracts/{draft['draft_id']}/sign").json()["id"])  # the USER signs
         STATIC_EXTRACTOR.set(_demo_checkout(contract_id))
         purchase = await call(session, "request_purchase", {"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout", "idempotency_key": "mcp-attempt-0001"})
-        assert purchase["status"] == "authorized" and purchase["next_action"] == "wait_for_user_link_approval"
+        assert purchase["status"] == "authorized" and purchase["next_action"] == "get_payment_credential_and_pay"
         status = await call(session, "get_purchase_status", {"purchase_id": purchase["purchase_id"]})
-        assert status["payment_state"] == "awaiting_approval"
+        assert status["payment_state"] == "credential_ready"
         listing = await call(session, "list_contracts", {"status": "used"})
         assert [c["id"] for c in listing["contracts"]] == [contract_id]
         active = await call(session, "list_active_contracts")
@@ -172,38 +172,40 @@ def test_blocked_purchase_reports_reasons(api_app: Any, client: TestClient, tmp_
 
 
 def test_credential_tool_rules(api_app: Any, client: TestClient, tmp_path: Path) -> None:
-    """get_payment_credential: refused before approval, delivered once after, refused the second time."""
-    contract_id = signed_demo_contract(client)
-    STATIC_EXTRACTOR.set(_demo_checkout(contract_id))
+    """get_payment_credential: refused while the checkout isn't authorized (escalated), delivered once when it is, refused the second time."""
+    contract_id = signed_demo_contract(client)  # signed AND funded (the card is stored, locked)
+    escalating = _demo_checkout(contract_id)
+    escalating.pop("addons_detected")
+    STATIC_EXTRACTOR.set(escalating)
 
     async def scenario(session: Any, backend: Any) -> None:
-        """Request, try early, approve (as the user), collect, collect again."""
-        purchase = await call(session, "request_purchase", {"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout", "idempotency_key": "mcp-card-0001"})
-        early = await call(session, "get_payment_credential", {"purchase_id": purchase["purchase_id"]})
+        """Try on an escalated purchase, then on an authorized one, twice."""
+        escalated = await call(session, "request_purchase", {"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout", "idempotency_key": "mcp-card-esc1"})
+        assert escalated["status"] == "escalated"
+        early = await call(session, "get_payment_credential", {"purchase_id": escalated["purchase_id"]})
         assert early["error"] == "payment_not_ready"
         assert_no_card_data(early)
 
-        client.post(f"/purchases/{purchase['purchase_id']}/payment/simulate-approval")  # the USER approves
-        status = await call(session, "get_purchase_status", {"purchase_id": purchase["purchase_id"]})
+        client.post(f"/purchases/{escalated['purchase_id']}/approve")  # the USER accepts the exception
+        status = await call(session, "get_purchase_status", {"purchase_id": escalated["purchase_id"]})
         assert status["next_action"] == "get_payment_credential_and_pay"
         assert_no_card_data(status)
 
-        card = await call(session, "get_payment_credential", {"purchase_id": purchase["purchase_id"]})
-        assert card["card_number"] == payments.STUB_TEST_CARD and card["purchase_id"] == purchase["purchase_id"]
-        again = await call(session, "get_payment_credential", {"purchase_id": purchase["purchase_id"]})
+        STATIC_EXTRACTOR.set(escalating)  # the checkout is re-read at release; unchanged
+        card = await call(session, "get_payment_credential", {"purchase_id": escalated["purchase_id"]})
+        assert card["card_number"] == payments.STUB_TEST_CARD and card["purchase_id"] == escalated["purchase_id"]
+        again = await call(session, "get_payment_credential", {"purchase_id": escalated["purchase_id"]})
         assert again["error"] == "credential_already_released"
         assert_no_card_data(again)
 
     run_with_session(api_app, tmp_path, scenario)
 
-
 def test_credential_tool_refuses_a_foreign_purchase(api_app: Any, stranger_client: TestClient, tmp_path: Path) -> None:
     """Another user's purchase is invisible to this agent (404), card or not."""
     record = stranger_client.post("/drafts/compile", json={"intent": compiler.DEMO_INTENT}).json()
-    contract_id = stranger_client.post(f"/contracts/{record['id']}/sign").json()["id"]
+    contract_id = funded(stranger_client, stranger_client.post(f"/contracts/{record['id']}/sign").json()["id"])
     STATIC_EXTRACTOR.set(_demo_checkout(contract_id))
     purchase_id = stranger_client.post("/purchases", json={"contract_id": contract_id, "checkout_url": "https://mocknike.example/checkout"}).json()["purchase_id"]
-    stranger_client.post(f"/purchases/{purchase_id}/payment/simulate-approval")
 
     async def scenario(session: Any, backend: Any) -> None:
         """Try to take the stranger's card."""
