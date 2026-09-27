@@ -52,10 +52,18 @@ DEV_CARD_KEY = "aGFuZHNoYWtlLWRldi1jYXJkLWtleS0zMmJ5dGVzISE="
 
 # The only payment modes that exist. There is deliberately no "live" value:
 # this codebase never requests a real card (see payments.py).
-PAYMENT_MODES = ("stub", "link_test")
+# link_optional: simulated funding for everyone, EXCEPT users who connected their own
+# Stripe Link account, whose contracts are funded with real Link TEST-mode cards.
+# It is how the public server works: anyone can try it, nobody needs Link.
+PAYMENT_MODES = ("stub", "link_test", "link_optional")
 CREDENTIAL_MODES = ("agent_visible", "executor")
 COMPILER_MODES = ("openai", "fixture")
 ENVIRONMENTS = ("dev", "prod")
+
+# Loopback hosts. OAuth lets native-app clients redirect to these over plain
+# http (RFC 8252); the hosted MCP server also answers health checks on them.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+LOOPBACK_HOST_PATTERNS = ("localhost:*", "127.0.0.1:*")
 
 
 class ConfigError(ValueError):
@@ -86,11 +94,24 @@ class Settings:
     agent_token: str | None = None  # static bearer token for the shopping agent
     agent_owner: str = "demo@handshake.dev"  # which user the agent acts for
     agent_id: str = "agent_demo"  # the agent's identity; contracts bind to it
-    mcp_http_token: str | None = None  # bearer token for MCP over HTTP
+    mcp_http_token: str | None = None  # legacy: a static bearer token for MCP over HTTP (single user, local only)
+    # The MCP server's public URL (e.g. https://handshake-mcp.example). Set it when
+    # MCP runs over HTTP for many users: each request then carries that user's
+    # OAuth access token, which the MCP server checks with the backend.
+    mcp_public_url: str | None = None
     mcp_http_host: str = "127.0.0.1"  # where `handshake-mcp --transport http` listens
     mcp_http_port: int = 8765
     agent_token_ttl_days: int = 7  # lifetime of an agent token issued through the device (OAuth) flow
     device_code_ttl_minutes: int = 10  # how long the user has to approve a "connect agent" request
+    oauth_request_ttl_minutes: int = 10  # authorization-code flow: time to log in and approve
+    oauth_code_ttl_seconds: int = 120  # an authorization code must be exchanged quickly (single use)
+    refresh_token_ttl_days: int = 30  # OAuth refresh tokens rotate on every use
+    agent_key_ttl_days: int = 90  # agent keys a user creates on the Agents page
+    # Sign in with Google: the OAuth client id from Google Cloud Console (public, not a secret).
+    google_client_id: str | None = None
+    # Demo login ("type any email") is on in dev and OFF in prod unless explicitly allowed,
+    # because on a public server it lets anyone act as anyone.
+    allow_demo_login: bool | None = None
     # Where the MCP server caches the agent token it got from the device flow (0600 file).
     mcp_token_file: str = str(Path.home() / ".handshake" / "mcp-agent-token.json")
 
@@ -158,10 +179,19 @@ class Settings:
         return self.compiler == "fixture" or not self.openai_api_key
 
     @property
+    def demo_login_enabled(self) -> bool:
+        """Demo login: explicit setting wins; otherwise on in dev, off in prod."""
+        if self.allow_demo_login is not None:
+            return self.allow_demo_login
+        return self.env != "prod"
+
+    @property
     def payment_label(self) -> str:
         """What every surface (health, header, MCP) shows about the payment rail."""
         if self.payment_mode == "link_test":
             return "Stripe Link: TEST MODE"
+        if self.payment_mode == "link_optional":
+            return "Simulated provider, or your Stripe Link (TEST MODE)"
         return "Simulated provider"
 
 
@@ -232,6 +262,18 @@ def _optional(env: Mapping[str, str], name: str) -> str | None:
     return value or None
 
 
+def _flag(env: Mapping[str, str], name: str) -> bool | None:
+    """A true/false setting; unset (or empty) means None ("use the default")."""
+    value = env.get(name, "").strip().lower()
+    if not value:
+        return None
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name}={env[name]!r} must be true or false.")
+
+
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     """Build and validate Settings from an environment mapping (os.environ by default)."""
     if env is None:
@@ -257,6 +299,13 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         agent_owner=(_optional(env, "HANDSHAKE_AGENT_OWNER") or Settings.agent_owner).lower(),
         agent_id=_optional(env, "HANDSHAKE_AGENT_ID") or Settings.agent_id,
         mcp_http_token=_optional(env, "HANDSHAKE_MCP_HTTP_TOKEN"),
+        mcp_public_url=(_optional(env, "HANDSHAKE_MCP_PUBLIC_URL") or "").rstrip("/") or None,
+        oauth_request_ttl_minutes=_number(env, "HANDSHAKE_OAUTH_REQUEST_TTL_MINUTES", Settings.oauth_request_ttl_minutes, int),
+        oauth_code_ttl_seconds=_number(env, "HANDSHAKE_OAUTH_CODE_TTL_SECONDS", Settings.oauth_code_ttl_seconds, int),
+        refresh_token_ttl_days=_number(env, "HANDSHAKE_REFRESH_TOKEN_TTL_DAYS", Settings.refresh_token_ttl_days, int),
+        agent_key_ttl_days=_number(env, "HANDSHAKE_AGENT_KEY_TTL_DAYS", Settings.agent_key_ttl_days, int),
+        google_client_id=_optional(env, "HANDSHAKE_GOOGLE_CLIENT_ID"),
+        allow_demo_login=_flag(env, "HANDSHAKE_ALLOW_DEMO_LOGIN"),
         mcp_http_host=_optional(env, "HANDSHAKE_MCP_HTTP_HOST") or Settings.mcp_http_host,
         mcp_http_port=_number(env, "HANDSHAKE_MCP_HTTP_PORT", Settings.mcp_http_port, int),
         agent_token_ttl_days=_number(env, "HANDSHAKE_AGENT_TOKEN_TTL_DAYS", Settings.agent_token_ttl_days, int),
@@ -326,8 +375,12 @@ def validate(settings: Settings) -> None:
             problems.append("HANDSHAKE_SESSION_SECRET is the public dev default")
         if settings.card_encryption_key == DEV_CARD_KEY:
             problems.append("HANDSHAKE_CARD_ENCRYPTION_KEY is the public dev default")
-        if not settings.agent_token:
-            problems.append("HANDSHAKE_AGENT_TOKEN is not set")
+        # A static agent token acts for one fixed user: fine on a laptop, but on a
+        # public server every agent must connect through a user's own login (OAuth).
+        if settings.agent_token:
+            problems.append("HANDSHAKE_AGENT_TOKEN is set (agents must connect per user through OAuth in prod)")
+        if not settings.google_client_id and not settings.demo_login_enabled:
+            problems.append("no way to log in: set HANDSHAKE_GOOGLE_CLIENT_ID (or HANDSHAKE_ALLOW_DEMO_LOGIN=true for a private demo)")
         if "*" in settings.effective_cors_origins:
             problems.append("HANDSHAKE_CORS_ORIGINS contains a wildcard")
         if problems:

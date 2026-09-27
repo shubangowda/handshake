@@ -22,6 +22,7 @@ dependencies = [
     "python-dotenv==1.2.3",
     # AES-256-GCM encryption of the funded one-time card stored on a contract.
     "cryptography==50.0.1",
+    "PyJWT==2.15.0",  # verifies Google sign-in ID tokens (RS256)
     # Contract compiler (drafts only; never decides authorization).
     "openai==3.19.2",
     # MCP server. Pinned below 2.0 on purpose: mcp 2.x renamed FastMCP, and we

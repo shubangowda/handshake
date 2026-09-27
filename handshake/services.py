@@ -366,9 +366,17 @@ def create_draft(session: Session, body: dict[str, Any], owner: str) -> dict[str
     return _store_draft(session, output, owner, source="posted")
 
 
-def store_compiled_draft(session: Session, result: "compiler.CompileResult", owner: str) -> dict[str, Any]:
-    """Persist a successful compile (the compiler already set the id and created_at server-side)."""
-    return _store_draft(session, result.output, owner, source=result.source)
+def store_compiled_draft(
+    session: Session, result: "compiler.CompileResult", owner: str, proposed_by: Principal | None = None
+) -> dict[str, Any]:
+    """
+    Persist a successful compile (the compiler already set the id and created_at server-side).
+
+    When an agent compiled it, remember which one: signing binds the contract to
+    THAT agent, so a contract Muse proposed is usable by Muse (and nobody else).
+    """
+    agent_id = proposed_by.agent_id if proposed_by is not None and proposed_by.is_agent else None
+    return _store_draft(session, result.output, owner, source=result.source, proposed_by_agent=agent_id)
 
 
 def _store_draft(
@@ -377,6 +385,7 @@ def _store_draft(
     owner: str,
     source: str,
     previous_contract_id: str | None = None,
+    proposed_by_agent: str | None = None,
 ) -> dict[str, Any]:
     """
     Lint, persist, and log a draft. Every path that creates a draft goes through here.
@@ -395,6 +404,8 @@ def _store_draft(
         },
         report,
     )
+    if proposed_by_agent:
+        meta["proposed_by_agent"] = proposed_by_agent
     db.save_draft(session, draft, meta, owner=owner, previous_contract_id=previous_contract_id)
 
     # Draft events are keyed by the draft id (there is no contract id yet).
@@ -451,6 +462,7 @@ def draft_record(row: db.DraftRow) -> dict[str, Any]:
         "signed_contract_id": row.signed_contract_id,
         "review_url": review_url_for(row.id),
         "blocking_issues": blocking_issues(row.meta),
+        "proposed_by_agent": row.meta.get("proposed_by_agent"),
     }
 
 
@@ -603,7 +615,8 @@ def sign_draft(
 
     Only the user who owns the draft may sign it (api.py refuses agents before
     this is called). The contract is bound to one agent via agent_key: if the
-    caller names none, it binds to the configured HANDSHAKE_AGENT_ID, so a
+    caller names none, it binds to the agent that proposed the draft (Muse,
+    Claude, an agent key), else to the configured HANDSHAKE_AGENT_ID. A
     contract is never usable by "any agent".
     """
     row = db.get_draft_row(session, draft_id)
@@ -612,7 +625,7 @@ def sign_draft(
         raise ServiceError(404, "draft_not_found", missing)
     _check_owner(row.owner, owner, "draft_not_found", missing)
     if not agent_key:
-        agent_key = get_settings().agent_id
+        agent_key = row.meta.get("proposed_by_agent") or get_settings().agent_id
     # Signing FUNDS the contract from the user's own Link account, so in
     # link_test mode that account must be connected first.
     if row.signed_contract_id is None:
@@ -2094,7 +2107,7 @@ def start_payment(session: Session, purchase: Purchase, contract: Contract, prop
     now = clock()
     row = db.PaymentRow(
         id=generate_id("payment"), purchase_id=purchase.id,
-        provider=funding.provider if funding else get_settings().payment_mode,
+        provider=funding.provider if funding else ("link_test" if get_settings().payment_mode == "link_test" else "stub"),
         provider_request_id=funding.provider_request_id if funding else None,
         state=payments.CREDENTIAL_READY, amount_minor=amount_minor, pay_amount_minor=amount_minor,
         currency=proposal.currency.upper(), checkout_url=proposal.source_url, created_at=now, updated_at=now,

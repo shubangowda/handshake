@@ -327,7 +327,7 @@ def test_dev_route_is_hidden_in_prod(merchant_client: TestClient) -> None:
     session = new_session(merchant_client)
     import base64
 
-    override_settings(env="prod", signing_secret="prod-sign", session_secret="prod-session", agent_token="t", cors_origins=("https://app.example",),
+    override_settings(env="prod", signing_secret="prod-sign", session_secret="prod-session", agent_token=None, google_client_id="test.apps.googleusercontent.com", cors_origins=("https://app.example",),
                       card_encryption_key=base64.b64encode(b"p" * 32).decode())
     assert merchant_client.post(f"/api/dev/checkout/{session['session_id']}/scenario", json={"scenario": "price_bump"}).status_code == 404
 

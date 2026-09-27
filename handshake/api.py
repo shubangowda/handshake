@@ -130,14 +130,6 @@ class DeviceAuthorizationRequest(BaseModel):
     client_name: str | None = None
 
 
-class TokenRequest(BaseModel):
-    """Body for POST /oauth/token (device code grant)."""
-
-    grant_type: str
-    device_code: str
-    client_id: str
-
-
 class DeviceDecision(BaseModel):
     """Body for approving or denying a connect request."""
 
@@ -151,6 +143,25 @@ class DemoLoginRequest(BaseModel):
     """Body for POST /auth/demo-login. DEMO ONLY: anyone who types an email gets a token."""
 
     email: str
+
+
+class GoogleLoginRequest(BaseModel):
+    """Body for POST /auth/google: the ID token Google Identity Services gave the frontend."""
+
+    credential: str = Field(min_length=20, max_length=8192)
+
+
+class AuthorizationDecision(BaseModel):
+    """Body for POST /oauth/authorize/decision (the consent page)."""
+
+    request_id: str
+    approve: bool
+
+
+class AgentKeyRequest(BaseModel):
+    """Body for POST /agents/keys."""
+
+    name: str
 
 
 class ContractListItem(BaseModel):
@@ -245,22 +256,36 @@ router = APIRouter()
 # ============================================================
 
 
+def _login_response(email: str, demo: bool) -> dict[str, Any]:
+    """The user token every login method returns (same shape, so the frontend treats them alike)."""
+    token, expires_at = auth.issue_user_token(email)
+    return {"token": token, "token_type": "bearer", "email": auth.normalize_email(email), "role": auth.USER, "expires_at": expires_at, "demo_auth": demo}
+
+
+@router.get("/auth/config")
+def auth_config() -> dict[str, Any]:
+    """Which sign-in methods this server offers (public: the login page needs it before anyone is logged in)."""
+    settings = get_settings()
+    return {"google_client_id": settings.google_client_id, "demo_login": settings.demo_login_enabled}
+
+
+@router.post("/auth/google")
+def google_login(body: GoogleLoginRequest) -> dict[str, Any]:
+    """Sign in with Google: the verified Google email becomes the Handshake user."""
+    return _login_response(auth.verify_google_credential(body.credential), demo=False)
+
+
 @router.post("/auth/demo-login")
 def demo_login(body: DemoLoginRequest) -> dict[str, Any]:
     """
     DEMO AUTH: exchange an email for a signed user token. No password, no email check.
 
-    Replace with passkeys or OAuth before any real user touches this (README, Future work).
+    Off in prod unless HANDSHAKE_ALLOW_DEMO_LOGIN=true: on a public server it
+    would let anyone act as anyone. Real users sign in with Google.
     """
-    token, expires_at = auth.issue_user_token(body.email)
-    return {
-        "token": token,
-        "token_type": "bearer",
-        "email": auth.normalize_email(body.email),
-        "role": auth.USER,
-        "expires_at": expires_at,
-        "demo_auth": True,
-    }
+    if not get_settings().demo_login_enabled:
+        raise AuthError(404, "demo_login_disabled", "Demo login is turned off on this server. Sign in with Google.")
+    return _login_response(body.email, demo=True)
 
 
 # ------------------------------------------------------------
@@ -270,17 +295,62 @@ def demo_login(body: DemoLoginRequest) -> dict[str, Any]:
 
 @router.get("/.well-known/oauth-authorization-server")
 def oauth_metadata() -> dict[str, Any]:
-    """Discovery document so OAuth-aware clients can find the device and token endpoints."""
+    """
+    Discovery (RFC 8414). MCP clients such as Muse find this from the MCP
+    server's protected-resource metadata, then register, send the user to
+    authorization_endpoint, and trade the code at token_endpoint.
+    """
     base = get_settings().api_url
     return {
         "issuer": base,
-        "device_authorization_endpoint": f"{base}/oauth/device_authorization",
+        "authorization_endpoint": f"{base}/oauth/authorize",
         "token_endpoint": f"{base}/oauth/token",
-        "grant_types_supported": [DEVICE_CODE_GRANT],
-        "scopes_supported": ["handshake.agent"],
-        "token_endpoint_auth_methods_supported": ["none"],
-        "service_documentation": f"{get_settings().frontend_url}/connect",
+        "registration_endpoint": f"{base}/oauth/register",
+        "device_authorization_endpoint": f"{base}/oauth/device_authorization",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token", DEVICE_CODE_GRANT],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": [auth.AGENT_SCOPE],
+        "token_endpoint_auth_methods_supported": list(auth.CLIENT_AUTH_METHODS),
+        "authorization_response_iss_parameter_supported": True,
+        "service_documentation": f"{get_settings().frontend_url}/agents",
     }
+
+
+@router.post("/oauth/register", status_code=201)
+def oauth_register(body: dict[str, Any] = Body(...), session: Session = Depends(db.get_session)) -> dict[str, Any]:
+    """Dynamic client registration (RFC 7591), which MCP clients do before their first sign-in."""
+    return auth.register_client(session, body)
+
+
+@router.get("/oauth/authorize")
+def oauth_authorize(request: Request, session: Session = Depends(db.get_session)) -> Any:
+    """
+    Where an agent sends the user's browser. We validate the request and send
+    the user on to the frontend's consent page, where they sign in and decide.
+    """
+    from fastapi.responses import RedirectResponse
+
+    result = auth.start_authorization(session, dict(request.query_params))
+    if "redirect_error" in result:
+        return RedirectResponse(result["redirect_error"], status_code=302)
+    return RedirectResponse(f"{get_settings().frontend_url}/authorize?request_id={result['request_id']}", status_code=302)
+
+
+@router.get("/oauth/authorize/request")
+def oauth_authorize_request(
+    request_id: str, session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)
+) -> dict[str, Any]:
+    """For the consent page: which agent is asking, and where the user will be sent back. Users only."""
+    return auth.describe_authorization(session, principal, request_id)
+
+
+@router.post("/oauth/authorize/decision")
+def oauth_authorize_decision(
+    body: AuthorizationDecision, session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)
+) -> dict[str, Any]:
+    """The USER approves or denies connecting the agent. Returns where to send the browser."""
+    return auth.decide_authorization(session, principal, body.request_id, body.approve)
 
 
 @router.post("/oauth/device_authorization")
@@ -289,12 +359,58 @@ def device_authorization(body: DeviceAuthorizationRequest, session: Session = De
     return auth.start_device_authorization(session, body.client_id, body.client_name)
 
 
+async def _token_params(request: Request) -> dict[str, str]:
+    """
+    /oauth/token parameters. OAuth clients send a form (RFC 6749); our own MCP
+    server sends JSON. Client credentials may also come as HTTP Basic auth.
+    """
+    import base64
+    from urllib.parse import unquote
+
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            raw = await request.json()
+        except ValueError:
+            raise AuthError(400, "invalid_request", "The body isn't valid JSON.")
+        params = {k: str(v) for k, v in raw.items() if v is not None} if isinstance(raw, dict) else {}
+    else:
+        params = {k: str(v) for k, v in (await request.form()).items()}
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("basic "):
+        try:
+            client_id, _, secret = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+        except ValueError:
+            raise AuthError(401, "invalid_client", "Malformed Basic credentials.")
+        params.setdefault("client_id", unquote(client_id))
+        params["client_secret"] = unquote(secret)
+    return params
+
+
 @router.post("/oauth/token")
-def oauth_token(body: TokenRequest, session: Session = Depends(db.get_session)) -> dict[str, Any]:
-    """The agent polls here with its device_code until the user approves; then it gets an agent token (once)."""
-    if body.grant_type != DEVICE_CODE_GRANT:
-        raise AuthError(400, "unsupported_grant_type", f"Only {DEVICE_CODE_GRANT} is supported.")
-    return auth.exchange_device_code(session, body.device_code, body.client_id)
+async def oauth_token(request: Request) -> Any:
+    """
+    Every token grant: device_code (our MCP server polling), authorization_code
+    (with the PKCE verifier), and refresh_token (rotating). Responses are never cached.
+    """
+    params = await _token_params(request)
+    grant = params.get("grant_type", "")
+    session = db.SessionLocal()
+    try:
+        if grant == DEVICE_CODE_GRANT:
+            result = auth.exchange_device_code(session, params.get("device_code", ""), params.get("client_id", ""))
+        elif grant in ("authorization_code", "refresh_token"):
+            auth.authenticate_client(session, params.get("client_id", ""), params.get("client_secret"))
+            if grant == "authorization_code":
+                result = auth.exchange_authorization_code(
+                    session, params.get("code", ""), params["client_id"], params.get("redirect_uri"), params.get("code_verifier", "")
+                )
+            else:
+                result = auth.refresh_access_token(session, params.get("refresh_token", ""), params["client_id"])
+        else:
+            raise AuthError(400, "unsupported_grant_type", "Use authorization_code, refresh_token, or the device_code grant.")
+    finally:
+        session.close()
+    return JSONResponse(result, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @router.get("/oauth/device")
@@ -331,8 +447,35 @@ def deny_device(
 
 @router.get("/auth/me")
 def whoami(principal: Principal = Depends(current_principal)) -> dict[str, Any]:
-    """Who the current token belongs to (the frontend uses this to validate a stored session)."""
+    """Who the current token belongs to (the frontend validates sessions with it; the MCP server checks agent tokens with it)."""
     return {"email": principal.email, "role": principal.role, "agent_id": principal.agent_id}
+
+
+# ------------------------------------------------------------
+# The user's connected agents (Agents page)
+# ------------------------------------------------------------
+
+
+@router.get("/agents")
+def list_agents(session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)) -> dict[str, Any]:
+    """Every agent the user connected (OAuth, device login, or key), active first. User only."""
+    return auth.list_grants(session, principal)
+
+
+@router.post("/agents/keys", status_code=201)
+def create_agent_key(
+    body: AgentKeyRequest, session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)
+) -> dict[str, Any]:
+    """Make an agent key (shown once) for an agent that can't sign in through OAuth. User only."""
+    return auth.create_agent_key(session, principal, body.name)
+
+
+@router.post("/agents/{agent_id}/revoke")
+def revoke_agent(
+    agent_id: str, session: Session = Depends(db.get_session), principal: Principal = Depends(current_principal)
+) -> dict[str, Any]:
+    """Disconnect an agent: its tokens stop working on the next request. User only."""
+    return auth.revoke_grant(session, principal, agent_id)
 
 
 # ============================================================
@@ -502,7 +645,7 @@ async def compile_draft(
         result = await compiler.compile_intent(body.intent, now=services.clock())
     except compiler.CompileError as exc:
         raise compile_error(exc)
-    stored = services.store_compiled_draft(session, result, owner=principal.email)
+    stored = services.store_compiled_draft(session, result, owner=principal.email, proposed_by=principal)
     return {**stored["record"], "compiler_source": result.source}
 
 
@@ -864,7 +1007,8 @@ def create_app() -> FastAPI:
 
     application.include_router(router)
     settings = get_settings()
-    if settings.payment_mode == "stub":
+    # Simulated approval exists wherever simulated funding can happen (it refuses Link-funded cards itself).
+    if settings.payment_mode in ("stub", "link_optional"):
         application.include_router(stub_router)
     if settings.credential_mode == "agent_visible":
         application.include_router(credential_router)

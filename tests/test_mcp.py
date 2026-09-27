@@ -317,7 +317,9 @@ def test_device_code_works_once_and_only_for_its_client(anon_client: TestClient,
 
 
 def test_oauth_discovery_document(anon_client: TestClient) -> None:
-    """The authorization-server metadata points at the device and token endpoints."""
+    """The authorization-server metadata points at the device, authorize, register, and token endpoints."""
     meta = anon_client.get("/.well-known/oauth-authorization-server").json()
     assert meta["device_authorization_endpoint"].endswith("/oauth/device_authorization")
-    assert meta["grant_types_supported"] == ["urn:ietf:params:oauth:grant-type:device_code"]
+    assert meta["authorization_endpoint"].endswith("/oauth/authorize") and meta["registration_endpoint"].endswith("/oauth/register")
+    assert set(meta["grant_types_supported"]) == {"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"}
+    assert meta["code_challenge_methods_supported"] == ["S256"]

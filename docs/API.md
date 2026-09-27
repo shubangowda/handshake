@@ -19,11 +19,20 @@ This is the single source of truth for every backend endpoint. The frontend's `l
 
 | Route | Who | Request | Response |
 |---|---|---|---|
-| `POST /auth/demo-login` | anyone | `{"email"}` | `{"token", "token_type": "bearer", "email", "role": "user", "expires_at", "demo_auth": true}`. `expires_at` is **Unix seconds**; every other time in this API is an ISO 8601 string. |
-| `GET /auth/me` | any token | – | `{"email", "role": "user" or "agent", "agent_id"}` |
-| `GET /.well-known/oauth-authorization-server` | anyone | – | OAuth discovery metadata (the device and token endpoints) |
+| `GET /auth/config` | anyone | – | `{"google_client_id": string or null, "demo_login": bool}`: which sign-in methods the login page offers. |
+| `POST /auth/google` | anyone | `{"credential"}` (the Google Identity Services ID token) | Same shape as demo-login, with `"demo_auth": false`. 401 `google_token_invalid` (bad signature, audience, issuer, unverified email, or expired); 404 `google_login_disabled`. |
+| `POST /auth/demo-login` | anyone | `{"email"}` | `{"token", "token_type": "bearer", "email", "role": "user", "expires_at", "demo_auth": true}`. `expires_at` is **Unix seconds**; every other time in this API is an ISO 8601 string. **Off in prod** (404 `demo_login_disabled`) unless `HANDSHAKE_ALLOW_DEMO_LOGIN=true`. |
+| `GET /auth/me` | any token | – | `{"email", "role": "user" or "agent", "agent_id"}`. The hosted MCP server uses it to check agent tokens. |
+| `GET /.well-known/oauth-authorization-server` | anyone | – | OAuth discovery (RFC 8414): authorize, token, register, and device endpoints; `code_challenge_methods_supported: ["S256"]`. |
+| `POST /oauth/register` | anyone (an MCP client) | RFC 7591 client metadata: `redirect_uris` (https, loopback http, or a private-use scheme; matched exactly), `client_name`, `token_endpoint_auth_method` (`none`, or `client_secret_post`/`client_secret_basic` to get a secret) | 201 `{"client_id", "client_name", "redirect_uris", "token_endpoint_auth_method", ...}` (+ `client_secret` when asked for) |
+| `GET /oauth/authorize` | the user's browser | `response_type=code`, `client_id`, `redirect_uri`, `code_challenge` + `code_challenge_method=S256` (**required**), `state`, `scope=handshake.agent`, `resource`? | 302 to the frontend's `/authorize?request_id=…` consent page. Errors after the redirect URI is verified go back to it (`error`, `state`, `iss`); an unregistered `redirect_uri` gets a plain 400 (never a redirect). |
+| `GET /oauth/authorize/request?request_id=` | user | – | `{"request_id", "client_id", "client_name", "redirect_host", "scopes", "expires_at"}`; 404 `authorization_request_not_found`, 410 `authorization_request_expired` |
+| `POST /oauth/authorize/decision` | **user only** | `{"request_id", "approve": bool}` | `{"redirect_to"}`: the client's redirect URI with `code`, `state`, `iss` (or `error=access_denied`) |
 | `POST /oauth/device_authorization` | anyone (the MCP server) | `{"client_id", "client_name"?}` | `{"device_code", "user_code", "verification_uri", "verification_uri_complete", "expires_in", "interval"}` |
-| `POST /oauth/token` | anyone (the MCP server) | `{"grant_type": "urn:ietf:params:oauth:grant-type:device_code", "device_code", "client_id"}` | 200 `{"access_token", "token_type": "Bearer", "expires_in", "scope", "agent_id", "email"}`, or 400 with `error` = `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, or `invalid_grant` |
+| `POST /oauth/token` | anyone | Form (or JSON). `grant_type=authorization_code` + `code`, `client_id`, `redirect_uri`, `code_verifier`; or `refresh_token` + `refresh_token`, `client_id`; or the device-code grant + `device_code`, `client_id`. Secret clients add `client_secret` or HTTP Basic. | 200 `{"access_token", "token_type": "Bearer", "expires_in", "refresh_token", "scope"}` (`Cache-Control: no-store`). Access tokens last 1 hour; refresh tokens rotate and work once, and **replaying one revokes the agent**. Errors: 400 `invalid_grant`, `unsupported_grant_type`, device-flow `authorization_pending`/`slow_down`/`access_denied`/`expired_token`; 401 `invalid_client`. |
+| `GET /agents` | **user only** | – | `{"agents": [{"agent_id", "name", "kind": "oauth"/"device"/"key", "client_name", "created_at", "last_used_at", "expires_at", "revoked_at"}]}`, active first |
+| `POST /agents/keys` | **user only** | `{"name"}` | 201 `{"agent_id", "name", "token", "expires_at"}`. The token is shown **once**; it acts as its own agent. |
+| `POST /agents/{agent_id}/revoke` | **user only** | – | The agent, with `revoked_at` set. Its tokens fail on the next request (401 `agent_revoked`). |
 | `GET /oauth/device?user_code=` | user | – | `{"user_code", "client_id", "client_name", "status", "expires_at", "permissions": [...], "never": [...]}`, for the approval screen |
 | `POST /oauth/device/approve` and `/deny` | **user only** | `{"user_code"}` | `{"user_code", "status", "client_id"}` |
 
@@ -44,7 +53,9 @@ Card validity is Link's 12 hours from the request. After that the funding expire
 | `GET /link/status` | user | `{"connected": bool, "simulated": bool, "provider_label", "login": pending-login-or-null}`. The Link access token is never returned. |
 | `POST /link/disconnect` | user | Logs this user's Link account out and returns the status above. |
 
-In `link_test` mode, signing without a connected Link account returns 409 `link_not_connected`.
+In `link_test` mode, signing without a connected Link account returns 409 `link_not_connected`. In **`link_optional`** mode (the public server), connecting Link is optional: a user who connected it gets real Link **test** cards, and everyone else is funded by the simulated provider. Each funding records its `provider`, and `POST /contracts/{id}/funding/simulate-approval` works only on `stub` fundings.
+
+**Which agent a contract binds to.** A draft compiled by an agent records `proposed_by_agent` (its agent id: the OAuth client id, or `key_…` for an agent key). Signing binds the contract to that agent, else to `HANDSHAKE_AGENT_ID`. Any other agent, even one belonging to the same user, gets 403 `agent_not_authorized`.
 
 ## Contract funding
 

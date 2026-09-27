@@ -35,6 +35,21 @@ Tools
 
 Only get_payment_credential ever returns card values. Logs go to stderr;
 stdout carries nothing but MCP protocol traffic.
+
+Hosted for many users (HTTP + OAuth)
+------------------------------------
+On a server (HANDSHAKE_MCP_PUBLIC_URL set), this is an OAuth 2.1 *resource
+server* for many users at once (Muse, Claude, any MCP client):
+
+    client -> POST /mcp (no token) -> 401 + WWW-Authenticate: resource_metadata=...
+    client -> /.well-known/oauth-protected-resource/mcp -> "authorization server: the Handshake API"
+    client registers, sends the user to sign in and approve, gets an access token (auth.py)
+    client -> POST /mcp  Authorization: Bearer <that user's agent token>
+
+Every request carries its own user's token; we check it with the backend
+(/auth/me, cached briefly) and pass THAT token on for the tool's backend
+calls. Nothing is cached to disk and no user can act as another. The
+single-user device flow and token file are for local (stdio) use only.
 """
 
 from __future__ import annotations
@@ -50,9 +65,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-from handshake.config import Settings, get_settings
+from handshake.config import LOOPBACK_HOST_PATTERNS, Settings, get_settings
 from handshake.prompts import CREDENTIAL_TOOL_RULES, agent_instructions
 
 # stdout is the MCP channel in stdio mode, so every log line goes to stderr.
@@ -100,14 +119,19 @@ class HandshakeBackend:
         settings: Settings | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         token_file: str | None = None,
+        per_request: bool = False,
     ) -> None:
-        """transport lets tests talk to an in-process backend; token_file overrides the cache location."""
+        """
+        transport lets tests talk to an in-process backend; token_file overrides the cache location.
+        per_request (hosted mode): use the calling user's OAuth token for each call, never a stored one.
+        """
+        self.per_request = per_request
         self.settings = settings or get_settings()
         self.base_url = self.settings.api_url
         self.transport = transport
         self.token_file = Path(token_file or self.settings.mcp_token_file).expanduser()
         self.client_id = self.settings.agent_id
-        self._token: str | None = self.settings.agent_token or self._load_cached_token()
+        self._token: str | None = None if per_request else (self.settings.agent_token or self._load_cached_token())
         self._pending: dict[str, Any] | None = None  # the device authorization we're waiting on
 
     # ---------------- token cache ----------------
@@ -169,6 +193,12 @@ class HandshakeBackend:
 
     async def _ensure_token(self) -> str:
         """The agent token, or raise NeedsAuthorization with the login link."""
+        if self.per_request:
+            # Hosted: the bearer middleware already verified this request's token.
+            access = get_access_token()
+            if access is None:
+                raise BackendError(401, {"error": "not_authenticated", "message": "Sign in to Handshake through your MCP client first."})
+            return access.token
         if self._token:
             return self._token
         if self._pending is not None:
@@ -199,6 +229,9 @@ class HandshakeBackend:
                 if attempt == attempts - 1:
                     raise
         if response.status_code == 401:
+            if self.per_request:
+                # The user's token was revoked mid-session: the client must sign in again.
+                raise BackendError(401, _json(response))
             self._forget_token()
             raise await self._start_device_flow()
         if response.status_code >= 400:
@@ -287,12 +320,84 @@ def contract_summary(record: dict[str, Any]) -> str:
 # ============================================================
 
 
-def build_server(settings: Settings | None = None, backend: HandshakeBackend | None = None) -> FastMCP:
-    """Create the FastMCP server with every tool; get_payment_credential only in agent_visible mode."""
+class BackendTokenVerifier:
+    """
+    Checks a bearer token by asking the backend who it belongs to (GET /auth/me).
+
+    Only AGENT tokens pass: a user's own login token must never be usable by an
+    agent. Answers are cached for a few seconds so a burst of tool calls costs
+    one check, while a revoked agent is still cut off almost immediately.
+    """
+
+    CACHE_SECONDS = 20.0
+
+    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        """transport lets tests talk to an in-process backend."""
+        self.settings = settings
+        self.transport = transport
+        self._cache: dict[str, tuple[float, AccessToken | None]] = {}
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """An AccessToken for a valid agent token, else None (the SDK answers 401)."""
+        import hashlib
+
+        key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cached = self._cache.get(key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        try:
+            async with httpx.AsyncClient(base_url=self.settings.api_url, timeout=10.0, transport=self.transport) as client:
+                response = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError:
+            return None  # fail closed, and don't cache an outage
+        me = _json(response)
+        result = None
+        if response.status_code == 200 and me.get("role") == "agent" and me.get("agent_id"):
+            result = AccessToken(token=token, client_id=me["agent_id"], scopes=["handshake.agent"], subject=me.get("email"))
+        if len(self._cache) > 5000:
+            self._cache.clear()
+        self._cache[key] = (time.monotonic() + self.CACHE_SECONDS, result)
+        return result
+
+
+def build_server(
+    settings: Settings | None = None,
+    backend: HandshakeBackend | None = None,
+    hosted: bool = False,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> FastMCP:
+    """
+    Create the FastMCP server with every tool; get_payment_credential only in agent_visible mode.
+
+    hosted=True: the multi-user HTTP server (OAuth resource server; see the module docstring).
+    """
     settings = settings or get_settings()
-    backend = backend or HandshakeBackend(settings)
     instructions = agent_instructions(settings.credential_mode)
-    server = FastMCP("Handshake", instructions=instructions)
+    if not hosted:
+        backend = backend or HandshakeBackend(settings)
+        server = FastMCP("Handshake", instructions=instructions)
+    else:
+        if not settings.mcp_public_url:
+            raise ValueError("HANDSHAKE_MCP_PUBLIC_URL must be set for the hosted MCP server.")
+        from urllib.parse import urlsplit
+
+        backend = backend or HandshakeBackend(settings, transport=transport, per_request=True)
+        resource = f"{settings.mcp_public_url}/mcp"
+        public_host = urlsplit(settings.mcp_public_url).netloc
+        server = FastMCP(
+            "Handshake", instructions=instructions, stateless_http=True,
+            host=settings.mcp_http_host, port=settings.mcp_http_port,
+            auth=AuthSettings(issuer_url=settings.api_url, resource_server_url=resource, required_scopes=["handshake.agent"],
+                              validate_token_resource=False),
+            token_verifier=BackendTokenVerifier(settings, transport),
+            # Only answer to our own public name (DNS-rebinding protection), plus loopback for health checks.
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=[public_host, *LOOPBACK_HOST_PATTERNS],
+                allowed_origins=[settings.mcp_public_url, settings.frontend_url],
+            ),
+        )
+        _add_hosted_routes(server, settings, resource, transport)
 
     async def guarded(action: Any) -> dict[str, Any]:
         """Run a backend action, turning every failure into a structured answer the agent can act on."""
@@ -458,6 +563,40 @@ def build_server(settings: Settings | None = None, backend: HandshakeBackend | N
 # ============================================================
 
 
+def _add_hosted_routes(server: FastMCP, settings: Settings, resource: str, transport: httpx.AsyncBaseTransport | None) -> None:
+    """/health, plus discovery documents at the places different MCP clients look for them."""
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    metadata = {
+        "resource": resource, "authorization_servers": [settings.api_url], "scopes_supported": ["handshake.agent"],
+        "bearer_methods_supported": ["header"], "resource_name": "Handshake",
+    }
+
+    @server.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> JSONResponse:
+        """Liveness for the platform's health check. No auth, no backend call."""
+        return JSONResponse({"status": "ok", "service": "handshake-mcp", "resource": resource})
+
+    # The SDK serves /.well-known/oauth-protected-resource/mcp (RFC 9728); some clients try the bare path.
+    @server.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+    async def protected_resource(request: Request) -> JSONResponse:
+        """Protected-resource metadata at the host root."""
+        return JSONResponse(metadata)
+
+    # Older MCP clients look for the authorization server's metadata on the MCP host itself.
+    # Serve the backend's document (its endpoints are absolute URLs on the API host).
+    @server.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    async def authorization_server(request: Request) -> JSONResponse:
+        """The backend's OAuth metadata, mirrored."""
+        try:
+            async with httpx.AsyncClient(base_url=settings.api_url, timeout=10.0, transport=transport) as client:
+                response = await client.get("/.well-known/oauth-authorization-server")
+            return JSONResponse(response.json(), status_code=response.status_code)
+        except (httpx.HTTPError, ValueError):
+            return JSONResponse({"error": "temporarily_unavailable"}, status_code=503)
+
+
 def _http_app(server: FastMCP, token: str) -> Any:
     """The streamable-HTTP MCP app, behind a bearer-token check (put TLS in front of it on the real domain)."""
     import hmac
@@ -496,13 +635,19 @@ def main(argv: list[str] | None = None) -> int:
         server.run("stdio")
         return 0
 
-    if not settings.mcp_http_token:
-        print("HANDSHAKE_MCP_HTTP_TOKEN must be set to serve MCP over HTTP.", file=sys.stderr)
-        return 2
     import uvicorn
 
     host = args.host or settings.mcp_http_host
     port = args.port or settings.mcp_http_port
+    if settings.mcp_public_url:
+        # Hosted, many users: each request brings its own user's OAuth token.
+        hosted = build_server(settings, hosted=True)
+        log.info("hosted MCP at %s/mcp (OAuth via %s)", settings.mcp_public_url, settings.api_url)
+        uvicorn.run(hosted.streamable_http_app(), host=host, port=port, log_level="info", proxy_headers=True, forwarded_allow_ips="*")
+        return 0
+    if not settings.mcp_http_token:
+        print("Set HANDSHAKE_MCP_PUBLIC_URL (hosted, per-user OAuth) or HANDSHAKE_MCP_HTTP_TOKEN (single user) to serve MCP over HTTP.", file=sys.stderr)
+        return 2
     uvicorn.run(_http_app(server, settings.mcp_http_token), host=host, port=port, log_level="info")
     return 0
 

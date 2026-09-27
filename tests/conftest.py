@@ -36,6 +36,15 @@ os.environ.setdefault("HANDSHAKE_SESSION_SECRET", "test-session-secret")
 os.environ["HANDSHAKE_AGENT_TOKEN"] = "test-agent-token"
 os.environ["HANDSHAKE_AGENT_OWNER"] = "demo@handshake.dev"
 os.environ["HANDSHAKE_AGENT_ID"] = "agent_demo"
+# Tests must NEVER reach the real Stripe Link CLI or a real user's saved Link
+# login (the dev machine has them). By default the "CLI" is a command that
+# prints nothing and fails, and Link homes live in a throwaway directory;
+# tests that need Link behavior install their own fake CLI (test_payments.py).
+import tempfile  # noqa: E402
+
+os.environ["HANDSHAKE_LINK_CLI"] = f"{sys.executable} -c 'import sys; sys.exit(3)'"
+os.environ["HANDSHAKE_LINK_HOME_ROOT"] = tempfile.mkdtemp(prefix="handshake-test-link-homes-")
+os.environ["HANDSHAKE_LINK_TMP_DIR"] = tempfile.mkdtemp(prefix="handshake-test-link-tmp-")
 
 from handshake import db  # noqa: E402  (must come after the environment setup)
 from handshake.models import Contract, ContractDraft, TransactionProposal  # noqa: E402

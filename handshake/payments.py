@@ -609,11 +609,24 @@ class StubProvider:
         cls._requests[request_id]["status"] = status
 
 
+def link_enabled() -> bool:
+    """True when users may connect their own Link account (link_test requires it; link_optional allows it)."""
+    return get_settings().payment_mode in ("link_test", "link_optional")
+
+
 def get_provider(settings: Settings | None = None, owner: str | None = None) -> Provider:
-    """The provider for the configured payment mode, acting as `owner`'s own Link account."""
+    """
+    The provider for the configured payment mode, acting as `owner`'s own Link account.
+
+    link_optional: the user's own Link (TEST MODE) if they connected it, the
+    simulated provider otherwise. Chosen when funding starts; the funding row
+    remembers it, so a later connect/disconnect never switches an existing card.
+    """
     settings = settings or get_settings()
     if settings.payment_mode == "link_test":
         return LinkTestProvider(settings, home=user_link_home(owner) if owner else None)
+    if settings.payment_mode == "link_optional" and owner and link_connection(owner)["connected"]:
+        return LinkTestProvider(settings, home=user_link_home(owner))
     return StubProvider()
 
 
@@ -713,7 +726,7 @@ def start_link_login(email: str, wait_seconds: float = 30.0) -> dict[str, Any]:
     import threading
     import time as _time
 
-    if get_settings().payment_mode != "link_test":
+    if not link_enabled():
         return {"state": "connected", "simulated": True, "provider_label": "Simulated provider"}
     existing = _logins.get(email)
     if existing and existing.state == "pending" and existing.process and existing.process.poll() is None:
@@ -739,7 +752,7 @@ def _login_view(login: LinkLogin) -> dict[str, Any]:
 
 def link_connection(email: str) -> dict[str, Any]:
     """Whether `email` has a connected Link account (the access token itself is never returned)."""
-    if get_settings().payment_mode != "link_test":
+    if not link_enabled():
         return {"connected": True, "simulated": True, "provider_label": "Simulated provider", "login": None}
     login = _logins.get(email)
     command, env = _link_cli_for(email)
@@ -755,7 +768,7 @@ def link_connection(email: str) -> dict[str, Any]:
 
 def disconnect_link(email: str) -> None:
     """Log `email` out of Link (their saved Link login is removed)."""
-    if get_settings().payment_mode != "link_test":
+    if not link_enabled():
         return
     command, env = _link_cli_for(email)
     subprocess.run([*command, "auth", "logout", "--format", "json"], capture_output=True, text=True, env=env,

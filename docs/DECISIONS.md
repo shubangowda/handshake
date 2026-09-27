@@ -21,6 +21,17 @@ The owner chose this over releasing the card as soon as the contract is funded, 
 **The per-purchase Link request is gone.**
 The owner chose to replace it rather than keep both. Purchases against an unfunded contract are refused with `contract_not_funded`. `POST /purchases/{id}/payment/simulate-approval` became `POST /contracts/{id}/funding/simulate-approval`.
 
+**Going public: hosted on Fly.io, reached by Muse over MCP (2026-09-27).**
+The owner chose Fly.io, free `*.fly.dev` addresses, Sign in with Google, and simulated payments by default with each user's own Link optional (`HANDSHAKE_PAYMENT_MODE=link_optional`).
+
+- **The MCP server is multi-user.** Over HTTP it is an OAuth 2.1 resource server. Each request carries that user's agent token, which is checked with the backend (`/auth/me`, cached 20 s) and passed on. Nothing is stored on disk. The old single shared `HANDSHAKE_MCP_HTTP_TOKEN` gave every caller the same account, so it is kept only for local single-user use.
+- **The backend is the OAuth authorization server:** dynamic client registration, authorization code with mandatory PKCE S256, exact redirect-URI matching, 1-hour access tokens, and rotating single-use refresh tokens (a replay revokes the agent). The consent screen is a user-only frontend page, so an agent still can't connect itself. Clients that ask for a secret get one, because refusing would break them; PKCE is required regardless.
+- **Agents are revocable.** Every issued agent token names a grant (`gid`), and revoking the grant on the Agents page kills its tokens on the next request. Agent keys exist for Muse's custom-connector path, where Muse writes code against an API and takes a pasted key through its secure credential prompt.
+- **Contracts bind to the agent that proposed them.** Before, signing bound every contract to the one configured `HANDSHAKE_AGENT_ID`, which would have locked Muse out of its own contracts.
+- **Prod forbids a static `HANDSHAKE_AGENT_TOKEN`,** because it acts for one fixed user. Demo login is off in prod unless explicitly allowed, and prod refuses to start with no way to log in.
+- **Real Amazon is out of scope.** The server can't read a user's logged-in Amazon cart (it's behind their session and bot protection), and trusting the agent's own description would break "Handshake reads the checkout itself". Paying there would also need a live card, which rule 4 forbids. Muse buys from the hosted mock store.
+- **Tests can never reach the real Link CLI or a real user's Link login.** conftest points the CLI at a command that always fails and the Link homes at a temporary directory. (An early `link_optional` test did run one real `auth status` against the dev machine's saved login before this was fixed. It was only a status read: no spend request was created.)
+
 ## Conflicts decided in the build spec (section 3)
 
 **3.1 Credential exposure: the agent receives the Link TEST card by default.**

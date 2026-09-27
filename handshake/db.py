@@ -384,6 +384,87 @@ class DeviceAuthorizationRow(Base):
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AgentGrantRow(Base):
+    """
+    One agent a user has connected: through OAuth (Muse, Claude, any MCP
+    client), the device flow, or an agent key made on the Agents page.
+
+    Agent tokens are signed and self-contained, so without this row they
+    couldn't be revoked before they expire. Every token issued for a grant
+    carries its id ("gid"), and auth.py refuses tokens whose grant is revoked.
+    """
+
+    __tablename__ = "agent_grants"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # "agt_…"
+    owner: Mapped[str] = mapped_column(String, index=True)
+    agent_id: Mapped[str] = mapped_column(String, index=True)  # what contracts bind to
+    kind: Mapped[str] = mapped_column(String)  # oauth / device / key
+    name: Mapped[str] = mapped_column(String)
+    client_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OAuthClientRow(Base):
+    """
+    An OAuth client that registered itself (RFC 7591 dynamic client
+    registration), e.g. Muse or Claude connecting to the MCP server. Every
+    client must use PKCE; redirect_uris are matched exactly.
+    """
+
+    __tablename__ = "oauth_clients"
+
+    client_id: Mapped[str] = mapped_column(String, primary_key=True)
+    client_name: Mapped[str] = mapped_column(String)
+    redirect_uris: Mapped[list] = mapped_column(JSON)
+    # "none" (public client) or client_secret_post / client_secret_basic for clients
+    # that ask for a secret. Only the secret's hash is stored. PKCE is required either way.
+    auth_method: Mapped[str] = mapped_column(String, default="none")
+    client_secret_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthRequestRow(Base):
+    """
+    One authorization-code request, from "the client sent the user here" to
+    "the code was exchanged". The user approves it on the frontend; the code
+    (stored only as a hash) is then good once, for a short time, and only with
+    the PKCE verifier that matches code_challenge.
+    """
+
+    __tablename__ = "oauth_requests"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # "oar_…", what the frontend sees
+    client_id: Mapped[str] = mapped_column(String, index=True)
+    redirect_uri: Mapped[str] = mapped_column(String)
+    state: Mapped[str | None] = mapped_column(String, nullable=True)
+    code_challenge: Mapped[str] = mapped_column(String)
+    scope: Mapped[str] = mapped_column(String)
+    resource: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, index=True)  # pending / approved / denied / consumed
+    owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    code_hash: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    code_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OAuthRefreshTokenRow(Base):
+    """A refresh token (hash only). Single use: each refresh issues a new one and retires the old."""
+
+    __tablename__ = "oauth_refresh_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String, primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String, index=True)
+    client_id: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 # The evidence ledger is APPEND-ONLY BY DESIGN. This module has an insert
 # helper and read helpers for it, and deliberately no update or delete
 # helper. Nothing in the app can rewrite history.
