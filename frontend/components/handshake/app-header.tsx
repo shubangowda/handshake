@@ -3,8 +3,10 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { CONFIG_ERROR, getHealth, USE_MOCKS } from "@/lib/api";
-import { Handshake } from "lucide-react";
-import { UserMenu } from "./user-menu";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { CircleCheck, Handshake, Link2 } from "lucide-react";
+import { LinkPanel, useLinkStatus } from "./link-connect";
+import { UserMenu, useSession } from "./user-menu";
 
 const BADGE = "rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase";
 
@@ -21,6 +23,36 @@ function ModeBadge() {
   return <span className={`${BADGE} bg-warn-soft text-warn`} title="Payment provider the backend is using">{label}</span>;
 }
 
+/** Link test mode, signed in: the user's own Stripe Link connection, one click from any page. */
+function LinkControl() {
+  const session = useSession();
+  // /link/status needs a user token; without a session there's nothing to show.
+  return session && !USE_MOCKS && !CONFIG_ERROR ? <LinkControlInner /> : null;
+}
+
+function LinkControlInner() {
+  const { health, status } = useLinkStatus();
+  const [open, setOpen] = useState(false);
+  if (health?.payment_mode !== "link_test" || !status) return null;
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}
+        className={`${BADGE} inline-flex items-center gap-1 ${status.connected ? "bg-pass-soft text-pass" : "bg-brand text-brand-foreground"}`}>
+        {status.connected ? <><CircleCheck className="size-3" />Stripe Link connected</> : <><Link2 className="size-3" />Connect Stripe Link</>}
+      </button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Stripe Link</DialogTitle>
+            <DialogDescription>Your own Link account (test mode). Signing a contract asks it for one single-use card for the contract&apos;s all-in cap.</DialogDescription>
+          </DialogHeader>
+          <LinkPanel />
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 export function AppHeader() {
   return (
     <header className="sticky top-0 z-20 border-b bg-background/85 backdrop-blur">
@@ -32,6 +64,7 @@ export function AppHeader() {
         <nav className="flex items-center gap-4 text-sm">
           <Link href="/contracts" className="text-muted-foreground hover:text-foreground">Contracts</Link>
           <ModeBadge />
+          <LinkControl />
           <UserMenu />
         </nav>
       </div>

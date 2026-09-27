@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { FIELD_LABELS, SELLER_LABELS, describeConstraint, formatDate, money } from "@/lib/format";
 import type { DraftRecord } from "@/lib/types";
-import { OctagonX, ShieldCheck, Sparkles } from "lucide-react";
+import { CreditCard, OctagonX, ShieldCheck, Sparkles } from "lucide-react";
+import { LinkPanel } from "./link-connect";
 
 const NEW_MERCHANT = { escalate: "Ask me first", deny: "Blocked", allow: "Allowed" } as const;
 
@@ -19,14 +20,18 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 }
 
 /**
- * Review-and-confirm before signing. It restates the terms the agent will be held to; signing
- * charges nothing (each purchase is paid separately after the user approves it in Link).
- * Blocking issues (lint errors from the backend) disable signing until the draft is edited.
+ * Review-and-confirm before signing. It restates the terms the agent will be held to. Signing is
+ * funding: it asks the user's Link account for one single-use test card for up to the hard cap.
+ * Blocking issues (lint errors from the backend) disable signing until the draft is edited, and a
+ * 409 link_not_connected shows the Connect Stripe Link panel.
  */
-export function SignDialog({ draft: d, blockingIssues, open, onOpenChange, onSign }: {
+export function SignDialog({ draft: d, blockingIssues, needsLink, onLinkConnected, open, onOpenChange, onSign }: {
   draft: DraftRecord;
   /** The draft's blocking_issues, or the ones a 409 draft_has_blocking_issues returned. */
   blockingIssues: string[];
+  /** The last sign attempt returned link_not_connected. */
+  needsLink: boolean;
+  onLinkConnected: () => void;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSign: () => Promise<void>;
@@ -45,10 +50,9 @@ export function SignDialog({ draft: d, blockingIssues, open, onOpenChange, onSig
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90svh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2"><ShieldCheck className="size-5" />Review and sign</DialogTitle>
+          <DialogTitle className="flex items-center gap-2"><ShieldCheck className="size-5" />Sign &amp; fund</DialogTitle>
           <DialogDescription>
             Your agent may buy <b>{d.goal}</b> under exactly these terms{d.single_use ? ", once" : ""}. Anything outside them is blocked.
-            Signing charges nothing: each purchase still needs your approval in Link.
           </DialogDescription>
         </DialogHeader>
 
@@ -66,6 +70,16 @@ export function SignDialog({ draft: d, blockingIssues, open, onOpenChange, onSig
           <Row label="Valid until">{d.expires_at ? formatDate(d.expires_at) : "No expiry"}</Row>
         </dl>
 
+        <p className="flex items-start gap-2 rounded-lg border p-3 text-sm">
+          <CreditCard className="mt-0.5 size-4 shrink-0" />
+          <span>
+            Signing asks your Link account for a <b>single-use test card for up to {money(d.spend.hard_cap_all_in, cur)}</b>. You approve it in Link.
+            Handshake stores it encrypted on this contract and releases it only for a checkout Handshake approves.
+          </span>
+        </p>
+
+        {needsLink && <LinkPanel onConnected={onLinkConnected} />}
+
         {!blocked && d.constraints.some((k) => k.source !== "user") && (
           <p className="flex items-start gap-2 rounded-lg bg-warn-soft p-3 text-sm text-warn"><Sparkles className="mt-0.5 size-4 shrink-0" />This includes values Handshake inferred. They&apos;re highlighted in the contract.</p>
         )}
@@ -80,7 +94,7 @@ export function SignDialog({ draft: d, blockingIssues, open, onOpenChange, onSig
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
           <Button onClick={sign} disabled={signing || blocked} className="bg-brand text-brand-foreground hover:bg-brand/90">
-            <ShieldCheck />{signing ? "Signing…" : "Sign contract"}
+            <ShieldCheck />{signing ? "Signing…" : "Sign & fund"}
           </Button>
         </DialogFooter>
       </DialogContent>

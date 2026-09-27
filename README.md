@@ -52,7 +52,7 @@ Tools: `connect_handshake`, `create_contract_draft`, `get_contract`, `list_contr
 
 ## Demo walkthrough
 
-[docs/DEMO.md](docs/DEMO.md) is the judge script. In short: compile and sign the Pegasus 41 contract, then run the eight scenarios. `valid` completes with a verified receipt. `price_bump`, `hidden_subscription`, `product_swap`, `late_delivery`, and `prompt_injection` are blocked, each for its stated reason. `unknown_seller` and `vague_delivery` escalate to you: first you accept the exception in Handshake, then you approve the payment in Link.
+[docs/DEMO.md](docs/DEMO.md) is the judge script. In short: compile and sign the Pegasus 41 contract, then run the eight scenarios. `valid` completes with a verified receipt. `price_bump`, `hidden_subscription`, `product_swap`, `late_delivery`, and `prompt_injection` are blocked, each for its stated reason. `unknown_seller` and `vague_delivery` escalate to you: once you accept the exception, the card you funded at signing is unlocked for that checkout.
 
 ## What is real and what is mocked
 

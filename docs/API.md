@@ -40,7 +40,7 @@ Card validity is Link's 12 hours from the request. After that the funding expire
 
 | Route | Who | Response |
 |---|---|---|
-| `POST /link/connect` | user | Starts the Link login for **this user's own** Link account. Returns `{"state": "pending", "verification_url", "phrase", "provider_label", "simulated": false}` immediately; the user opens `verification_url` and approves in the Link app. In stub mode it returns `{"state": "connected", "simulated": true}`. |
+| `POST /link/connect` | user | Starts the Link login for **this user's own** Link account. Waits up to 30 s for Link's first update, then returns `{"state", "verification_url", "phrase", "provider_label", "simulated": false, "error"}`, where `state` is `pending` (the user opens `verification_url` and approves in the Link app), `starting` (no update yet; poll `/link/status`), `connected`, `failed`, or `expired`; `error` is set only when it failed. In stub mode it returns `{"state": "connected", "simulated": true}`. |
 | `GET /link/status` | user | `{"connected": bool, "simulated": bool, "provider_label", "login": pending-login-or-null}`. The Link access token is never returned. |
 | `POST /link/disconnect` | user | Logs this user's Link account out and returns the status above. |
 
@@ -51,7 +51,7 @@ In `link_test` mode, signing without a connected Link account returns 409 `link_
 | Route | Who | Response |
 |---|---|---|
 | `GET /contracts/{id}/funding` | user or agent | **Funding** (refreshed; it polls Link and stores the card once it's approved) |
-| `POST /contracts/{id}/funding` | user | Funds the contract again (after a denied, expired, failed, or used card). Returns Funding. |
+| `POST /contracts/{id}/funding` | user | Funds an **active** contract again (after a denied, expired, failed, or canceled card; a single-use contract whose card was used is `used` itself, so this applies to multi-use contracts only). Returns Funding. |
 | `POST /contracts/{id}/funding/simulate-approval` | user | **Stub mode only.** "Simulated provider approval" for the funding card. Returns Funding (`funded`). |
 
 **Funding** has this shape:
@@ -63,7 +63,7 @@ In `link_test` mode, signing without a connected Link account returns 409 `link_
  "released_purchase_id", "last_error"}
 ```
 
-It never contains card data (at most `card_last4`). `approval_url` is Link's approval page, or the frontend contract page in stub mode.
+A contract with no funding yet returns only `{"state": "not_funded", "card_stored": false}`. Funding never contains card data (at most `card_last4`). `approval_url` is Link's approval page, or the frontend contract page in stub mode.
 
 ## Drafts and contracts
 

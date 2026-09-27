@@ -133,6 +133,18 @@ def test_escalated_then_approved_then_paid(user: TestClient, agent: TestClient, 
     pay_as_agent(agent, merchant_env, detail["purchase_id"])
     assert agent.get(f"/purchases/{detail['purchase_id']}").json()["status"] == "completed"
 
+def test_decline_after_accepted_exception_keeps_what_was_accepted(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
+    """The user accepts the unknown seller, then says "Not this one": the decline is shown, and so is what was accepted."""
+    contract_id = sign_demo_contract(user)
+    detail = request(agent, merchant_env, contract_id, "unknown_seller")
+    user.post(f"/purchases/{detail['purchase_id']}/approve", json={"note": "I know this seller."})
+    declined = user.post(f"/purchases/{detail['purchase_id']}/reject").json()  # on an AUTHORIZED purchase this is a decline
+    assert declined["status"] == "blocked"
+    assert declined["resolution"]["action"] == "decline"
+    assert declined["resolution"]["accepted_constraints"] == ["seller_requirement"]
+    assert user.get(f"/contracts/{contract_id}").json()["funding"]["card_stored"] is True
+
+
 def test_escalated_then_rejected(user: TestClient, agent: TestClient, merchant_env: TestClient) -> None:
     """vague_delivery escalates; the user rejects it; nothing is requested or paid."""
     detail = request(agent, merchant_env, sign_demo_contract(user), "vague_delivery")

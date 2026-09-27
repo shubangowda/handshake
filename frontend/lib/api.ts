@@ -4,8 +4,8 @@ import * as fixtures from "./mock-data";
 import { clearSession, readSession } from "./session";
 import type {
   ApiErrorBody, Contract, ContractListItem, ContractRecord, ContractResponse, DemoLogin, DeviceAuthorization,
-  DeviceDecision, DraftPatch, DraftRecord, EvidenceBundle, EvidenceEvent, Health, PaymentState, PurchaseDetail,
-  SignedContract,
+  DeviceDecision, DraftPatch, DraftRecord, EvidenceBundle, EvidenceEvent, Funding, Health, LinkLogin, LinkStatus,
+  PaymentState, PurchaseDetail, SignedContract,
 } from "./types";
 
 export const USE_MOCKS = process.env.NEXT_PUBLIC_USE_MOCKS !== "false";
@@ -74,6 +74,7 @@ const store = {
   contracts: clone(fixtures.contracts),
   purchases: clone(fixtures.purchases),
   evidence: clone(fixtures.evidence),
+  fundings: clone(fixtures.fundings),
 };
 const delay = (ms = 250) => new Promise((r) => setTimeout(r, ms));
 const iso = () => new Date().toISOString();
@@ -90,35 +91,61 @@ function mockPurchase(id: string): PurchaseDetail {
   return p;
 }
 
+const NOT_FUNDED: Funding = { state: "not_funded", card_stored: false };
+const mockFundingOf = (contractId: string): Funding => store.fundings[contractId] ?? NOT_FUNDED;
+
+/** A purchase as the backend returns it: with its contract's current funding. */
+const withFunding = (d: PurchaseDetail): PurchaseDetail => clone({ ...fixtures.syncDetail(d), funding: mockFundingOf(d.purchase.contract_id) });
+const signedWithExtras = (c: Contract): SignedContract => ({ ...c, verification: mockVerification, funding: mockFundingOf(c.id) });
+
 function pushEvent(e: Omit<EvidenceEvent, "id" | "timestamp">) {
   const key = e.purchase_id ?? `contract:${e.contract_id}`;
   (store.evidence[key] ??= []).push({ ...e, id: newId("event"), timestamp: iso() });
 }
 
-/** Mock stand-in for the backend's payment refresh: one step per poll, so the progression is visible. */
-const MOCK_NEXT: Partial<Record<PaymentState, PaymentState>> = { approved: "revalidating", revalidating: "paying", paying: "paid", paid: "completed" };
+/**
+ * Mock stand-in for the agent collecting the unlocked card and paying, one step per poll, so the
+ * progression is visible. It waits a few polls at credential_ready so "Not this one" can be tried.
+ */
+const mockTicks = new Map<string, number>();
+const MOCK_NEXT: Partial<Record<PaymentState, PaymentState>> = { credential_ready: "paying", paying: "paid", paid: "completed" };
 function advanceMockPayment(d: PurchaseDetail) {
   const pay = d.payment;
   const next = pay && d.purchase.status === "authorized" ? MOCK_NEXT[pay.state] : undefined;
   if (!pay || !next) return;
   const { id, contract_id } = d.purchase;
+  const ticks = (mockTicks.get(id) ?? 0) + 1;
+  mockTicks.set(id, ticks);
+  if (pay.state === "credential_ready" && ticks < 4) return;
   const total = pay.amount;
+  const funding = store.fundings[contract_id];
   pay.state = next;
   pay.updated_at = iso();
   if (next === "paying") {
-    pushEvent({ purchase_id: id, contract_id, event_type: "validation_completed", message: "Checkout rechecked: unchanged since approval", data: { kind: "checkout_revalidated" } });
+    pay.credential_released = true;
+    pay.last4 = funding?.card_last4 ?? "4242";
+    if (funding) Object.assign(funding, { state: "released", card_stored: false, released_purchase_id: id });
+    pushEvent({ purchase_id: id, contract_id, event_type: "validation_completed", message: "Checkout rechecked before release: unchanged", data: { kind: "checkout_revalidated" } });
+    pushEvent({ purchase_id: id, contract_id, event_type: "credential_created", message: `Card ending ${pay.last4} released once to the agent; stored copy wiped`, data: { kind: "credential_released" } });
   }
   if (next === "paid") {
-    pay.last4 = "4242";
     pushEvent({ purchase_id: id, contract_id, event_type: "credential_used", message: `Paid $${total.toFixed(2)} with the single-use card`, data: { kind: "payment_submitted" } });
   }
   if (next === "completed") {
     pay.order_id = `order_${newId("demo").slice(5, 11)}`;
+    if (funding) funding.state = "used";
     Object.assign(d.purchase, { status: "completed", charged_amount: total, completed_at: iso() });
     d.summary = `Completed: charged $${total.toFixed(2)} at ${d.purchase.merchant_name}.`;
     pushEvent({ purchase_id: id, contract_id, event_type: "payment_completed", message: "Merchant order verified against the receipt", data: { kind: "receipt_verified" } });
   }
-  fixtures.syncDetail(d);
+}
+
+/** Only ever open a real web page in a new tab; the URL comes from Link via the backend. */
+function openExternal(url: string | null | undefined, what: string) {
+  if (!url || !/^https?:\/\//i.test(url)) throw new ApiError(`Link hasn't provided ${what} yet. Try again in a moment.`, 0, "approval_url_missing");
+  const tab = window.open(url, "_blank");
+  if (!tab) throw new ApiError(`Your browser blocked the Link tab. Allow pop-ups for this site, or open ${url}`, 0, "popup_blocked");
+  tab.opener = null;
 }
 
 // ---------- Auth ----------
@@ -141,7 +168,7 @@ export function getHealth(): Promise<Health> {
   return healthPromise;
 }
 
-/** The cached health, if already fetched. Lets approvePurchase open Link's tab synchronously (see below). */
+/** The cached health, if already fetched. Lets approveFunding open Link's tab synchronously. */
 export function cachedHealth(): Health | null {
   return USE_MOCKS ? fixtures.health : healthValue;
 }
@@ -152,7 +179,7 @@ async function getSignedContract(id: string): Promise<ContractRecord> {
   const r = await http<ContractResponse>(`/contracts/${encodeURIComponent(id)}`);
   // GET /contracts/{id} also answers for draft ids, but without review_url/blocking_issues; /drafts has those.
   if (r.kind === "draft") return http<DraftRecord>(`/drafts/${encodeURIComponent(id)}`);
-  return { ...r.contract, verification: r.verification } satisfies SignedContract;
+  return { ...r.contract, verification: r.verification, funding: r.funding } satisfies SignedContract;
 }
 
 export async function listContracts(): Promise<ContractRecord[]> {
@@ -164,7 +191,7 @@ export async function listContracts(): Promise<ContractRecord[]> {
     return [...drafts.filter((d) => !d.signed_contract_id), ...signed];
   }
   await delay();
-  return clone([...store.drafts.filter((d) => !d.signed_contract_id), ...store.contracts.map((c) => ({ ...c, verification: mockVerification }))]);
+  return clone([...store.drafts.filter((d) => !d.signed_contract_id), ...store.contracts.map(signedWithExtras)]);
 }
 
 /** Draft ids go to GET /drafts/{id}; signed contracts come back with `.verification` attached. */
@@ -175,7 +202,7 @@ export async function getContract(id: string): Promise<ContractRecord> {
   await delay();
   const record = findRecord(id);
   if (!record) throw new ApiError(`No contract or draft with id '${id}'.`, 404, "contract_not_found");
-  return clone(record.status === "draft" ? record : { ...record, verification: mockVerification });
+  return clone(record.status === "draft" ? record : signedWithExtras(record as Contract));
 }
 
 /** Turns the user's words into a DRAFT. It has no authority until the user signs it. */
@@ -196,7 +223,11 @@ export async function compileDraft(intent: string): Promise<DraftRecord> {
   return clone(draft);
 }
 
-/** Signs a draft. Nothing is charged: payment happens per purchase, approved by the user in Link. */
+/**
+ * Signs a draft, which also starts FUNDING: the backend asks the user's Link account for one
+ * single-use test card for the all-in hard cap. In link_test mode this is refused with
+ * 409 link_not_connected until the user connects their own Link account.
+ */
 export async function signContract(draftId: string): Promise<Contract> {
   if (!USE_MOCKS) return post<Contract>(`/contracts/${encodeURIComponent(draftId)}/sign`, { draft_id: draftId });
   await delay(500);
@@ -215,11 +246,13 @@ export async function signContract(draftId: string): Promise<Contract> {
   // Signing a new version revokes the one it was edited from.
   if (draft.previous_contract_id) {
     const prev = store.contracts.find((c) => c.id === draft.previous_contract_id);
-    if (prev && prev.status === "active") prev.status = "revoked";
+    if (prev && prev.status === "active") { prev.status = "revoked"; cancelMockFunding(prev.id); }
   }
   draft.signed_contract_id = contract.id;
   store.contracts.unshift(contract);
+  store.fundings[contract.id] = fixtures.mockFunding(contract.id, contract.spend.hard_cap_all_in, "awaiting_approval");
   pushEvent({ purchase_id: null, contract_id: contract.id, event_type: "contract_signed", message: "Contract signed", data: {} });
+  pushEvent({ purchase_id: null, contract_id: contract.id, event_type: "contract_signed", message: "Asked the simulated provider for a single-use card for the all-in cap", data: { kind: "funding_requested" } });
   return clone(contract);
 }
 
@@ -229,8 +262,80 @@ export async function revokeContract(id: string): Promise<Contract> {
   const c = store.contracts.find((x) => x.id === id);
   if (!c) throw new ApiError(`No contract with id '${id}'.`, 404, "contract_not_found");
   c.status = "revoked";
+  cancelMockFunding(id);
   pushEvent({ purchase_id: null, contract_id: id, event_type: "contract_revoked", message: "Contract revoked", data: {} });
   return clone(c);
+}
+
+/** Revoking cancels a pending funding request and wipes a stored card. */
+function cancelMockFunding(contractId: string) {
+  const f = store.fundings[contractId];
+  if (f && (f.state === "awaiting_approval" || f.state === "funded")) Object.assign(f, { state: "canceled", card_stored: false });
+}
+
+// ---------- Contract funding (signing = funding) ----------
+
+/** GET /contracts/{id}/funding. The backend polls Link and stores the card once it's approved. */
+export async function getFunding(contractId: string): Promise<Funding> {
+  if (!USE_MOCKS) return http<Funding>(`/contracts/${encodeURIComponent(contractId)}/funding`);
+  await delay(150);
+  return clone(mockFundingOf(contractId));
+}
+
+/** POST /contracts/{id}/funding: fund again after a denied, expired, failed, or used card. */
+export async function restartFunding(contractId: string): Promise<Funding> {
+  if (!USE_MOCKS) return post<Funding>(`/contracts/${encodeURIComponent(contractId)}/funding`);
+  await delay(400);
+  const c = store.contracts.find((x) => x.id === contractId);
+  if (!c || c.status !== "active") throw new ApiError(`Only an active contract can be funded; this one is ${c?.status ?? "missing"}.`, 409, "contract_not_active");
+  store.fundings[contractId] = fixtures.mockFunding(contractId, c.spend.hard_cap_all_in, "awaiting_approval");
+  pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: "Asked the simulated provider for a single-use card for the all-in cap", data: { kind: "funding_requested" } });
+  return clone(store.fundings[contractId]);
+}
+
+/**
+ * The user's approval of the contract's funding card.
+ * - link_test: opens Link's approval page (funding.approval_url) in a new tab; polling getFunding picks it up.
+ * - stub: POST /contracts/{id}/funding/simulate-approval, "Simulated provider approval".
+ * The tab opens before any await when health is cached, so pop-up blockers allow it.
+ */
+export async function approveFunding(contractId: string, funding: Funding): Promise<Funding> {
+  const health = cachedHealth() ?? (await getHealth());
+  if (health.payment_mode === "link_test") { openExternal(funding.approval_url, "an approval page for this card"); return funding; }
+  if (!USE_MOCKS) return post<Funding>(`/contracts/${encodeURIComponent(contractId)}/funding/simulate-approval`);
+  await delay(400);
+  const f = store.fundings[contractId];
+  if (f?.state !== "awaiting_approval") throw new ApiError(`The funding is ${f?.state ?? "not_funded"}, not waiting for approval.`, 409, "funding_not_awaiting_approval");
+  Object.assign(f, { state: "funded", card_stored: true, card_last4: "4242", valid_until: new Date(Date.now() + 12 * 3_600_000).toISOString() });
+  pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: "Simulated provider approval: you approved the (simulated) funding.", data: { kind: "simulated_provider_approval" } });
+  pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: "Card ending 4242 stored encrypted on the contract, locked", data: { kind: "card_stored" } });
+  return clone(f);
+}
+
+// ---------- The user's own Stripe Link account ----------
+
+/** POST /link/connect: returns Link's login link and phrase right away (stub mode: simulated, connected). */
+export async function connectLink(): Promise<LinkLogin> {
+  if (!USE_MOCKS) return post<LinkLogin>("/link/connect");
+  await delay(300);
+  return { state: "connected", simulated: true, provider_label: "Simulated provider" };
+}
+
+export async function getLinkStatus(): Promise<LinkStatus> {
+  if (!USE_MOCKS) return http<LinkStatus>("/link/status");
+  await delay(100);
+  return { connected: true, simulated: true, provider_label: "Simulated provider", login: null };
+}
+
+export async function disconnectLink(): Promise<LinkStatus> {
+  if (!USE_MOCKS) return post<LinkStatus>("/link/disconnect");
+  await delay(200);
+  return { connected: true, simulated: true, provider_label: "Simulated provider", login: null };
+}
+
+/** Opens Link's login page for connecting the account (from POST /link/connect). Not a backend call. */
+export function openLinkLogin(login: LinkLogin) {
+  openExternal(login.verification_url, "a login link");
 }
 
 /** POST /contracts/{id}/amend → a new draft pointing at the signed contract, which stays in force until the draft is signed. */
@@ -276,7 +381,7 @@ export async function getPurchase(id: string): Promise<PurchaseDetail> {
   await delay();
   const p = mockPurchase(id);
   advanceMockPayment(p);
-  return clone(p);
+  return withFunding(p);
 }
 
 export async function refreshPayment(id: string): Promise<PurchaseDetail> {
@@ -284,56 +389,29 @@ export async function refreshPayment(id: string): Promise<PurchaseDetail> {
   await delay(150);
   const p = mockPurchase(id);
   advanceMockPayment(p);
-  return clone(p);
+  return withFunding(p);
 }
 
 export async function listPurchasesForContract(contractId: string): Promise<PurchaseDetail[]> {
   if (!USE_MOCKS) return http<PurchaseDetail[]>(`/contracts/${encodeURIComponent(contractId)}/purchases`);
   await delay(100);
-  return clone(store.purchases.filter((p) => p.purchase.contract_id === contractId));
+  return store.purchases.filter((p) => p.purchase.contract_id === contractId).map(withFunding);
 }
 
 export async function listPurchases(): Promise<PurchaseDetail[]> {
   if (!USE_MOCKS) return http<PurchaseDetail[]>("/purchases");
   await delay(100);
-  return clone(store.purchases);
+  return store.purchases.map(withFunding);
 }
 
-/**
- * The user's payment approval for a purchase that passed every check.
- * - link_test: opens Link's approval page in a new tab; polling picks up the result.
- * - stub: "Simulated provider approval", which stands in for Link's approval tap.
- * The tab is opened before any await when health is cached, so pop-up blockers allow it.
- */
-export async function approvePurchase(detail: PurchaseDetail): Promise<PurchaseDetail> {
-  const health = cachedHealth() ?? (await getHealth());
-  const id = detail.purchase.id;
-  if (health.payment_mode === "link_test") {
-    const url = detail.approval_url ?? detail.payment?.approval_url;
-    // Only ever open a real web page; the URL comes from the payment provider via the backend.
-    if (!url || !/^https?:\/\//i.test(url)) throw new ApiError("Link hasn't provided an approval page for this payment yet. Try again in a moment.", 0, "approval_url_missing");
-    const tab = window.open(url, "_blank");
-    if (!tab) throw new ApiError(`Your browser blocked the Link tab. Allow pop-ups for this site, or open ${url}`, 0, "popup_blocked");
-    tab.opener = null;
-    return detail;
-  }
-  if (!USE_MOCKS) return post<PurchaseDetail>(`/purchases/${encodeURIComponent(id)}/payment/simulate-approval`);
-  await delay(400);
-  const p = mockPurchase(id);
-  if (p.payment?.state !== "awaiting_approval") throw new ApiError(`The payment is ${p.payment?.state ?? "missing"}, not waiting for approval.`, 409, "payment_not_awaiting_approval");
-  p.payment.state = "approved";
-  pushEvent({ purchase_id: id, contract_id: p.purchase.contract_id, event_type: "purchase_authorized", message: "Simulated provider approval: you approved the (simulated) payment.", data: { kind: "simulated_provider_approval" } });
-  return clone(fixtures.syncDetail(p));
-}
-
-/** "Not this one": POST /purchases/{id}/reject declines an authorized purchase whose payment hasn't started. */
+/** "Not this one": POST /purchases/{id}/reject declines an authorized purchase whose card hasn't been released. The card stays locked on the contract. */
 export async function declinePurchase(id: string): Promise<PurchaseDetail> {
   if (!USE_MOCKS) return post<PurchaseDetail>(`/purchases/${encodeURIComponent(id)}/reject`, {});
   await delay(400);
   const p = mockPurchase(id);
   const pay = p.payment;
-  if (p.purchase.status !== "authorized" || (pay && !["awaiting_approval", "approved", "credential_ready"].includes(pay.state))) {
-    throw new ApiError("The payment is already under way and can no longer be declined.", 409, "payment_already_started");
+  if (p.purchase.status !== "authorized" || (pay && (pay.state !== "credential_ready" || pay.credential_released))) {
+    throw new ApiError("The card was already released for this purchase; it can no longer be declined.", 409, "payment_already_started");
   }
   if (pay) pay.state = "denied";
   Object.assign(p.purchase, { status: "blocked", error: "Declined by the user before payment.", completed_at: iso() });
@@ -341,14 +419,14 @@ export async function declinePurchase(id: string): Promise<PurchaseDetail> {
   // Declining frees the single-use contract so the agent can keep looking.
   const c = store.contracts.find((x) => x.id === p.purchase.contract_id);
   if (c?.status === "used") c.status = "active";
-  pushEvent({ purchase_id: id, contract_id: p.purchase.contract_id, event_type: "purchase_blocked", message: "You declined this purchase before payment. The agent can keep looking under the same contract.", data: { kind: "purchase_declined", human_rejection: true } });
-  return clone(fixtures.syncDetail(p));
+  pushEvent({ purchase_id: id, contract_id: p.purchase.contract_id, event_type: "purchase_blocked", message: "You declined this purchase before payment. The card stays locked on the contract; the agent can keep looking.", data: { kind: "purchase_declined", human_rejection: true } });
+  return withFunding(p);
 }
 
 /**
  * Step 1 of an escalation: accept (approve) or reject the checks Handshake couldn't verify.
- * Approving never turns UNVERIFIABLE into PASS, and never overrides a FAIL. Afterwards the
- * payment still needs the user's own approval in Link (step 2).
+ * Approving never turns UNVERIFIABLE into PASS, and never overrides a FAIL. Because funding
+ * happened at signing, accepting unlocks the contract's stored card for this checkout (step 2).
  */
 export async function resolveEscalation(id: string, action: "approve" | "reject", note?: string): Promise<PurchaseDetail> {
   if (!USE_MOCKS) return post<PurchaseDetail>(`/purchases/${encodeURIComponent(id)}/${action}`, note ? { note } : {});
@@ -359,18 +437,19 @@ export async function resolveEscalation(id: string, action: "approve" | "reject"
   const accepted = p.decision?.results.filter((r) => r.verdict === "unverifiable" && r.severity !== "soft").map((r) => r.constraint) ?? [];
   p.resolution = { action, resolved_at: iso(), accepted_constraints: action === "approve" ? accepted : [], note: note ?? null };
   if (action === "approve") {
+    if (mockFundingOf(contractId).state !== "funded") throw new ApiError("This contract has no funded card. Fund it, then try again.", 409, "contract_not_funded");
     const total = p.proposal?.total ?? 0;
     Object.assign(p.purchase, { status: "authorized", authorized_amount: total });
     const c = store.contracts.find((x) => x.id === contractId);
     if (c?.single_use) c.status = "used";
-    p.payment = fixtures.mockPayment(total, "awaiting_approval", { updated_at: iso() });
-    pushEvent({ purchase_id: id, contract_id: contractId, event_type: "purchase_authorized", message: "You accepted the exception. The payment still needs your approval.", data: { human_approval: true, accepted_constraints: accepted } });
-    pushEvent({ purchase_id: id, contract_id: contractId, event_type: "purchase_authorized", message: "Payment requested from the simulated provider", data: { kind: "payment_requested" } });
+    p.payment = fixtures.mockPayment(total, "credential_ready", { updated_at: iso() });
+    pushEvent({ purchase_id: id, contract_id: contractId, event_type: "purchase_authorized", message: "You accepted the exception for this checkout.", data: { human_approval: true, accepted_constraints: accepted } });
+    pushEvent({ purchase_id: id, contract_id: contractId, event_type: "purchase_authorized", message: "The contract's card is unlocked for this checkout only", data: { kind: "credential_ready" } });
   } else {
     Object.assign(p.purchase, { status: "blocked", error: "Rejected by the user after escalation.", completed_at: iso() });
     pushEvent({ purchase_id: id, contract_id: contractId, event_type: "purchase_blocked", message: "User rejected the escalated purchase.", data: { human_rejection: true } });
   }
-  return clone(fixtures.syncDetail(p));
+  return withFunding(p);
 }
 
 // ---------- Evidence ----------
@@ -383,7 +462,10 @@ export async function getEvidenceBundle(purchaseId: string): Promise<EvidenceBun
   return clone({
     purchase: p.purchase, status: p.purchase.status, summary: p.summary, contract: contract ?? {},
     contract_verification: mockVerification, proposal: p.proposal, proposal_raw_payload: null, decision: p.decision,
-    credential: p.credential, ledger_intact: true, events: store.evidence[purchaseId] ?? [],
+    credential: p.credential, ledger_intact: true,
+    // Like the backend, the story includes the contract's signing and funding events.
+    events: [...(store.evidence[`contract:${p.purchase.contract_id}`] ?? []), ...(store.evidence[purchaseId] ?? [])]
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp)),
   });
 }
 

@@ -1,11 +1,11 @@
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-import type { ContractRecord, PurchaseDetail } from "@/lib/types";
+import type { ContractRecord } from "@/lib/types";
 import { isDraft, money, relativeExpiry } from "@/lib/format";
-import { rejectionReason, type DisplayStatus } from "@/lib/status";
+import { FUNDING_STATE_LABELS, fundingOf, rejectionReason, type DisplayStatus } from "@/lib/status";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "./tags";
-import { Ban, Check, Clock, GitBranch, Sparkles } from "lucide-react";
+import { Ban, Check, Clock, CreditCard, GitBranch, Sparkles } from "lucide-react";
 
 function inferredCount(c: ContractRecord) {
   return c.constraints.filter((k) => k.source !== "user").length
@@ -13,16 +13,16 @@ function inferredCount(c: ContractRecord) {
     + (c.delivery && c.delivery.max_shipping_source !== "user" ? 1 : 0);
 }
 
-export function ContractCard({ contract: c, status, pending, onApprove, approving, approveLabel = "Approve in Link" }: {
+export function ContractCard({ contract: c, status, onApproveFunding, approving, approveLabel = "Approve funding in Link" }: {
   contract: ContractRecord;
+  /** "pending" = signed, with its funding card waiting for the user's approval. */
   status: DisplayStatus;
-  /** The purchase whose payment is waiting for the user's approval, when status is "pending". */
-  pending?: PurchaseDetail;
-  onApprove?: (p: PurchaseDetail) => void;
+  onApproveFunding?: (c: ContractRecord) => void;
   approving?: boolean;
-  /** "Approve in Link", or "Simulated provider approval" when the backend runs the stub provider. */
+  /** "Approve funding in Link", or "Simulated provider approval" when the backend runs the stub provider. */
   approveLabel?: string;
 }) {
+  const funding = fundingOf(c);
   const rejected = status === "rejected";
   const draft = isDraft(c);
   const reason = rejectionReason(c);
@@ -50,23 +50,24 @@ export function ContractCard({ contract: c, status, pending, onApprove, approvin
         <span className="mr-1 text-lg font-normal text-muted-foreground">≤</span>{money(c.spend.hard_cap_all_in, c.spend.currency)}
       </p>
 
-      {pending?.proposal ? (
+      {status === "pending" ? (
         <div className="mt-auto space-y-3">
           <div className="rounded-lg bg-muted/60 p-3 text-sm">
-            <p className="text-xs text-muted-foreground">Handshake found</p>
-            <p className="font-medium">{pending.proposal.line_items[0].name}</p>
-            <p className="text-muted-foreground">{pending.proposal.merchant.name} · <span className="font-semibold text-foreground tabular-nums">{money(pending.proposal.total)}</span></p>
+            <p className="font-medium">Approve funding in Link</p>
+            <p className="text-muted-foreground">Signed. Approve the single-use card for up to {money(c.spend.hard_cap_all_in, c.spend.currency)} so your agent can buy.</p>
           </div>
-          <Button className="relative z-10 w-full bg-brand text-brand-foreground hover:bg-brand/90" size="lg" disabled={approving} onClick={() => onApprove?.(pending)}>
-            <Check />{approving ? "Approving…" : `${approveLabel} · ${money(pending.proposal.total)}`}
+          <Button className="relative z-10 w-full bg-brand text-brand-foreground hover:bg-brand/90" size="lg" disabled={approving} onClick={() => onApproveFunding?.(c)}>
+            <Check />{approving ? "Approving…" : approveLabel}
           </Button>
-          <p className="text-center text-xs text-muted-foreground">
-            Every check passed · nothing is paid until you approve{pending.payment ? ` · ${pending.payment.provider_label}` : ""}
-          </p>
         </div>
       ) : (
         <div className="mt-auto space-y-1.5 text-sm text-muted-foreground">
           {!rejected && c.status !== "used" && <p>{relativeExpiry(c.expires_at)}</p>}
+          {funding && !rejected && (
+            <p className="flex items-center gap-1.5 text-foreground">
+              <CreditCard className="size-3.5" />{funding.card_last4 && funding.state === "funded" ? `Card ending ${funding.card_last4} · locked` : FUNDING_STATE_LABELS[funding.state]}
+            </p>
+          )}
           <p>{c.single_use ? "Single use" : "Reusable"} · {c.constraints.filter((k) => k.severity === "hard").length} hard rules</p>
           {draft && (
             <p className="flex items-center gap-1 font-medium text-warn"><Sparkles className="size-3.5" />Review {inferredCount(c)} inferred values, then sign</p>

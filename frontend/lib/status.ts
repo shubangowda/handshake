@@ -1,22 +1,25 @@
-// Dashboard grouping and plain-English payment wording. Frontend-only: the backend keeps its own statuses.
-import type { ContractRecord, PaymentState, PurchaseDetail } from "./types";
+// Dashboard grouping and plain-English payment and funding wording. Frontend-only: the backend keeps its own statuses.
+import type { ContractRecord, Funding, FundingState, PaymentState, PurchaseDetail, SignedContract } from "./types";
 import { formatDate } from "./format";
 
 export type DisplayStatus = "active" | "pending" | "draft" | "used" | "rejected";
 
-/**
- * The purchase that passed Handshake and is waiting for the user's payment approval in Link, if any.
- * Based on payment_state, not contract status: the backend marks a single-use contract "used"
- * while an authorized purchase holds it (and frees it again if that purchase is declined).
- */
-export function pendingPurchase(c: ContractRecord, purchases: PurchaseDetail[]): PurchaseDetail | undefined {
-  if (c.status === "draft" || c.status === "revoked" || c.status === "expired") return undefined;
-  return purchases.find((p) => p.purchase.contract_id === c.id && p.payment_state === "awaiting_approval");
+/** A signed contract's funding, when api.ts attached it (it always does for GET /contracts/{id}). */
+export function fundingOf(c: ContractRecord): Funding | undefined {
+  return c.status === "draft" ? undefined : (c as SignedContract).funding;
 }
 
-export function displayStatus(c: ContractRecord, purchases: PurchaseDetail[]): DisplayStatus {
+/**
+ * "Pending" = signed, but its funding card is waiting for the user's approval in Link
+ * ("Approve funding in Link"). Signing is funding, so this is the one step left for the user.
+ */
+export function awaitingFunding(c: ContractRecord): boolean {
+  return c.status === "active" && fundingOf(c)?.state === "awaiting_approval";
+}
+
+export function displayStatus(c: ContractRecord): DisplayStatus {
   if (c.status === "revoked" || c.status === "expired") return "rejected";
-  if (pendingPurchase(c, purchases)) return "pending";
+  if (awaitingFunding(c)) return "pending";
   return c.status;
 }
 
@@ -36,24 +39,19 @@ export function isTerminal(d: PurchaseDetail): boolean {
   return d.payment_state != null && TERMINAL_PAYMENT_STATES.includes(d.payment_state);
 }
 
-/** Payment hasn't started (no card released, nothing submitted), so "Not this one" can still decline it. */
+/** The card hasn't been released yet, so "Not this one" can still decline (the card stays locked on the contract). */
 export function canDecline(d: PurchaseDetail): boolean {
-  if (d.status !== "authorized" || !d.payment) return false;
-  const s = d.payment.state;
-  return s === "awaiting_approval" || s === "approved" || (s === "credential_ready" && !d.payment.credential_released);
+  return d.status === "authorized" && d.payment?.state === "credential_ready" && !d.payment.credential_released;
 }
 
 export const PAYMENT_STATE_LABELS: Record<PaymentState, string> = {
-  awaiting_approval: "Awaiting your Link approval",
-  approved: "Approved in Link",
-  revalidating: "Rechecking checkout",
-  credential_ready: "Card ready",
-  paying: "Paying",
+  credential_ready: "Card unlocked for this checkout",
+  paying: "Card released to agent",
   paid: "Paid",
   completed: "Completed",
-  denied: "You declined in Link",
-  expired: "Approval expired",
-  checkout_changed: "The checkout changed after approval; nothing was paid",
+  denied: "Declined",
+  expired: "Authorization expired",
+  checkout_changed: "The checkout changed; the card stayed locked",
   failed: "Payment failed",
   unknown: "Checking with the merchant",
 };
@@ -62,7 +60,21 @@ export const PAYMENT_STATE_LABELS: Record<PaymentState, string> = {
 export function paymentLabel(d: PurchaseDetail): string | null {
   const s = d.payment_state;
   if (!s) return null;
-  if (s === "credential_ready" && d.payment?.credential_released) return "Card released to agent";
   if (s === "denied" && d.resolution?.action === "decline") return "Declined by you";
   return PAYMENT_STATE_LABELS[s];
 }
+
+export const FUNDING_STATE_LABELS: Record<FundingState, string> = {
+  not_funded: "Not funded",
+  awaiting_approval: "Waiting for your approval in Link",
+  funded: "Funded · card stored, locked",
+  released: "Card released for a purchase",
+  used: "Card used",
+  denied: "You declined the card in Link",
+  expired: "Funded card expired",
+  failed: "Funding failed",
+  canceled: "Funding canceled",
+};
+
+/** States from which the user can ask for a fresh card (POST /contracts/{id}/funding). */
+export const FUND_AGAIN_STATES: FundingState[] = ["not_funded", "denied", "expired", "failed", "used"];

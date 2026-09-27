@@ -1,7 +1,7 @@
 // Demo fixtures for NEXT_PUBLIC_USE_MOCKS=true. Shapes match docs/API.md so UI work runs with no backend.
 // Times are relative to page load so "expires tomorrow" stays true.
 import type {
-  Constraint, Contract, DraftRecord, EvidenceEvent, Health, NextAction, PaymentInfo, PaymentState,
+  Constraint, Contract, DraftRecord, EvidenceEvent, Funding, FundingState, Health, NextAction, PaymentInfo, PaymentState,
   Purchase, PurchaseDetail, TransactionProposal, ValidationDecision,
 } from "./types";
 
@@ -21,7 +21,7 @@ function nextMonday(): string {
 /** What GET /health would say. The header shows "Mock data" instead of the payment label in mock mode. */
 export const health: Health = {
   status: "ok", database: "mock", payment_mode: "stub", payment_label: "Simulated provider",
-  credential_mode: "handshake_pays", compiler_mode: "fixture",
+  credential_mode: "agent_visible", compiler_mode: "fixture",
 };
 
 /** The one request the offline (fixture) compiler understands, same as the backend's. */
@@ -107,8 +107,14 @@ export const contracts: Contract[] = [
   signed({ ...shoeBase, id: "contract_shoes_c", status: "active", goal: "Running shoes — backup pair",
     merchants: { ...shoeBase.merchants },
     created_at: at(-60 * MIN), signed_at: at(-58 * MIN), expires_at: at(DAY) }),
-  // "used" while its authorized purchase waits for payment approval: the backend reserves a
-  // single-use contract at authorization, and frees it again if the payment is declined.
+  // Signed but its funding card is still waiting for approval: the dashboard's "Pending" group.
+  signed({ ...shoeBase, id: "contract_shoes_d", status: "active", goal: "Running shoes — race-day pair",
+    created_at: at(-4 * MIN), signed_at: at(-3 * MIN), expires_at: at(DAY) }),
+  // Its funded card expired unused, so the contract page offers "Fund again".
+  signed({ ...shoeBase, id: "contract_shoes_e", status: "active", goal: "Running shoes — spare pair",
+    created_at: at(-DAY), signed_at: at(-DAY + MIN), expires_at: at(2 * DAY) }),
+  // "used" while its authorized purchase holds it: the backend reserves a single-use contract at
+  // authorization, and frees it again if that purchase is declined.
   signed({ ...shoeBase, id: "contract_trail", status: "used", goal: "Trail running shoes",
     spend: { ...shoeBase.spend, target: 130, hard_cap_all_in: 145, hard_cap_source: "user" },
     constraints: [
@@ -148,6 +154,33 @@ export const contracts: Contract[] = [
     created_at: at(-6 * DAY), signed_at: at(-6 * DAY + MIN), expires_at: at(-6 * DAY + 4 * HOUR),
   }),
 ];
+
+// ---------- Funding (signing = funding; one single-use card per contract) ----------
+
+/** A simulated-provider funding, as GET /contracts/{id}/funding returns it. */
+export function mockFunding(contractId: string, amount: number, state: FundingState, extra: Partial<Funding> = {}): Funding {
+  const stored = state === "funded";
+  return {
+    funding_id: `funding_${contractId.replace(/^contract_/, "")}`, state, provider: "stub", provider_label: "Simulated provider",
+    approval_url: `/contracts/${contractId}`, provider_reference: `spend_${contractId.replace(/^contract_/, "")}`,
+    amount, currency: "USD", merchant_name: "Amazon.com", card_stored: stored,
+    card_last4: state === "awaiting_approval" || state === "denied" ? null : "4242",
+    valid_until: stored || state === "released" ? at(12 * HOUR) : null, released_purchase_id: null, last_error: null,
+    ...extra,
+  };
+}
+
+export const fundings: Record<string, Funding> = {
+  contract_shoes: mockFunding("contract_shoes", 135, "used", { released_purchase_id: "purchase_pass" }),
+  contract_shoes_b: mockFunding("contract_shoes_b", 135, "funded"),
+  contract_shoes_c: mockFunding("contract_shoes_c", 135, "funded"),
+  contract_shoes_d: mockFunding("contract_shoes_d", 135, "awaiting_approval"),
+  contract_shoes_e: mockFunding("contract_shoes_e", 135, "expired"),
+  contract_trail: mockFunding("contract_trail", 145, "funded"),
+  contract_headphones: mockFunding("contract_headphones", 320, "used"),
+  contract_tickets: mockFunding("contract_tickets", 400, "canceled", { card_last4: "4242" }),
+  contract_pizza: mockFunding("contract_pizza", 35, "expired"),
+};
 
 // ---------- Purchases ----------
 
@@ -246,6 +279,10 @@ export function mockPayment(amount: number, state: PaymentState, extra: Partial<
 }
 
 const TERMINAL_PAYMENT: PaymentState[] = ["completed", "denied", "expired", "checkout_changed", "failed"];
+const NEXT_FOR_PAYMENT: Partial<Record<PaymentState, NextAction>> = {
+  credential_ready: "get_payment_credential_and_pay", paying: "wait_for_merchant_order",
+  paid: "wait_for_order_verification", unknown: "wait_for_reconciliation",
+};
 
 /** Recomputes the derived PurchaseDetail keys the backend fills in, after a mock mutation. */
 export function syncDetail(d: PurchaseDetail): PurchaseDetail {
@@ -262,9 +299,7 @@ export function syncDetail(d: PurchaseDetail): PurchaseDetail {
     : p.status === "escalated" ? "wait_for_user_decision"
     : p.status === "blocked" || p.status === "failed" ? (pay === "expired" || pay === "checkout_changed" ? "request_purchase_again" : "blocked_no_action")
     : p.status !== "authorized" || !pay ? "wait"
-    : ({ awaiting_approval: "wait_for_user_link_approval", approved: "wait_for_revalidation", revalidating: "wait_for_revalidation",
-         credential_ready: "wait_for_payment", paying: "wait_for_merchant_order", paid: "wait_for_order_verification",
-         unknown: "wait_for_reconciliation" } as Partial<Record<PaymentState, NextAction>>)[pay] ?? (TERMINAL_PAYMENT.includes(pay) ? "blocked_no_action" : "wait");
+    : NEXT_FOR_PAYMENT[pay] ?? (TERMINAL_PAYMENT.includes(pay) ? "blocked_no_action" : "wait");
   d.next_action = next;
   return d;
 }
@@ -273,7 +308,8 @@ function detail(purchase: Purchase, prop: TransactionProposal, dec: ValidationDe
   return syncDetail({
     purchase_id: purchase.id, status: purchase.status, decision: dec, contract_id: purchase.contract_id,
     proposal_id: purchase.proposal_id, credential: null, summary, idempotent_replay: false,
-    purchase, proposal: prop, payment, payment_state: null, approval_url: null, resolution: null,
+    purchase, proposal: prop, payment, payment_state: null, funding: fundings[purchase.contract_id] ?? { state: "not_funded", card_stored: false },
+    approval_url: null, resolution: null,
     next_action: "wait", review_url: `/purchases/${purchase.id}`,
   });
 }
@@ -286,7 +322,7 @@ export const purchases: PurchaseDetail[] = [
     passProposal,
     decision("decision_pass", passProposal.id, "contract_shoes", common(passProposal)),
     "Completed: charged $128.39 at Nike.",
-    mockPayment(128.39, "completed", { last4: "4242", order_id: "order_demo_1042", updated_at: at(-4 * MIN) }),
+    mockPayment(128.39, "completed", { last4: "4242", order_id: "order_demo_1042", credential_released: true, updated_at: at(-4 * MIN) }),
   ),
   detail(
     { id: "purchase_pending", contract_id: "contract_trail", proposal_id: pendingProposal.id, decision_id: "decision_pending", credential_id: "cred_pending",
@@ -297,7 +333,7 @@ export const purchases: PurchaseDetail[] = [
       r.constraint === "hard_cap_all_in" ? { ...r, expected: "<= 145.00 USD", reason: "$132.18 is within the $145.00 all-in maximum.", verdict: "pass" as const }
       : r.field === "category" ? { ...r, expected: "Trail running shoes" } : r)),
     "Authorized $132.18 at HOKA. A single-use credential was issued.",
-    mockPayment(132.18, "awaiting_approval"),
+    mockPayment(132.18, "credential_ready"),
   ),
   detail(
     { id: "purchase_blocked", contract_id: "contract_shoes_b", proposal_id: blockedProposal.id, decision_id: "decision_blocked", credential_id: null,
@@ -326,22 +362,28 @@ export const purchases: PurchaseDetail[] = [
 type Story = "completed" | "awaiting_payment" | "fail" | "unverifiable";
 
 function events(purchaseId: string, contractId: string, story: Story, total: number, passed: number, of: number): EvidenceEvent[] {
+  let n = 0;
+  // Signing and funding events belong to the contract (purchase_id null), as the backend's evidence chain returns them.
   const e = (i: number, event_type: EvidenceEvent["event_type"], message: string, data: EvidenceEvent["data"] = {}): EvidenceEvent =>
-    ({ id: `event_${purchaseId}_${i}`, purchase_id: purchaseId, contract_id: contractId, event_type, timestamp: at(-20 * MIN + i * 45_000), message, data });
+    ({ id: `event_${purchaseId}_${n++}`, purchase_id: event_type === "contract_signed" ? null : purchaseId, contract_id: contractId,
+       event_type, timestamp: at(-20 * MIN + i * 45_000), message, data });
   const start = [
     e(0, "contract_signed", "Contract signed"),
-    e(1, "shopping_started", "Agent began shopping"),
+    e(1, "contract_signed", "Asked the simulated provider for a single-use card for the all-in cap", { kind: "funding_requested" }),
+    e(1, "contract_signed", "Simulated provider approval: you approved the (simulated) funding.", { kind: "simulated_provider_approval" }),
+    e(2, "contract_signed", "Card ending 4242 stored encrypted on the contract, locked", { kind: "card_stored" }),
+    e(2, "shopping_started", "Agent began shopping"),
     e(3, "proposal_created", `Handshake read the checkout · $${total.toFixed(2)}`),
     e(4, "validation_started", "Handshake checking contract"),
   ];
   const authorized = [
     e(5, "validation_completed", `${passed}/${of} constraints passed`),
     e(6, "purchase_authorized", `Purchase authorized for $${total.toFixed(2)}`),
-    e(7, "purchase_authorized", "Payment requested from the simulated provider", { kind: "payment_requested" }),
+    e(7, "purchase_authorized", "The contract's card is unlocked for this checkout only", { kind: "credential_ready" }),
   ];
   if (story === "completed") return [...start, ...authorized,
-    e(8, "purchase_authorized", "Simulated provider approval", { kind: "simulated_provider_approval" }),
-    e(9, "validation_completed", "Checkout rechecked: unchanged since approval", { kind: "checkout_revalidated" }),
+    e(8, "validation_completed", "Checkout rechecked before release: unchanged", { kind: "checkout_revalidated" }),
+    e(9, "credential_created", "Card ending 4242 released once to the agent; stored copy wiped", { kind: "credential_released" }),
     e(10, "credential_used", `Paid $${total.toFixed(2)} with the single-use card`, { kind: "payment_submitted" }),
     e(11, "payment_completed", "Merchant order verified against the receipt", { kind: "receipt_verified" }),
   ];

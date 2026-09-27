@@ -8,11 +8,12 @@ import { ContractCard } from "@/components/handshake/contract-card";
 import { useSession } from "@/components/handshake/user-menu";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { approvePurchase, compileDraft, getHealth, listContracts, listPurchases, USE_MOCKS } from "@/lib/api";
+import { LinkPanel, useLinkStatus } from "@/components/handshake/link-connect";
+import { approveFunding, compileDraft, getHealth, listContracts, USE_MOCKS } from "@/lib/api";
 import { DEMO_INTENT } from "@/lib/mock-data";
 import { toast } from "sonner";
-import { displayStatus, pendingPurchase, type DisplayStatus } from "@/lib/status";
-import type { ContractRecord, Health, PurchaseDetail } from "@/lib/types";
+import { displayStatus, fundingOf, type DisplayStatus } from "@/lib/status";
+import type { ContractRecord, Health } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { CircleCheck, OctagonX, CircleHelp, Hourglass, Sparkles } from "lucide-react";
 
@@ -20,11 +21,18 @@ type Tab = DisplayStatus | "all";
 const TABS: Tab[] = ["all", "pending", "active", "draft", "used", "rejected"];
 
 const DEMOS = [
-  { href: "/purchases/purchase_pending", icon: Hourglass, tone: "text-brand", title: "Waiting for payment approval", body: "HOKA · $132.18" },
+  { href: "/purchases/purchase_pending", icon: Hourglass, tone: "text-brand", title: "Card unlocked for checkout", body: "HOKA · $132.18" },
   { href: "/purchases/purchase_pass", icon: CircleCheck, tone: "text-pass", title: "Honest checkout", body: "Nike · $128.39" },
   { href: "/purchases/purchase_blocked", icon: OctagonX, tone: "text-fail", title: "Malicious merchant", body: "Hidden add-on · $149.72" },
   { href: "/purchases/purchase_escalated", icon: CircleHelp, tone: "text-warn", title: "Unknown seller", body: "SneakerDeals123 · $127.42" },
 ];
+
+/** Link test mode only: until the user's own Link account is connected, signing (= funding) is refused. */
+function LinkBanner() {
+  const { health, status } = useLinkStatus();
+  if (health?.payment_mode !== "link_test" || !status || status.connected) return null;
+  return <LinkPanel className="mt-6" />;
+}
 
 /** Compiles a request into a draft right here, so the demo works without an MCP agent. */
 function DescribeBox() {
@@ -60,32 +68,34 @@ function DescribeBox() {
 export default function ContractsPage() {
   const [contracts, setContracts] = useState<ContractRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [purchases, setPurchases] = useState<PurchaseDetail[]>([]);
   const [tab, setTab] = useState<Tab>("all");
   const [approving, setApproving] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const session = useSession();
 
   const load = useCallback(() => {
-    Promise.all([listContracts(), listPurchases()]).then(([c, p]) => { setContracts(c); setPurchases(p); }, (e: Error) => setError(e.message));
+    listContracts().then(setContracts, (e: Error) => setError(e.message));
     // Health decides the approve button (Link vs. simulated provider); it's cached after the first call.
     getHealth().then(setHealth, () => {});
   }, []);
   useEffect(load, [load]);
 
-  async function approve(p: PurchaseDetail) {
-    setApproving(p.purchase.id);
+  /** Pending card's button: the funding card's approval (Link tab, or the stub's simulated approval). */
+  async function approve(c: ContractRecord) {
+    const funding = fundingOf(c);
+    if (!funding) return;
+    setApproving(c.id);
     try {
-      await approvePurchase(p);
-      if (health?.payment_mode === "link_test") toast("Approve the payment in the Link tab", { description: "Open the purchase to watch it go through." });
-      else toast.success("Simulated provider approval sent", { description: "Handshake rechecks the checkout, then pays." });
+      await approveFunding(c.id, funding);
+      if (health?.payment_mode === "link_test") toast("Approve the card in the Link tab", { description: "The contract shows as funded once you do." });
+      else toast.success("Simulated provider approval sent", { description: "The card is stored, encrypted, locked until Handshake approves a checkout." });
       load();
     } catch (e) { toast.error((e as Error).message); } finally { setApproving(null); }
   }
 
-  const status = (c: ContractRecord) => displayStatus(c, purchases);
+  const status = (c: ContractRecord) => displayStatus(c);
   const count = (t: Tab) => contracts?.filter((c) => t === "all" || status(c) === t).length ?? 0;
-  // Needs-attention first: waiting for payment, drafts, active, then history.
+  // Needs-attention first: funding waiting for approval, drafts, active, then history.
   const rank: Record<DisplayStatus, number> = { pending: 0, draft: 1, active: 2, used: 3, rejected: 4 };
   const shown = (contracts ?? []).filter((c) => tab === "all" || status(c) === tab).sort((a, b) => rank[status(a)] - rank[status(b)]);
 
@@ -100,6 +110,7 @@ export default function ContractsPage() {
           </div>
         </div>
 
+        <LinkBanner />
         <DescribeBox />
 
         <div role="tablist" className="mt-6 flex gap-1 overflow-x-auto border-b">
@@ -116,8 +127,8 @@ export default function ContractsPage() {
 
         <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {!contracts && !error && Array.from({ length: 3 }, (_, i) => <div key={i} className="h-48 animate-pulse rounded-xl bg-muted" />)}
-          {shown.map((c) => <ContractCard key={c.id} contract={c} status={status(c)} pending={pendingPurchase(c, purchases)} onApprove={approve} approving={approving === pendingPurchase(c, purchases)?.purchase.id}
-            approveLabel={health?.payment_mode === "stub" ? "Simulated provider approval" : "Approve in Link"} />)}
+          {shown.map((c) => <ContractCard key={c.id} contract={c} status={status(c)} onApproveFunding={approve} approving={approving === c.id}
+            approveLabel={health?.payment_mode === "stub" ? "Simulated provider approval" : "Approve funding in Link"} />)}
           {contracts && !shown.length && <p className="col-span-full py-10 text-center text-sm text-muted-foreground">No {tab} contracts.</p>}
         </div>
 

@@ -5,13 +5,14 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { AppHeader } from "@/components/handshake/app-header";
+import { FundingSummary } from "@/components/handshake/funding";
 import { PaymentPanel } from "@/components/handshake/payment-status";
 import { Progression, PROGRESSION_STEPS, type Outcome } from "@/components/handshake/progression";
 import { Timeline } from "@/components/handshake/timeline";
 import { VerdictRows, showValue } from "@/components/handshake/verdict-rows";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { approvePurchase, declinePurchase, getContract, getEvidence, getHealth, getPurchase, resolveEscalation } from "@/lib/api";
+import { declinePurchase, getContract, getEvidence, getHealth, getPurchase, resolveEscalation } from "@/lib/api";
 import { formatTime, money } from "@/lib/format";
 import { isTerminal } from "@/lib/status";
 import type { ContractRecord, EvidenceEvent, Health, PurchaseDetail } from "@/lib/types";
@@ -107,12 +108,13 @@ function Blocked({ detail, cap }: { detail: PurchaseDetail; cap: number }) {
 }
 
 /**
- * An escalated purchase needs two separate consents: accepting the unverifiable checks here,
- * then approving the payment itself in Link. Neither one implies the other.
+ * An escalated purchase: the user accepts (or rejects) the checks Handshake couldn't verify. The
+ * contract was funded at signing, so accepting unlocks its stored card, released once to the agent
+ * for this checkout only.
  */
-function Escalated({ detail, health, cap, busy, onResolve, onApprovePayment, onDecline }: {
+function Escalated({ detail, health, cap, busy, onResolve, onDecline }: {
   detail: PurchaseDetail; health: Health | null; cap: number; busy: boolean;
-  onResolve: (a: "approve" | "reject") => void; onApprovePayment: () => void; onDecline: () => void;
+  onResolve: (a: "approve" | "reject") => void; onDecline: () => void;
 }) {
   const [confirm, setConfirm] = useState(false);
   const results = detail.decision?.results ?? [];
@@ -122,7 +124,7 @@ function Escalated({ detail, health, cap, busy, onResolve, onApprovePayment, onD
   const accepted = res?.action === "approve";
   const labelOf = (name: string) => results.find((r) => r.constraint === name)?.label ?? name;
   const title = deciding ? "HANDSHAKE NEEDS YOU" : accepted ? "EXCEPTION ACCEPTED" : res?.action === "reject" ? "REJECTED BY YOU" : "PURCHASE BLOCKED";
-  const subtitle = deciding ? "Everything else checked out, but some things couldn't be confirmed. Two separate approvals are needed before anything is paid."
+  const subtitle = deciding ? "Everything else checked out, but some things couldn't be confirmed. Nothing is paid unless you accept them."
     : accepted ? "You accepted what couldn't be verified. It stays marked unverified, not passed."
     : "Nothing was charged and no card was issued.";
   return (
@@ -137,7 +139,7 @@ function Escalated({ detail, health, cap, busy, onResolve, onApprovePayment, onD
       <div className="space-y-4 bg-card p-5">
         <ol className="grid gap-2 rounded-lg bg-muted p-3 text-sm sm:grid-cols-2">
           <li><span className="font-semibold">1. Accept the exception in Handshake.</span> You take responsibility for the checks Handshake couldn&apos;t verify.</li>
-          <li><span className="font-semibold">2. Then approve the payment in Link.</span> The payment provider asks you separately; nothing is paid without it.</li>
+          <li><span className="font-semibold">2. The contract&apos;s funded card is then released once to the agent for this checkout.</span> It stays locked until you accept.</li>
         </ol>
 
         <section className="space-y-3 rounded-xl border p-4">
@@ -178,10 +180,10 @@ function Escalated({ detail, health, cap, busy, onResolve, onApprovePayment, onD
         </section>
 
         <section className={cn("space-y-3 rounded-xl border p-4", !accepted && "opacity-60")}>
-          <h3 className="flex items-center gap-2 font-semibold"><span className="grid size-5 place-items-center rounded-full bg-muted-foreground/60 text-xs text-white">2</span>Then approve the payment in Link</h3>
+          <h3 className="flex items-center gap-2 font-semibold"><span className="grid size-5 place-items-center rounded-full bg-muted-foreground/60 text-xs text-white">2</span>The contract&apos;s funded card is then released once to the agent for this checkout</h3>
           {accepted
-            ? <PaymentPanel detail={detail} health={health} cap={cap} busy={busy} onApprove={onApprovePayment} onDecline={onDecline} />
-            : <p className="text-sm text-muted-foreground">{deciding ? "Available after you accept the exception." : "Not needed: nothing will be paid."}</p>}
+            ? <PaymentPanel detail={detail} health={health} cap={cap} busy={busy} onDecline={onDecline} />
+            : <p className="text-sm text-muted-foreground">{deciding ? "The card stays locked until you accept the exception." : "Not needed: the card stays locked and nothing will be paid."}</p>}
         </section>
       </div>
       <Dialog open={confirm} onOpenChange={setConfirm}>
@@ -190,7 +192,7 @@ function Escalated({ detail, health, cap, busy, onResolve, onApprovePayment, onD
             <DialogTitle className="flex items-center gap-2"><ShieldAlert className="size-5 text-warn" />Accept an unverified purchase?</DialogTitle>
             <DialogDescription>
               Handshake still can&apos;t verify {unknown.map((u) => u.label.toLowerCase()).join(", ") || "some checks"}. Accepting records this as <b>your exception</b>. It is not marked as passed.
-              {detail.proposal && <> Next, you approve the {money(detail.proposal.total, detail.proposal.currency)} payment to {detail.proposal.merchant.name} in Link.</>}
+              {detail.proposal && <> The contract&apos;s funded card is then unlocked for this checkout, and your agent can use it once to pay {money(detail.proposal.total, detail.proposal.currency)} to {detail.proposal.merchant.name}.</>}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -279,17 +281,7 @@ export default function PurchasePage() {
     setBusy(true);
     try {
       await refreshAfter(await resolveEscalation(id, action));
-      toast(action === "approve" ? "Exception accepted" : "Purchase rejected", action === "approve" ? { description: "Next: approve the payment in Link." } : undefined);
-    } catch (e) { toast.error((e as Error).message); } finally { setBusy(false); }
-  }
-
-  async function approvePayment() {
-    setBusy(true);
-    try {
-      // Called straight from the click so Link's tab isn't treated as a pop-up.
-      const d = await approvePurchase(detail!);
-      await refreshAfter(d);
-      toast(health?.payment_mode === "link_test" ? "Approve the payment in the Link tab" : "Simulated provider approval sent", { description: "This page updates on its own." });
+      toast(action === "approve" ? "Exception accepted" : "Purchase rejected", action === "approve" ? { description: "The contract's card is unlocked for this checkout." } : undefined);
     } catch (e) { toast.error((e as Error).message); } finally { setBusy(false); }
   }
 
@@ -297,7 +289,7 @@ export default function PurchasePage() {
     setBusy(true);
     try {
       await refreshAfter(await declinePurchase(id));
-      toast("Declined", { description: "Nothing was charged. The agent can keep looking." });
+      toast("Declined", { description: "Nothing was charged. The card stays locked on the contract." });
     } catch (e) { toast.error((e as Error).message); } finally { setBusy(false); }
   }
 
@@ -311,7 +303,9 @@ export default function PurchasePage() {
   const passed = decision?.results.filter((r) => r.verdict === "pass").length ?? 0;
   const total = decision?.results.length ?? 0;
   const checking = detail.status === "pending" || detail.status === "validating";
-  const escalation = detail.status === "escalated" || detail.resolution?.action === "approve" || detail.resolution?.action === "reject" || decision?.verdict === "unverifiable";
+  // A decline (even after an accepted exception) is the latest decision, so the payment panel tells that story.
+  const declined = detail.resolution?.action === "decline";
+  const escalation = !declined && (detail.status === "escalated" || detail.resolution?.action === "approve" || detail.resolution?.action === "reject" || decision?.verdict === "unverifiable");
   const paymentView = !escalation && (detail.payment != null || detail.status === "authorized" || detail.status === "completed");
 
   return (
@@ -339,10 +333,12 @@ export default function PurchasePage() {
         {done && !checking && (
           <>
             {escalation
-              ? <Escalated detail={detail} health={health} cap={cap} busy={busy} onResolve={resolve} onApprovePayment={approvePayment} onDecline={decline} />
+              ? <Escalated detail={detail} health={health} cap={cap} busy={busy} onResolve={resolve} onDecline={decline} />
               : paymentView
-                ? <PaymentPanel detail={detail} health={health} cap={cap} busy={busy} onApprove={approvePayment} onDecline={decline} />
+                ? <PaymentPanel detail={detail} health={health} cap={cap} busy={busy} onDecline={decline} />
                 : <Blocked detail={detail} cap={cap} />}
+
+            {detail.funding && <FundingSummary funding={detail.funding} contractId={contract.id} />}
 
             {decision && (
               <section className="animate-in fade-in duration-500">

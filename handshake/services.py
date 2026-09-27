@@ -1603,8 +1603,7 @@ def approve_purchase(session: Session, purchase_id: str, note: str | None = None
         session.rollback()
         raise
 
-    # Consent #1 (accepting the exception, here in Handshake) is done.
-    # Consent #2 is separate: the user still approves the payment in Link.
+    # The exception is accepted; the card funded at signing is now unlocked for this checkout.
     purchase = start_payment(session, purchase, contract, proposal)
     return {"purchase": purchase, "decision": decision, "credential": credential}
 
@@ -1614,8 +1613,8 @@ def reject_purchase(session: Session, purchase_id: str, note: str | None = None,
     A human says no. Two cases:
       - an ESCALATED purchase: it becomes BLOCKED and no credential is ever issued
       - an AUTHORIZED purchase whose payment has not started (no card released,
-        nothing submitted): the pending provider request is cancelled, the
-        purchase becomes BLOCKED ("declined"), and the contract is freed
+        nothing submitted): the purchase becomes BLOCKED ("declined"), the
+        contract is freed, and its card stays stored for the agent's next try
     """
     current = get_owned_purchase(session, purchase_id, owner)
     if current.status == PurchaseStatus.AUTHORIZED:
@@ -2509,21 +2508,26 @@ def payment_for_api(row: db.PaymentRow | None) -> dict[str, Any] | None:
 
 
 def resolution_from_evidence(session: Session, purchase_id: str) -> dict[str, Any] | None:
-    """Whether (and how) a human decided an escalation or declined, read from the evidence we already record."""
-    for row in reversed(db.list_evidence_for_purchase(session, purchase_id)):
+    """
+    Whether (and how) a human decided an escalation or declined, read from the evidence we already record.
+    A decline after an accepted exception keeps the constraints that were accepted, so the UI can show both.
+    """
+    rows = db.list_evidence_for_purchase(session, purchase_id)
+    accepted = next(
+        ([c.get("constraint") for c in row.data.get("data", {}).get("accepted_constraints", [])]
+         for row in reversed(rows) if row.data.get("data", {}).get("human_approval")),
+        [],
+    )
+    for row in reversed(rows):
         data = row.data.get("data", {})
         if data.get("human_approval"):
-            return {
-                "action": "approve",
-                "resolved_at": row.data.get("timestamp"),
-                "accepted_constraints": [c.get("constraint") for c in data.get("accepted_constraints", [])],
-                "note": data.get("note"),
-            }
+            return {"action": "approve", "resolved_at": row.data.get("timestamp"), "accepted_constraints": accepted, "note": data.get("note")}
         if data.get("human_rejection"):
+            declined = data.get("kind") == "purchase_declined"
             return {
-                "action": "reject" if data.get("kind") != "purchase_declined" else "decline",
+                "action": "decline" if declined else "reject",
                 "resolved_at": row.data.get("timestamp"),
-                "accepted_constraints": [],
+                "accepted_constraints": accepted if declined else [],
                 "note": data.get("note"),
             }
     return None

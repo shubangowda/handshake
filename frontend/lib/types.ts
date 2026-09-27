@@ -304,11 +304,13 @@ export interface CompilerOutput {
 
 /** API-only: evidence `data`. `kind` is the precise subtype for steps models.py has no event_type for. */
 export type EvidenceKind =
-  | "payment_requested" | "payment_request_uncertain" | "simulated_provider_approval" | "payment_approved"
-  | "payment_denied" | "payment_expired" | "checkout_revalidated" | "checkout_changed"
-  | "credential_ready" | "credential_released" | "payment_submitted" | "payment_outcome_unknown"
-  | "receipt_verified" | "receipt_mismatch" | "purchase_declined" | "contract_amended"
-  | "draft_edited" | "agent_action_denied" | "extraction_failed";
+  | "funding_requested" | "simulated_provider_approval" | "card_stored" | "funding_denied" | "funding_expired"
+  | "funding_failed" | "funding_unavailable" | "card_unavailable" | "authorization_expired"
+  | "checkout_revalidated" | "checkout_changed" | "credential_ready" | "credential_released"
+  | "payment_submitted" | "payment_outcome_unknown" | "payment_request_uncertain" | "payment_request_failed"
+  | "payment_not_made" | "order_not_verified" | "order_mismatch" | "contract_tampered" | "contract_no_longer_valid"
+  | "credential_retrieval_failed" | "payment_refused" | "receipt_verified" | "receipt_mismatch"
+  | "purchase_declined" | "contract_amended" | "draft_edited" | "agent_action_denied" | "extraction_failed";
 
 export interface EvidenceData {
   // `string & {}` keeps autocomplete for known kinds while allowing new ones the backend adds later.
@@ -344,8 +346,36 @@ export interface ContractVerification {
   [key: string]: unknown;
 }
 
-/** A signed contract plus (API-only) its verification, which api.ts attaches from GET /contracts/{id}. */
-export type SignedContract = Contract & { verification?: ContractVerification | null };
+/** API-only: where a contract's funding card is. Signing = funding (see API.md "Payment model"). */
+export type FundingState =
+  | "not_funded" | "awaiting_approval" | "funded" | "released" | "used"
+  | "denied" | "expired" | "failed" | "canceled";
+
+/**
+ * API-only: a contract's funding. One single-use Link TEST card for the all-in hard cap, stored
+ * encrypted on the contract and released once, only for a checkout Handshake authorized.
+ * Never contains card data (at most card_last4). "not_funded" carries only state and card_stored.
+ */
+export interface Funding {
+  state: FundingState;
+  card_stored: boolean;
+  funding_id?: string;
+  provider?: "stub" | "link_test";
+  provider_label?: string;
+  /** Link's approval page, or (stub mode) the frontend contract page. */
+  approval_url?: string | null;
+  provider_reference?: string | null;
+  amount?: number;
+  currency?: string;
+  merchant_name?: string | null;
+  card_last4?: string | null;
+  valid_until?: string | null;
+  released_purchase_id?: string | null;
+  last_error?: string | null;
+}
+
+/** A signed contract plus (API-only) its verification and funding, which api.ts attaches from GET /contracts/{id}. */
+export type SignedContract = Contract & { verification?: ContractVerification | null; funding?: Funding };
 
 export type ContractRecord = SignedContract | DraftRecord;
 
@@ -359,17 +389,22 @@ export interface ContractListItem {
   signed_at: string | null;
   signed_contract_id: string | null;
   draft_id: string | null;
+  /** Contracts only. */
+  funding_state: FundingState | null;
 }
 
 /** API-only: GET /contracts/{id}. */
 export type ContractResponse =
-  | { kind: "contract"; id: string; status: ContractStatus; draft_id: string | null; contract: Contract; verification: ContractVerification }
+  | { kind: "contract"; id: string; status: ContractStatus; draft_id: string | null; contract: Contract; verification: ContractVerification; funding: Funding }
   | { kind: "draft"; id: string; status: "draft"; signed_contract_id: string | null; draft: ContractDraft; verification: null;
       assumptions: string[]; clarifications_needed: string[]; compiler_notes: string[] };
 
-/** API-only: the payment state machine. */
+/**
+ * API-only: a purchase's payment. Funding happened at signing, so an authorized checkout starts at
+ * credential_ready (the contract's card is unlocked for it); paying = the card was released.
+ */
 export type PaymentState =
-  | "awaiting_approval" | "approved" | "revalidating" | "credential_ready" | "paying" | "paid" | "completed"
+  | "credential_ready" | "paying" | "paid" | "completed"
   | "denied" | "expired" | "checkout_changed" | "failed" | "unknown";
 
 /** API-only: PurchaseDetail.payment. Never contains card data (at most last4). */
@@ -392,8 +427,7 @@ export interface PaymentInfo {
 
 /** API-only: the hint for what happens next. */
 export type NextAction =
-  | "wait_for_user_decision" | "wait_for_user_link_approval" | "wait_for_revalidation"
-  | "get_payment_credential_and_pay" | "wait_for_payment" | "wait_for_merchant_order"
+  | "wait_for_user_decision" | "get_payment_credential_and_pay" | "wait_for_payment" | "wait_for_merchant_order"
   | "wait_for_order_verification" | "wait_for_reconciliation" | "blocked_no_action"
   | "request_purchase_again" | "completed" | "wait";
 
@@ -432,6 +466,8 @@ export interface PurchaseDetail {
   proposal: TransactionProposal | null;
   payment: PaymentInfo | null;
   payment_state: PaymentState | null;
+  /** The contract's funding (card_last4, state). */
+  funding: Funding;
   approval_url: string | null;
   resolution: Resolution | null;
   next_action: NextAction;
@@ -459,7 +495,8 @@ export interface Health {
   database: string;
   payment_mode: "stub" | "link_test";
   payment_label: string;
-  credential_mode: string;
+  /** agent_visible: the agent collects the released card and pays. executor: Handshake pays at authorization. */
+  credential_mode: "agent_visible" | "executor";
   compiler_mode: "fixture" | "openai";
 }
 
@@ -472,6 +509,26 @@ export interface DemoLogin {
   /** Unix time in SECONDS (unlike the ISO strings elsewhere in the API). */
   expires_at: number;
   demo_auth: true;
+}
+
+/** API-only: an in-progress "connect your Link account" login (POST /link/connect, GET /link/status .login). */
+export interface LinkLogin {
+  state: "starting" | "pending" | "connected" | "failed" | "expired";
+  /** Open this and approve in the Link app. */
+  verification_url?: string | null;
+  /** Link shows the same phrase, so the user can check it's their login. */
+  phrase?: string | null;
+  error?: string | null;
+  provider_label: string;
+  simulated: boolean;
+}
+
+/** API-only: GET /link/status (and POST /link/disconnect). The Link access token is never returned. */
+export interface LinkStatus {
+  connected: boolean;
+  simulated: boolean;
+  provider_label: string;
+  login: LinkLogin | null;
 }
 
 /** API-only: GET /oauth/device?user_code= (the /connect approval screen). */

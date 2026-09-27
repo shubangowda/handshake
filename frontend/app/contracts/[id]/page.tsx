@@ -6,15 +6,16 @@ import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { AppHeader } from "@/components/handshake/app-header";
 import { SignDialog } from "@/components/handshake/sign-dialog";
+import { FundingCard } from "@/components/handshake/funding";
 import { ContractSheet, contractRows } from "@/components/handshake/contract-sheet";
 import { EditDraftDialog } from "@/components/handshake/edit-draft-dialog";
 import { StatusBadge, SourceTag, SeverityTag } from "@/components/handshake/tags";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { ApiError, amendContract, getContract, listPurchasesForContract, revokeContract, signContract, updateDraft } from "@/lib/api";
+import { ApiError, amendContract, getContract, getHealth, listPurchasesForContract, revokeContract, signContract, updateDraft } from "@/lib/api";
 import { FIELD_LABELS, describeConstraint, formatDate, formatTime, isDraft, money, relativeExpiry, shortId } from "@/lib/format";
 import { paymentLabel } from "@/lib/status";
-import type { ContractRecord, DraftPatch, PurchaseDetail, SignedContract } from "@/lib/types";
+import type { ContractRecord, DraftPatch, Health, PurchaseDetail, SignedContract } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { ArrowLeft, ArrowRight, GitBranch, OctagonX, PenLine, ShieldAlert, ShieldCheck, TriangleAlert } from "lucide-react";
 
@@ -141,10 +142,14 @@ export default function ContractPage() {
   const [busy, setBusy] = useState(false);
   // Blocking issues a sign attempt returned (409 draft_has_blocking_issues), until the draft reloads.
   const [signIssues, setSignIssues] = useState<string[] | null>(null);
+  // The last sign attempt returned 409 link_not_connected: show the Connect Stripe Link panel.
+  const [needsLink, setNeedsLink] = useState(false);
+  const [health, setHealth] = useState<Health | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const c = await getContract(id);
+      const [c, h] = await Promise.all([getContract(id), getHealth()]);
+      setHealth(h);
       // A signed draft lives on as a record; show the contract it became instead.
       if (isDraft(c) && c.signed_contract_id) { router.replace(`/contracts/${c.signed_contract_id}`); return; }
       setContract(c);
@@ -164,16 +169,18 @@ export default function ContractPage() {
   const signed = draft ? null : (contract as SignedContract);
   const blockingIssues = signIssues ?? draft?.blocking_issues ?? [];
 
-  /** Runs from the review dialog. Errors keep the dialog open; blocking issues are shown in it. */
+  /** Runs from the review dialog. Errors keep the dialog open; blocking issues and Link connect are shown in it. */
   async function sign() {
+    setNeedsLink(false);
     try {
       const c = await signContract(contract!.id);
       setConfirmSign(false);
-      toast.success("Contract signed", { description: `Your agent may now buy within these terms, up to ${money(c.spend.hard_cap_all_in)} all-in.` });
+      toast.success("Contract signed", { description: `Now approve the single-use card for up to ${money(c.spend.hard_cap_all_in)} to fund it.` });
       router.replace(`/contracts/${c.id}`);
     } catch (e) {
       const issues = e instanceof ApiError && e.code === "draft_has_blocking_issues" ? e.details.blocking_issues : null;
       if (Array.isArray(issues)) setSignIssues(issues.map(String));
+      else if (e instanceof ApiError && e.code === "link_not_connected") setNeedsLink(true);
       else toast.error((e as Error).message);
     }
   }
@@ -218,6 +225,11 @@ export default function ContractPage() {
           {draft && <BlockingIssues issues={blockingIssues} />}
           {draft && <InferredPanel contract={draft} />}
           {signed && <Verification contract={signed} />}
+          {signed && signed.funding && (
+            // Keyed so a reload (e.g. after revoke) resets the card's own polling state.
+            <FundingCard key={`${signed.status}:${signed.funding.funding_id ?? ""}:${signed.funding.state}`} contractId={signed.id}
+              active={signed.status === "active"} initial={signed.funding} health={health} />
+          )}
           <Legend />
           <ContractSheet contract={contract} />
 
@@ -260,11 +272,11 @@ export default function ContractPage() {
         <div className="fixed inset-x-0 bottom-0 z-20 border-t bg-background/95 backdrop-blur">
           <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3">
             <p className="text-sm text-muted-foreground">
-              Up to <span className="font-semibold text-foreground tabular-nums">{money(draft.spend.hard_cap_all_in)}</span> all-in · nothing is charged when you sign
+              Up to <span className="font-semibold text-foreground tabular-nums">{money(draft.spend.hard_cap_all_in)}</span> all-in · signing asks Link for a single-use card for this amount
             </p>
             <div className="flex gap-2">
               <Button variant="outline" size="lg" onClick={() => setEditing(true)}><PenLine />Edit contract</Button>
-              <Button size="lg" onClick={() => setConfirmSign(true)} className="bg-brand text-brand-foreground hover:bg-brand/90"><ShieldCheck />Review &amp; sign</Button>
+              <Button size="lg" onClick={() => setConfirmSign(true)} className="bg-brand text-brand-foreground hover:bg-brand/90"><ShieldCheck />Review, sign &amp; fund</Button>
             </div>
           </div>
         </div>
@@ -272,14 +284,15 @@ export default function ContractPage() {
 
       {draft && <EditDraftDialog key={draft.id + JSON.stringify(draft.spend)} draft={draft} open={editing} onOpenChange={setEditing} onSave={save} />}
 
-      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} open={confirmSign} onOpenChange={setConfirmSign} onSign={sign} />}
+      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} needsLink={needsLink} onLinkConnected={() => setNeedsLink(false)}
+        open={confirmSign} onOpenChange={setConfirmSign} onSign={sign} />}
 
       <Dialog open={confirmRevoke} onOpenChange={setConfirmRevoke}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Revoke this contract?</DialogTitle>
             <DialogDescription>
-              Your agent immediately loses permission to buy {contract.goal.toLowerCase()}. Any payment still waiting for your approval is cancelled. This can&apos;t be undone.
+              Your agent immediately loses permission to buy {contract.goal.toLowerCase()}. Its funding is canceled and any stored card is wiped. This can&apos;t be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
