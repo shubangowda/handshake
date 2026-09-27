@@ -1,6 +1,6 @@
 # Decisions
 
-This file explains why the integrated Handshake works the way it does. Most entries resolve a conflict between the teammates' specs; some record a fact verified against a real tool. Section numbers refer to `HANDSHAKE_BUILD.md`.
+This file explains why the integrated Handshake works the way it does. Most entries resolve a conflict between the teammates' specs; some record a fact verified against a real tool. Section numbers refer to `docs/original/HANDSHAKE_BUILD.md`.
 
 ## Owner decisions after the integration (these override parts of the build spec)
 

@@ -1,5 +1,5 @@
 """
-test_auth.py: roles, ownership, and tokens (HANDSHAKE_BUILD.md section 8).
+test_auth.py: roles, ownership, and tokens (docs/original/HANDSHAKE_BUILD.md section 8).
 
 The rule under test: the agent proposes, the USER decides. The agent may read
 its owner's records and request purchases, but it can never sign, patch,

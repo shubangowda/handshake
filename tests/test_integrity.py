@@ -3,7 +3,7 @@ test_integrity.py: repository-wide guarantees that are not about any one feature
 
 1. models.py is the team's shared standard. There must be exactly one copy,
    and it must stay byte-identical to the canonical text in Appendix A of
-   HANDSHAKE_BUILD.md. The SHA-256 below was computed from Appendix A at the
+   docs/original/HANDSHAKE_BUILD.md. The SHA-256 below was computed from Appendix A at the
    start of the integration and confirmed against the backend's copy.
 """
 

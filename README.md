@@ -76,6 +76,7 @@ Tools: `connect_handshake`, `create_contract_draft`, `get_contract`, `list_contr
 
 ## Docs
 
+- [AGENTS.md](AGENTS.md): the rules and map for AI coding agents (start here)
 - [docs/API.md](docs/API.md): every endpoint
 - [docs/DECISIONS.md](docs/DECISIONS.md): why things are the way they are
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): state machines and trust boundaries

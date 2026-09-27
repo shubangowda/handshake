@@ -1,6 +1,6 @@
 # Integration plan
 
-This follows the milestones in HANDSHAKE_BUILD.md section 14. It records what the inventory found, the conflicts it found beyond those already decided in section 3, and how each one will be handled.
+This follows the milestones in docs/original/HANDSHAKE_BUILD.md section 14. It records what the inventory found, the conflicts it found beyond those already decided in section 3, and how each one will be handled.
 
 ## Inventory (milestone 1)
 

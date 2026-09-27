@@ -1,7 +1,7 @@
 """
 test_extractor.py: the mock merchant (Sri's store) and Handshake's independent extractor.
 
-Covers HANDSHAKE_BUILD.md sections 7.2 to 7.5:
+Covers docs/original/HANDSHAKE_BUILD.md sections 7.2 to 7.5:
 - every scenario normalizes into a valid models.py TransactionProposal
 - SSRF rules: wrong origin, file/ftp schemes, redirects to another origin, internal IPs
 - the two readings (JSON feed vs the HTML page's embedded facts) are compared

@@ -1,5 +1,5 @@
 """
-test_payments.py: payments (HANDSHAKE_BUILD.md section 9). Ajay's test_stripe.py, grown up.
+test_payments.py: payments (docs/original/HANDSHAKE_BUILD.md section 9). Ajay's test_stripe.py, grown up.
 
 Nothing here contacts Stripe or creates real credentials:
 - Ajay's offline auth-status tests are kept (now against payments.py).

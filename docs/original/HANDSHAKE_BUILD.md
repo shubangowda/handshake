@@ -1,3 +1,5 @@
+> **Historical build spec.** This is the spec the four parts were integrated from. It is kept for reference and is **superseded wherever it conflicts with [AGENTS.md](../../AGENTS.md) or [docs/DECISIONS.md](../DECISIONS.md)**. For example, payments now fund at signing instead of asking for a Link approval after authorization.
+
 # HANDSHAKE_BUILD.md: Fuse the four parts into one working Handshake repo
 
 ## 0. Read this first

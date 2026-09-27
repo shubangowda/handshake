@@ -33,7 +33,7 @@ Offline fixture
 ---------------
 With HANDSHAKE_COMPILER=fixture, or with no OPENAI_API_KEY, a deterministic
 compiler recognizes the demo intent (Pegasus 41 running shoes) and returns the
-exact demo contract from HANDSHAKE_BUILD.md section 12.1. Anything else gets a
+exact demo contract from docs/original/HANDSHAKE_BUILD.md section 12.1. Anything else gets a
 structured "live compiler not configured" error. This keeps the demo alive
 when the API is down, and it is labeled in compiler_notes.
 """
@@ -225,7 +225,7 @@ def end_of_day_in(days_from_now: int, now: datetime, timezone_name: str) -> date
 
 def demo_contract_draft(now: datetime | None = None) -> ContractDraft:
     """
-    The exact demo contract of HANDSHAKE_BUILD.md section 12.1.
+    The exact demo contract of docs/original/HANDSHAKE_BUILD.md section 12.1.
 
     Shared by the fixture compiler and scripts/demo.py so both produce the
     identical contract. No min_return_days: the mock merchant publishes no

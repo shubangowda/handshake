@@ -1,5 +1,5 @@
 """
-test_e2e.py: the eight red-team scenarios, end to end, fully in-process (HANDSHAKE_BUILD.md 12.2 and 12.4).
+test_e2e.py: the eight red-team scenarios, end to end, fully in-process (docs/original/HANDSHAKE_BUILD.md 12.2 and 12.4).
 
     user compiles (offline fixture compiler) and signs the section 12.1 demo contract
     agent creates a checkout at Sri's mock merchant and calls POST /purchases
