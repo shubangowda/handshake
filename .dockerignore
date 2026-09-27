@@ -1,0 +1,41 @@
+# Build context for deploy/backend.Dockerfile (the api, mcp, and store images).
+#
+# Why an allowlist: the repo root holds a real .env with live secrets, a
+# local SQLite database with users' contracts, per-user Stripe Link logins in
+# .handshake-state/, and the owner's _incoming/ copies. A denylist that
+# forgets one new file ships it into an image (and to Fly's remote builder).
+# So everything is excluded first and only what the Python images need is
+# let back in. The frontend has its own context and ignore file
+# (frontend/.dockerignore).
+
+*
+
+!pyproject.toml
+!README.md
+!handshake/
+!merchant_static/
+!deploy/backend.Dockerfile
+!deploy/api-entrypoint.sh
+
+# Re-exclude anything sensitive or generated that could sit inside the
+# allowed folders (defense in depth: these must never reach an image even if
+# someone drops one there).
+**/.env
+**/.env.*
+!**/.env.example
+**/__pycache__
+**/*.pyc
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.pem
+**/*.key
+**/link-card*.json
+**/.link-tmp
+**/.handshake-state
+**/.venv
+**/venv
+**/node_modules
+**/.next
+**/*.egg-info
+**/.DS_Store

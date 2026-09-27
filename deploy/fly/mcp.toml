@@ -1,0 +1,47 @@
+# mcp.toml: the hosted Handshake MCP server on Fly.io.
+#
+# A stateless, thin client of the API: each MCP request carries the user's
+# OAuth access token, which the server checks with the backend. It holds no
+# database, no secrets, and no Link session, so it can stop when idle and
+# start again on the next request (MCP runs in stateless HTTP mode).
+#
+# Deploy with `python scripts/deploy_fly.py` (it passes --app, --dockerfile
+# and the prefix-derived URLs below as --env; the values here are for the
+# default prefix `handshake-sg`).
+#
+# HANDSHAKE_ENV is deliberately left at its default ("dev" validation): the
+# prod checks in config.py are about the API's secrets and logins, which
+# this process never uses. It must NOT get HANDSHAKE_AGENT_TOKEN.
+
+app = "handshake-sg-mcp"
+primary_region = "iad"
+
+[build]
+  build-target = "mcp"
+
+[env]
+  HANDSHAKE_API_URL = "https://handshake-sg-api.fly.dev"
+  HANDSHAKE_MCP_PUBLIC_URL = "https://handshake-sg-mcp.fly.dev"
+  # Allowed browser origin for MCP requests, besides the MCP URL itself.
+  HANDSHAKE_FRONTEND_URL = "https://handshake-sg.fly.dev"
+  HANDSHAKE_MCP_HTTP_HOST = "0.0.0.0"
+  HANDSHAKE_MCP_HTTP_PORT = "8765"
+
+[http_service]
+  internal_port = 8765
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

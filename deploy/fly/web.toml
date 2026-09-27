@@ -1,0 +1,41 @@
+# web.toml: the Handshake web app (Next.js, frontend/) on Fly.io.
+#
+# Deploy with `python scripts/deploy_fly.py` (it passes --app, --dockerfile,
+# and the prefix-derived URLs below as --build-arg; the values here are for
+# the default prefix `handshake-sg`).
+#
+# NEXT_PUBLIC_* values are compiled into the JavaScript bundle at BUILD time,
+# which is why they are [build.args] and not [env]: changing one means a new
+# deploy (a rebuild), not a restart. None of them is secret.
+#
+# The site is stateless (every call goes to the API from the browser), so it
+# stops when idle and starts on the next visit.
+
+app = "handshake-sg"
+primary_region = "iad"
+
+[build]
+  [build.args]
+    NEXT_PUBLIC_API_URL = "https://handshake-sg-api.fly.dev"
+    # The MCP endpoint itself (what a user pastes into their MCP client).
+    NEXT_PUBLIC_MCP_URL = "https://handshake-sg-mcp.fly.dev/mcp"
+    NEXT_PUBLIC_USE_MOCKS = "false"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

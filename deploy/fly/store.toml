@@ -1,0 +1,48 @@
+# store.toml: the mock "Amazon.com" store (handshake/merchant.py) on Fly.io.
+#
+# Deploy with `python scripts/deploy_fly.py` (it passes --app, --dockerfile
+# and the prefix-derived URLs below as --env; the values here are for the
+# default prefix `handshake-sg`).
+#
+# Why these settings:
+# - HANDSHAKE_MERCHANT_URL is how the store builds its own checkout_url and
+#   pay_url, so it must be the store's public https address.
+# - HANDSHAKE_FRONTEND_URL is the "back to Handshake" link on the page.
+# - ONE machine, always on: carts and orders live in this process's memory.
+#   A stopped machine (or a second one) would lose a cart between the agent
+#   creating it and Handshake reading it.
+# - HANDSHAKE_ENV = "dev" on purpose: it enables the store's hidden demo
+#   panel and the "change the cart after creation" endpoint that the
+#   checkout_changed demo uses. It has no other effect here, and "prod"
+#   would demand the API's secrets and login settings, which a mock store
+#   never uses. (The API itself runs with HANDSHAKE_ENV=prod.)
+
+app = "handshake-sg-store"
+primary_region = "iad"
+
+[build]
+  build-target = "store"
+
+[env]
+  HANDSHAKE_ENV = "dev"
+  HANDSHAKE_MERCHANT_URL = "https://handshake-sg-store.fly.dev"
+  HANDSHAKE_FRONTEND_URL = "https://handshake-sg.fly.dev"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

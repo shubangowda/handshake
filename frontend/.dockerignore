@@ -1,0 +1,32 @@
+# Build context for frontend/Dockerfile (the web image).
+#
+# Most important: no .env files. Next.js reads .env, .env.local and
+# .env.production at BUILD time and inlines every NEXT_PUBLIC_* value into
+# the JavaScript bundle. A developer's .env.local (NEXT_PUBLIC_API_URL
+# pointing at their laptop) would silently override the production build
+# args, so the image gets its values only from the build args in
+# deploy/fly/web.toml.
+.env
+.env.*
+!.env.example
+
+# Installed and built inside the image, never copied from the host (the host's
+# node_modules may be built for macOS, and .next is a dev build).
+node_modules
+.next
+out
+build
+*.tsbuildinfo
+next-env.d.ts
+
+# Not needed to build or run the app.
+Dockerfile
+.dockerignore
+.git
+.vercel
+coverage
+test-results
+playwright-report
+npm-debug.log*
+*.pem
+.DS_Store

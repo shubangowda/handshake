@@ -1,0 +1,79 @@
+# api.toml: the Handshake backend (FastAPI) on Fly.io.
+#
+# Deploy with `python scripts/deploy_fly.py` (it creates the app, the volume,
+# and the secrets, and passes --app, --dockerfile and the prefix-derived URLs
+# below as --env). The values written here are for the default prefix
+# `handshake-sg`; with another prefix the script overrides every one of them
+# at deploy time, so this file never needs editing.
+#
+# Why these settings:
+# - ONE machine, always on. SQLite lives on the machine's volume (one
+#   writer), and a user's "Connect Stripe Link" login is a child process
+#   tracked in this process's memory. Stopping the machine, or adding a
+#   second one, would lose in-flight logins and split the database.
+# - Secrets are NOT here. HANDSHAKE_SIGNING_SECRET, HANDSHAKE_SESSION_SECRET
+#   and HANDSHAKE_CARD_ENCRYPTION_KEY are Fly secrets (the script generates
+#   them), and OPENAI_API_KEY is optional (see docs/DEPLOY.md, "Fly.io").
+
+app = "handshake-sg-api"
+primary_region = "iad"
+
+[build]
+  # The image comes from deploy/backend.Dockerfile, stage `api` (Python +
+  # Node 22 + the pinned Link CLI). The script passes the Dockerfile path.
+  build-target = "api"
+
+[env]
+  HANDSHAKE_ENV = "prod"
+  HANDSHAKE_API_URL = "https://handshake-sg-api.fly.dev"
+  HANDSHAKE_FRONTEND_URL = "https://handshake-sg.fly.dev"
+  HANDSHAKE_MERCHANT_URL = "https://handshake-sg-store.fly.dev"
+  HANDSHAKE_MCP_PUBLIC_URL = "https://handshake-sg-mcp.fly.dev"
+  # Exact origins only; prod refuses a wildcard.
+  HANDSHAKE_CORS_ORIGINS = "https://handshake-sg.fly.dev,https://handshake-sg-store.fly.dev"
+  HANDSHAKE_ALLOWED_MERCHANT_ORIGINS = "https://handshake-sg-store.fly.dev"
+  HANDSHAKE_MERCHANT_IDENTITIES = "https://handshake-sg-store.fly.dev=Amazon.com"
+  # Simulated funding for everyone; real Link TEST-mode cards only for users
+  # who connect their own Link account. There is no live mode.
+  HANDSHAKE_PAYMENT_MODE = "link_optional"
+  HANDSHAKE_CREDENTIAL_MODE = "agent_visible"
+  # HANDSHAKE_GOOGLE_CLIENT_ID is passed by the script (--google-client-id).
+  # It is public (it ends up in the login page), but it is the owner's value.
+  # Prod refuses to start with neither it nor HANDSHAKE_ALLOW_DEMO_LOGIN=true
+  # (the script's --allow-demo-login). Never set HANDSHAKE_AGENT_TOKEN here:
+  # prod refuses it (agents connect per user through OAuth).
+
+  # Everything that must survive a restart lives on the volume at /data.
+  DATABASE_URL = "sqlite:////data/handshake.db"
+  HANDSHAKE_LINK_HOME_ROOT = "/data/link-homes"
+  HANDSHAKE_LINK_NPM_CACHE = "/data/npm-cache"
+  # Link card files exist for milliseconds (read, zeroed, deleted): keep them
+  # on the machine's ephemeral disk, never on the persistent volume.
+  HANDSHAKE_LINK_TMP_DIR = "/tmp/handshake-link"
+  # The Link CLI is pre-installed in the image at the pinned version.
+  HANDSHAKE_LINK_CLI = "/usr/local/bin/link-cli"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+
+# The volume is created by the script (`fly volumes create handshake_data`).
+# The api entrypoint hands it to the non-root `app` user on every boot.
+[mounts]
+  source = "handshake_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
