@@ -389,6 +389,22 @@ def deploy(fly: Fly, app: FlyApp, apps: dict[str, FlyApp], region: str, google_c
     fly.run(args)
 
 
+def _tls_context() -> "ssl.SSLContext":
+    """
+    Verify HTTPS with certifi's CA bundle when it's installed (it is, in the repo
+    venv). python.org's macOS Python ships without system CA certificates, so the
+    default context fails every check with CERTIFICATE_VERIFY_FAILED even though
+    the site is fine. Verification is never turned off.
+    """
+    import ssl
+
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def smoke_check(app: FlyApp) -> str:
     """Step 6: GET the app's health path over the public https URL until it answers 200 (or time runs out)."""
     url = app.url + app.health_path
@@ -397,7 +413,7 @@ def smoke_check(app: FlyApp) -> str:
     while time.monotonic() < deadline:
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "handshake-deploy-smoke-check"})
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=10, context=_tls_context()) as response:
                 body = response.read(4096).decode("utf-8", "replace")
                 if response.status == 200:
                     return summarize_health(app, body)
