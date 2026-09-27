@@ -3,14 +3,14 @@ import Link from "next/link";
 import { ContactLine, LegalPage } from "@/components/handshake/legal-page";
 
 export const metadata: Metadata = {
-  title: "Terms · Handshake",
+  title: "Terms of Service · Handshake",
   description: "The terms for using the Handshake prototype: test-mode payments only, provided as is.",
 };
 
 /** Public (no login), like /privacy. */
 export default function TermsPage() {
   return (
-    <LegalPage title="Terms" intro="By using Handshake you agree to these short terms. Handshake is a prototype for letting an AI shopping agent buy things only within limits you sign.">
+    <LegalPage title="Terms of Service" intro="By using Handshake you agree to these short terms. Handshake is a prototype for letting an AI shopping agent buy things only within limits you sign.">
       <section>
         <h2>A prototype, in test mode</h2>
         <ul>
@@ -33,7 +33,7 @@ export default function TermsPage() {
       </section>
       <section>
         <h2>Contact</h2>
-        <p>Questions about these terms: <ContactLine />. How your data is handled is described in the <Link className="underline underline-offset-4" href="/privacy">privacy notice</Link>.</p>
+        <p>Questions about these terms: <ContactLine />. How your data is handled is described in the <Link className="underline underline-offset-4" href="/privacy">Privacy Policy</Link>.</p>
       </section>
     </LegalPage>
   );

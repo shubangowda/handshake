@@ -25,9 +25,9 @@ function usePortalFont() {
 }
 
 const STEPS = [
-  { icon: FileSignature, title: "You sign a contract", body: "Plain English, not JSON. Max spend, size, delivery, no subscriptions. Anything Handshake guessed is flagged before you sign." },
-  { icon: Bot, title: "Your agent shops", body: "It can browse anywhere, but it never holds your card. It can only propose a checkout." },
-  { icon: ShieldCheck, title: "Handshake checks the checkout", body: "Every line is compared to what you signed. If it all passes, you approve the payment in Link and a single-use card pays it. Any failure blocks it. If Handshake can't verify something, it asks you." },
+  { icon: FileSignature, title: "You sign and fund a contract", body: "Plain English, not JSON: max spend, size, delivery, no subscriptions. Anything Handshake guessed is flagged before you sign. Signing funds a single-use test card for your cap, stored encrypted and locked." },
+  { icon: Bot, title: "Your agent shops", body: "It can browse anywhere, but it can only propose a checkout. It can't sign, approve an exception, change your limits, or unlock the card." },
+  { icon: ShieldCheck, title: "Handshake checks the checkout", body: "Handshake reads the checkout itself and compares every line to what you signed. Only if it all passes is the card released, once, for that exact checkout. Any failure blocks it; anything it can't verify, it asks you." },
 ];
 
 export default function Home() {
@@ -102,6 +102,32 @@ export default function Home() {
       ) : (
         <div role="status" className="grid h-svh place-items-center text-xs text-muted-foreground">Loading…</div>
       )}
+
+      {/* Plain, server-rendered description with the legal links: readable without JavaScript and before the
+          animated intro loads. Google's sign-in review requires the home page to describe the app and link to
+          the privacy policy. */}
+      <section aria-labelledby="about-handshake" className="mx-auto w-full max-w-3xl px-4 py-16 text-[#2f3632]">
+        <h2 id="about-handshake" className="text-2xl font-semibold tracking-tight text-[#0c1212]">What Handshake is</h2>
+        <p className="mt-3 leading-relaxed">
+          Handshake lets an AI shopping agent (such as Meta&apos;s Muse, Claude, or any MCP client) buy things for you only within limits you sign.
+          You describe what you want in plain English; Handshake drafts a contract with your maximum all-in price, delivery deadline, allowed
+          stores, and rules like &ldquo;no subscriptions&rdquo;, and you review and sign it.
+        </p>
+        <ol className="mt-4 list-decimal space-y-2 pl-5 leading-relaxed">
+          {STEPS.map(({ title, body }) => <li key={title}><b>{title}.</b> {body}</li>)}
+        </ol>
+        <p className="mt-4 leading-relaxed">
+          Handshake is a prototype: every payment is a Stripe Link <b>test-mode</b> or simulated card, so no real money moves. You sign in with
+          your Google account, and you can see every connected agent and disconnect it at any time.
+        </p>
+        <p className="mt-4 text-sm">
+          <Link href="/privacy" className="font-medium underline underline-offset-4">Privacy policy</Link>
+          <span aria-hidden> · </span>
+          <Link href="/terms" className="font-medium underline underline-offset-4">Terms of service</Link>
+          <span aria-hidden> · </span>
+          <Link href="/login" className="font-medium underline underline-offset-4">Sign in</Link>
+        </p>
+      </section>
     </main>
   );
 }
