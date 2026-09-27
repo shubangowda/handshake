@@ -2,6 +2,25 @@
 
 This file explains why the integrated Handshake works the way it does. Most entries resolve a conflict between the teammates' specs; some record a fact verified against a real tool. Section numbers refer to `HANDSHAKE_BUILD.md`.
 
+## Owner decisions after the integration (these override parts of the build spec)
+
+**Each user connects their own Stripe Link account from the website.**
+There is no longer one Link login shared by the whole server. The backend runs the Link CLI with `HOME` set to a private per-user directory, `.handshake-state/link-homes/<hash of email>` (mode 0700). The user's Link login lives there, and every spend request on their behalf uses it.
+
+The website's "Connect Stripe Link" starts `auth login --format jsonl`. That output streams (verified): the verification URL and phrase arrive in about a second, and the CLI keeps polling in the background until the user approves in the Link app. The access token is never returned by any API. In stub mode the connection is simulated.
+
+**Sign = fund. This reverses decision 3.2's "no held funds".**
+Signing a contract now asks the user's Link account for one single-use **test** card for the contract's all-in hard cap, and the user approves it in Link. Link's own limits apply: the approval window is 10 minutes, and a card is valid for 12 hours, after which the contract must be funded again.
+
+**The funded card is stored on the contract, encrypted. This reverses section 6.6's "never store a PAN".**
+It is encrypted with AES-256-GCM (`HANDSHAKE_CARD_ENCRYPTION_KEY`; `dev.py` generates one, and prod refuses the public dev key). The contract and funding ids are the authenticated data, so a ciphertext copied onto another contract fails to decrypt. The card is decrypted only at release (agent-visible mode) or at payment (executor mode), and is **wiped from the database in the same transaction**. Revoking the contract also wipes it. So the plaintext card exists only in memory, and the stored copy exists only between funding and use.
+
+**The card unlocks only for a checkout Handshake authorized.**
+The owner chose this over releasing the card as soon as the contract is funded, so Handshake still decides. The agent requests a purchase; the extractor, the link parser, and the engine run. Only an AUTHORIZED checkout makes `get_payment_credential` available. Even then, Handshake re-reads the checkout just before releasing the card. If it changed for the worse, the card stays locked and the purchase stops at `checkout_changed`. A declined purchase also leaves the card stored for the agent's next try.
+
+**The per-purchase Link request is gone.**
+The owner chose to replace it rather than keep both. Purchases against an unfunded contract are refused with `contract_not_funded`. `POST /purchases/{id}/payment/simulate-approval` became `POST /contracts/{id}/funding/simulate-approval`.
+
 ## Conflicts decided in the build spec (section 3)
 
 **3.1 Credential exposure: the agent receives the Link TEST card by default.**
@@ -43,12 +62,12 @@ The frontend adapts to the backend's names: resolve became approve and reject, a
 
 ## Decisions made during integration (not specified in the build spec)
 
-**The single-use contract is reserved at authorization, not at completion.**
+**The single-use contract is reserved at authorization, not at completion.** *(Still true under fund-at-signing: the reservation is released if the purchase ends without any money moving.)*
 Section 9.4 says to mark the contract used at completion. But if that waited, two purchases could both be authorized against one single-use contract while waiting for Link approval. So the backend keeps its atomic `ACTIVE → USED` claim at authorization; the completion step is then a no-op.
 
 If the payment ends in a state where **no money moved**, the reservation is released back to ACTIVE with a conditional update and an evidence event. Those states are denied, expired, checkout changed, failed before any order, and declined by the user. An uncertain outcome (`unknown`) or an overcharge never releases it.
 
-**The models.py `Credential` row is Handshake's authorization grant.**
+**The models.py `Credential` row is Handshake's authorization grant.** *(The card itself is now the contract's stored funding card; see above.)*
 It is created at authorization: exact amount, single use, a 30-minute TTL. It never holds card data. The card itself comes from Link or from the stub provider at release time, and exists only in memory.
 
 **Contracts bind to an agent by default.**
@@ -124,3 +143,10 @@ That's what the demo pays in. Widening it is a deliberate decision, not a defaul
 **Capabilities not claimed.** Link issues a single-use test card. Handshake does not claim merchant locking, exact spend limits, or an expiry that the CLI doesn't report. The 50,000-cent limit is enforced by Handshake itself (`HANDSHAKE_LINK_MAX_MINOR_UNITS`) as well as documented by Link.
 
 **How test mode is enforced.** Every spend request is created through `payments.build_create_command()`, which always ends the command with `--test`. No function takes a parameter to remove it. `HANDSHAKE_PAYMENT_MODE` accepts only `stub` or `link_test`; `live`, an empty value, or a typo refuses to start. `retrieve` and `cancel` only accept `lsrq_…` ids that the backend itself created. Tests pin all of this down (`tests/test_payments.py`).
+
+### Real `link-cli` output shapes (found live on 2026-09-26)
+
+- `spend-request create --format json` prints a **JSON list** of streamed updates: `[{"id": "lsrq_…", "status": "pending_approval", "approval_url": …, "_next": …}]`. The same goes for `retrieve`. `cancel` prints a bare object.
+- The first adapter expected a bare object, which caused the live failure on purchase_93fb17da748a. The adapter now accepts an object, a list (the last update wins), or JSON lines. A sanitized copy of the real output is the regression fixture at `tests/fixtures/link_cli_0.23.0_spend_request_create.json`.
+- `--format <anything>` puts the CLI in agent mode. In agent mode, `--format json` collects every update until the end, which is why `python -m handshake.payments login` now runs **without** `--format`, so the approval link prints straight to the terminal. `--format jsonl` streams line by line (`{"type": "chunk", "data": …}`); the website login uses that.
+- The CLI keeps its login in `$HOME/Library/Preferences/link-cli-nodejs/config.json` (via `conf`), so a per-user `HOME` gives each user their own Link login.

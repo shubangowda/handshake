@@ -64,15 +64,16 @@ POST <merchant>/api/dev/checkout/<session>/scenario {"scenario": "price_bump"}
 
 Now approve. Handshake re-reads the checkout, sees the new total, re-runs the rules, and stops at **checkout_changed**. Nothing is paid, and the contract is freed.
 
-## Stripe Link TEST MODE (`link_test`): not run on this machine
+## Stripe Link TEST MODE (`link_test`)
 
-This machine has **no Link login** (`link-cli auth status` returned `authenticated: false`), so no Link spend request was ever created. Everything in the table above ran in stub mode. To run the valid scenario for real in Link **test mode** (no real charge; Link returns test credentials):
+**Each Handshake user connects their own Link account.** The login you did with `link-cli` in your terminal does not carry over, because Handshake keeps a separate Link login per user. With `HANDSHAKE_PAYMENT_MODE=link_test python scripts/dev.py` running:
 
-```bash
-python -m handshake.payments login            # approve the device in the Link app (a person must do this)
-python -m handshake.payments status           # should say "Logged in to Link."
-HANDSHAKE_PAYMENT_MODE=link_test python scripts/dev.py
-python scripts/demo.py valid                  # prints the Link approval URL; approve it in the Link app within 10 minutes
-```
+1. **Connect Link.** Log in on the website and click **Connect Stripe Link**. Open the Link page it shows and approve in the Link app; check that Link shows the same phrase. (From a terminal, `python -m handshake.payments login --email demo@handshake.dev` does the same thing.)
+2. **Sign and fund.** Sign the Pegasus contract, or run `python scripts/demo.py valid`, which signs it for you and prints the funding approval link. Approve the **$135.00 test-mode card** in Link within 10 minutes. The card is then stored, encrypted, on the contract.
+3. **Buy.** `demo.py` (or the agent) requests the valid checkout. Handshake authorizes it, releases the card once, and the agent pays. Handshake then verifies the order.
 
-Record the sanitized result here afterwards (request id, status transitions, last4, and order id; never the card).
+**Live run status.**
+
+- The real CLI's output shape was captured and the parser fixed. A test-mode spend request was created and then cancelled.
+- The first per-user connect link went unapproved and timed out, so the full live run (connect → fund → buy) still needs you to do the two approvals above.
+- Record the sanitized result here afterwards: request ids, status transitions, last4, and order id. Never the card.

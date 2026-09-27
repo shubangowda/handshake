@@ -2,7 +2,7 @@
 
 **The agent proposes. Handshake decides.**
 
-Handshake is an authorization layer between an AI shopping agent and payment. You describe what you're willing to buy; Handshake turns that into a contract you review and sign. When the agent finds a checkout, Handshake reads the checkout itself, checks every fact against your signed rules with deterministic code (no LLM decides anything), blocks violations, and asks you about anything it can't verify. Only then does a single-use **Stripe Link test-mode** card let the agent pay. Every step lands in a hash-chained evidence timeline.
+Handshake is an authorization layer between an AI shopping agent and payment. You describe what you're willing to buy; Handshake turns that into a contract you review, **sign, and fund**. Funding means approving one single-use **Stripe Link test-mode** card from your own Link account, for the contract's all-in cap. Handshake stores that card encrypted and locked on the contract. When the agent finds a checkout, Handshake reads the checkout itself, checks every fact against your signed rules with deterministic code (no LLM decides anything), blocks violations, and asks you about anything it can't verify. Only an authorized checkout unlocks the card, once, for that exact purchase. Every step lands in a hash-chained evidence timeline.
 
 ## How it fits together
 
@@ -15,7 +15,7 @@ Handshake is an authorization layer between an AI shopping agent and payment. Yo
   - **the payment state machine**;
   - **the evidence ledger**.
 - The **mock merchant** is Sri's store, with eight red-team checkout scenarios.
-- **Stripe Link, in test mode** (or a simulated provider), issues the single-use card. You approve it in Link.
+- **Stripe Link, in test mode** (or a simulated provider), issues the single-use card when you sign. You connect **your own** Link account from the website and approve the card in Link.
 
 For the state machines and trust boundaries, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -62,8 +62,8 @@ Tools: `connect_handshake`, `create_contract_draft`, `get_contract`, `list_contr
 | Auth | **Demo auth.** Anyone who types an email gets a user token. Agents connect through a real OAuth-style device-login flow, but it rests on that demo login. Replace it with passkeys or OAuth before real users. |
 | The merchant | **Mocked.** Sri's fake store, with sessions held in memory. |
 | Checkout extraction | Reads the mock store's **structured feed** and embedded page facts. It does not scrape real sites. |
-| Payments | **`stub`** (default): a simulated provider, labeled "Simulated provider" everywhere. **`link_test`**: real Stripe Link in **TEST MODE**, which was **not** exercised on the build machine because it had no Link login; see docs/DEMO.md. **No real card is ever charged by this codebase.** |
-| Cards | In the default **agent-visible** mode, the agent receives a single-use Link **test** card once, for one approved purchase, and nowhere else. In **executor** mode, the backend pays and the agent never sees a card. |
+| Payments | **`stub`** (default): a simulated provider, labeled "Simulated provider" everywhere. **`link_test`**: real Stripe Link in **TEST MODE**, where each user connects their own Link account from the website. The adapter now matches the real CLI's output (fixed after a live run), but the end-to-end live run is still waiting on the approvals in docs/DEMO.md. **No real card is ever charged by this codebase.** |
+| Cards | The contract's funded single-use **test** card is **stored encrypted** (AES-256-GCM) on the contract from funding until use, and wiped when it is released or the contract is revoked. In the default **agent-visible** mode, the agent receives it once, for one authorized checkout. In **executor** mode, the backend pays with it and the agent never sees it. |
 | The contract compiler | The **real** OpenAI structured-output call, if you provide a key. Otherwise an offline fixture for the demo request. It only drafts; it never decides. |
 
 ## Tests

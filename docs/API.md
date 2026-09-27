@@ -27,6 +27,44 @@ This is the single source of truth for every backend endpoint. The frontend's `l
 | `GET /oauth/device?user_code=` | user | – | `{"user_code", "client_id", "client_name", "status", "expires_at", "permissions": [...], "never": [...]}`, for the approval screen |
 | `POST /oauth/device/approve` and `/deny` | **user only** | `{"user_code"}` | `{"user_code", "status", "client_id"}` |
 
+## Payment model: fund at signing
+
+1. **Connect Link.** Each user connects their **own** Stripe Link account from the website. Link test mode is the only live rail; stub mode is simulated and always connected.
+2. **Sign = fund.** Signing a contract requests one single-use Link **TEST** card for the contract's all-in hard cap. The user approves it in Link, or with "Simulated provider approval" in stub mode. Handshake then retrieves the card and **stores it encrypted (AES-256-GCM) on the contract**. The contract's `funding.state` goes `awaiting_approval → funded`.
+3. **No purchase without funding.** Purchases against an unfunded contract are refused with 409 `contract_not_funded`, and the attempt is recorded.
+4. **Release only for an authorized checkout.** The stored card stays **locked** until Handshake AUTHORIZES a specific checkout. Then the agent may collect it once (`POST /purchases/{id}/credential`). Handshake re-reads the checkout first, and wipes the stored card as it releases it. Executor mode pays the merchant with it instead, right at authorization.
+
+Card validity is Link's 12 hours from the request. After that the funding expires and the contract must be funded again (`POST /contracts/{id}/funding`).
+
+## The user's Stripe Link account
+
+| Route | Who | Response |
+|---|---|---|
+| `POST /link/connect` | user | Starts the Link login for **this user's own** Link account. Returns `{"state": "pending", "verification_url", "phrase", "provider_label", "simulated": false}` immediately; the user opens `verification_url` and approves in the Link app. In stub mode it returns `{"state": "connected", "simulated": true}`. |
+| `GET /link/status` | user | `{"connected": bool, "simulated": bool, "provider_label", "login": pending-login-or-null}`. The Link access token is never returned. |
+| `POST /link/disconnect` | user | Logs this user's Link account out and returns the status above. |
+
+In `link_test` mode, signing without a connected Link account returns 409 `link_not_connected`.
+
+## Contract funding
+
+| Route | Who | Response |
+|---|---|---|
+| `GET /contracts/{id}/funding` | user or agent | **Funding** (refreshed; it polls Link and stores the card once it's approved) |
+| `POST /contracts/{id}/funding` | user | Funds the contract again (after a denied, expired, failed, or used card). Returns Funding. |
+| `POST /contracts/{id}/funding/simulate-approval` | user | **Stub mode only.** "Simulated provider approval" for the funding card. Returns Funding (`funded`). |
+
+**Funding** has this shape:
+
+```json
+{"funding_id", "state": "not_funded|awaiting_approval|funded|released|used|denied|expired|failed|canceled",
+ "provider": "stub|link_test", "provider_label", "approval_url", "provider_reference",
+ "amount", "currency", "merchant_name", "card_stored": bool, "card_last4", "valid_until",
+ "released_purchase_id", "last_error"}
+```
+
+It never contains card data (at most `card_last4`). `approval_url` is Link's approval page, or the frontend contract page in stub mode.
+
 ## Drafts and contracts
 
 | Route | Who | Request | Response |
@@ -36,10 +74,10 @@ This is the single source of truth for every backend endpoint. The frontend's `l
 | `GET /drafts/{id}` | user or agent | – | DraftRecord |
 | `PATCH /drafts/{id}` | user | **DraftPatch** `{goal?, target?, hard_cap_all_in?, max_shipping?, deliver_by?, constraints?}` (unknown keys → 422) | DraftRecord. Edited values get `source: "user"`, and lint re-runs. Returns 409 `already_signed` for a signed draft. |
 | `POST /contracts` | user | a `ContractDraft`, or `{"draft": ContractDraft, "assumptions", "clarifications_needed", "compiler_notes"}` | 201 `{"draft_id", "draft", "assumptions", "clarifications_needed", "compiler_notes", "review_url", "blocking_issues", "previous_contract_id", "record": DraftRecord}` |
-| `GET /contracts` | user or agent | – | `[{"id", "kind": "draft" or "contract", "status", "goal", "created_at", "signed_at", "signed_contract_id", "draft_id"}]`, newest first |
-| `GET /contracts/{id}` | user or agent | – | Contract: `{"kind": "contract", "id", "status", "draft_id", "contract": Contract, "verification": {"valid", "hash_matches", "signature_matches", ...}}`. Draft: `{"kind": "draft", "id", "status": "draft", "signed_contract_id", "draft": ContractDraft, "verification": null, "assumptions", "clarifications_needed", "compiler_notes"}` |
-| `POST /contracts/{draft_id}/sign` | user | optional `{"draft_id", "agent_key", "signature"}` | **Contract**. Errors: 409 `draft_has_blocking_issues` (with `details.blocking_issues`), 409 `already_signed`, 400 `draft_id_mismatch`. If no `agent_key` is given, it defaults to `HANDSHAKE_AGENT_ID`. Signing an amendment draft atomically revokes the old version. |
-| `POST /contracts/{id}/revoke` | user | – | Contract with status `revoked`. Its unused credentials are revoked and pending payment requests cancelled. |
+| `GET /contracts` | user or agent | – | `[{"id", "kind": "draft" or "contract", "status", "goal", "created_at", "signed_at", "signed_contract_id", "draft_id", "funding_state"}]`, newest first |
+| `GET /contracts/{id}` | user or agent | – | Contract: `{"kind": "contract", "id", "status", "draft_id", "contract": Contract, "verification": {"valid", "hash_matches", "signature_matches", ...}, "funding": Funding}`. Draft: `{"kind": "draft", "id", "status": "draft", "signed_contract_id", "draft": ContractDraft, "verification": null, "assumptions", "clarifications_needed", "compiler_notes"}` |
+| `POST /contracts/{draft_id}/sign` | user | optional `{"draft_id", "agent_key", "signature"}` | **Contract**. Signing also **starts funding** (see above). Errors: 409 `link_not_connected` (link_test mode), 409 `draft_has_blocking_issues` (with `details.blocking_issues`), 409 `already_signed`, 400 `draft_id_mismatch`. If no `agent_key` is given, it defaults to `HANDSHAKE_AGENT_ID`. Signing an amendment draft atomically revokes the old version. |
+| `POST /contracts/{id}/revoke` | user | – | Contract with status `revoked`. Its unused credentials are revoked, uncollected payments are cancelled, and the **funding is cancelled, wiping the stored card**. |
 | `POST /contracts/{id}/amend` | user | – | A new DraftRecord whose `previous_contract_id` points at the contract. The old contract stays in force until the new draft is signed. |
 | `GET /contracts/{id}/purchases` | user or agent | – | `[PurchaseDetail]` |
 
@@ -53,17 +91,16 @@ A **DraftRecord** has every `ContractDraft` field flattened, plus these API-only
 | `GET /purchases` | user or agent | – | `[PurchaseDetail]`, newest first |
 | `GET /purchases/{id}` | user or agent | – | PurchaseDetail. **Runs the payment refresh first.** |
 | `POST /purchases/{id}/payment/refresh` | user or agent | – | PurchaseDetail. Advances the payment state machine; idempotent. |
-| `POST /purchases/{id}/approve` | user | `{"note"?}` | PurchaseDetail. Accepts an ESCALATED purchase's unverifiable facts. It never overrides a FAIL (409 `cannot_override_fail`), and returns 409 `escalation_stale` after `HANDSHAKE_ESCALATION_TTL_MINUTES`. Afterwards the payment still needs the user's approval in Link. |
-| `POST /purchases/{id}/reject` | user | `{"note"?}` | PurchaseDetail. Rejects an ESCALATED purchase, or **declines** an AUTHORIZED one whose payment hasn't started. Declining cancels the provider request and frees the contract. |
-| `POST /purchases/{id}/payment/simulate-approval` | user | – | PurchaseDetail. **Only exists when `HANDSHAKE_PAYMENT_MODE=stub`.** It is labeled "Simulated provider approval" and stands in for tapping Approve in Link. |
-| `POST /purchases/{id}/credential` | **the bound agent only** | – | **CredentialRelease** (see below). **Only exists when `HANDSHAKE_CREDENTIAL_MODE=agent_visible`.** It works once; a second call returns 409 `credential_already_released`. Before the payment is ready it returns 409 `payment_not_ready`. |
+| `POST /purchases/{id}/approve` | user | `{"note"?}` | PurchaseDetail. Accepts an ESCALATED purchase's unverifiable facts, which unlocks the contract's stored card for that checkout. It never overrides a FAIL (409 `cannot_override_fail`). Other errors: 409 `escalation_stale` after `HANDSHAKE_ESCALATION_TTL_MINUTES`, 409 `contract_not_funded`. |
+| `POST /purchases/{id}/reject` | user | `{"note"?}` | PurchaseDetail. Rejects an ESCALATED purchase, or **declines** an AUTHORIZED one whose card hasn't been released yet. Declining frees the contract, and the card stays stored on it. |
+| `POST /purchases/{id}/credential` | **the bound agent only** | – | **CredentialRelease** (see below): the contract's stored card, decrypted and then wiped from the database. **Only exists when `HANDSHAKE_CREDENTIAL_MODE=agent_visible`.** Handshake re-reads the checkout first; if it changed for the worse, it returns 409 `checkout_changed` and the card stays locked. The release works once; a second call returns 409 `credential_already_released`. Without an authorized checkout it returns 409 `payment_not_ready`. |
 | `POST /purchases/{id}/complete` | nobody | – | Always 403 `internal_only`. Reconciliation is done by the backend after it verifies the merchant order. |
 | `GET /evidence/{purchase_id}` | user or agent | – | `{"purchase", "status", "summary", "contract", "contract_verification", "proposal", "proposal_raw_payload", "decision", "credential", "ledger_intact", "events": [...]}` |
 | `GET /health` | anyone | – | `{"status", "database", "payment_mode", "payment_label" ("Simulated provider" or "Stripe Link: TEST MODE"), "credential_mode", "compiler_mode"}` |
 
 **Rejections still leave a record.** Rejections against a known contract create a purchase record, and `details.purchase_id` points at its evidence:
 
-- 409 `contract_tampered`, `contract_used`, `contract_revoked`, or `contract_expired` (recorded as BLOCKED)
+- 409 `contract_tampered`, `contract_used`, `contract_revoked`, `contract_expired`, or `contract_not_funded` (recorded as BLOCKED)
 - 403 `agent_not_authorized`: the contract is bound to a different agent (BLOCKED)
 - 422 `unsupported_checkout_url`: the URL is off the merchant allowlist (BLOCKED)
 - 502 `checkout_unreachable` (FAILED)
@@ -85,10 +122,11 @@ A **DraftRecord** has every `ContractDraft` field flattened, plus these API-only
   "purchase": Purchase, "proposal": TransactionProposal | null,
   "payment": {"state", "provider": "stub|link_test", "provider_label", "approval_url", "provider_reference",
               "amount", "pay_amount", "currency", "last4", "credential_released", "order_id", "receipt", "last_error", "updated_at"} | null,
-  "payment_state": "awaiting_approval|approved|revalidating|credential_ready|paying|paid|completed|denied|expired|checkout_changed|failed|unknown" | null,
+  "payment_state": "credential_ready|paying|paid|completed|denied|expired|checkout_changed|failed|unknown" | null,
+  "funding": Funding,
   "approval_url": "…" | null,
   "resolution": {"action": "approve|reject|decline", "resolved_at", "accepted_constraints": ["no_addons"], "note"} | null,
-  "next_action": "wait_for_user_decision|wait_for_user_link_approval|wait_for_revalidation|get_payment_credential_and_pay|wait_for_payment|wait_for_merchant_order|wait_for_order_verification|wait_for_reconciliation|blocked_no_action|request_purchase_again|completed|wait",
+  "next_action": "wait_for_user_decision|get_payment_credential_and_pay|wait_for_payment|wait_for_merchant_order|wait_for_order_verification|wait_for_reconciliation|blocked_no_action|request_purchase_again|completed|wait",
   "review_url": "<frontend>/purchases/<id>"
 }
 ```
@@ -99,7 +137,7 @@ Results whose names start with `checkout_link_` come from the **checkout-link pa
 - the link's origin belongs to the merchant the page claims to be, and the contract allows that merchant;
 - the link matches the agent's own `selection_report`.
 
-**Evidence events** always use the models.py `event_type`. For steps models.py has no type for, `data.kind` carries the precise subtype: `payment_requested`, `simulated_provider_approval`, `payment_approved`, `payment_denied`, `payment_expired`, `checkout_revalidated`, `checkout_changed`, `credential_ready`, `credential_released`, `payment_submitted`, `payment_outcome_unknown`, `payment_request_uncertain`, `payment_request_failed`, `payment_not_made`, `order_not_verified`, `order_mismatch`, `contract_tampered`, `contract_no_longer_valid`, `credential_retrieval_failed`, `payment_refused`, `receipt_verified`, `receipt_mismatch`, `purchase_declined`, `contract_amended`, `draft_edited`, `agent_action_denied`, and `extraction_failed`. Human decisions set `data.human_approval` or `data.human_rejection`. No event ever contains a card number, CVC, full expiry, Link session token, or card file path.
+**Evidence events** always use the models.py `event_type`. For steps models.py has no type for, `data.kind` carries the precise subtype: `funding_requested`, `simulated_provider_approval`, `card_stored`, `funding_denied`, `funding_expired`, `funding_failed`, `funding_unavailable`, `card_unavailable`, `authorization_expired`, `checkout_revalidated`, `checkout_changed`, `credential_ready`, `credential_released`, `payment_submitted`, `payment_outcome_unknown`, `payment_request_uncertain`, `payment_request_failed`, `payment_not_made`, `order_not_verified`, `order_mismatch`, `contract_tampered`, `contract_no_longer_valid`, `credential_retrieval_failed`, `payment_refused`, `receipt_verified`, `receipt_mismatch`, `purchase_declined`, `contract_amended`, `draft_edited`, `agent_action_denied`, and `extraction_failed`. Human decisions set `data.human_approval` or `data.human_rejection`. No event ever contains a card number, CVC, full expiry, Link session token, or card file path.
 
 ### CredentialRelease (the only response that contains card values)
 

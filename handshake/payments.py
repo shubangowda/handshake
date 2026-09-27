@@ -6,11 +6,12 @@ Job in the system
 Handshake's engine decides WHETHER a purchase may happen. This file is the
 part that makes it happen, after the decision:
 
-    services.start_payment()     -> provider.create_request()   Link TEST spend request (user approves in Link)
-    services.refresh_payment()   -> provider.get_status()       pending / approved / denied / expired
-    credential release           -> provider.retrieve_card()    the single-use TEST card, read once, never stored
-    executor mode                -> pay_merchant()              submit the card to the merchant's /pay
-    both modes                   -> find_session_order() / get_order()   verify the order independently
+    website "Connect Stripe Link"    -> start_link_login()      each USER's own Link login (a private HOME per user)
+    services.start_funding()  (sign) -> create_request()        one Link TEST card for the contract's hard cap
+    services.refresh_funding()       -> get_status(), retrieve_card(), encrypt_card()   stored ENCRYPTED on the contract
+    credential release / executor    -> decrypt_card()          unlocked only for an AUTHORIZED checkout, then wiped
+    executor mode                    -> pay_merchant()          submit the card to the merchant's /pay
+    both modes                       -> find_session_order() / get_order()   verify the order independently
 
 Renamed from stripe.py so it no longer shadows the official `stripe` package.
 
@@ -28,9 +29,10 @@ charged by this codebase.
 
 Card handling
 -------------
-A card exists in memory only, for the moment it is released to the agent or
-submitted to the merchant. It is never written to the database, logs, errors,
-or evidence. CardSecret's repr is redacted, so even an accidental print shows
+By the owner's decision, the funded card is stored on its contract, ENCRYPTED
+(AES-256-GCM: encrypt_card/decrypt_card), from funding until release, and
+wiped when it is released or the contract is revoked. In plaintext it exists
+only in memory. It is never written to logs, errors, or evidence. CardSecret's repr is redacted, so even an accidental print shows
 only the last four digits. Link writes the full card to a private temp file
 (mode 0600, in a 0700 directory we create), which we read once and then
 overwrite and delete in a `finally` block.

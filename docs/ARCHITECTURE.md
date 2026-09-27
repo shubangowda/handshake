@@ -25,18 +25,18 @@
 ## The flow
 
 1. **Compile.** The user or the agent compiles an intent into a DRAFT. Lint problems block signing.
-2. **Sign.** The user reviews and signs, and the contract is bound to one agent (its `agent_key`). The hash covers the canonical JSON, excluding `status`, `contract_hash`, and `signature`. The signature is a demo HMAC.
+2. **Sign and fund.** The user reviews and signs, and the contract is bound to one agent (its `agent_key`). The hash covers the canonical JSON, excluding `status`, `contract_hash`, and `signature`; the signature is a demo HMAC. Signing requests one single-use Link TEST card for the hard cap from the **user's own Link account**. The user approves it in Link, and Handshake stores it **encrypted** on the contract (funding goes `awaiting_approval → funded`). An unfunded contract can't authorize a purchase (`contract_not_funded`).
 3. **Request.** The agent requests a purchase with `checkout_url` and an idempotency key. Handshake then:
    - checks ownership, then idempotency, then the contract (tampered, revoked, used, or expired, and whether this agent is the bound one);
    - **extracts** the checkout itself;
    - runs the **checkout-link parser**, then the **engine**;
    - maps the result to BLOCKED, ESCALATED, or AUTHORIZED.
 4. **Escalated.** The **user** accepts the exception (consent #1) or rejects it.
-5. **Authorized.** The single-use contract is **reserved** (atomically marked USED), the Handshake credential grant is created, and a **Link TEST** spend request is created, which the user approves in Link (consent #2).
-6. **Refresh** runs the payment state machine:
-   - after approval, it re-checks the contract and **re-extracts the checkout**; if the cart changed, it re-runs the engine;
-   - in agent-visible mode, the card is released once; in executor mode, the backend pays;
-   - it verifies the merchant order independently, reconciles (an overcharge by even one cent fails the purchase), and marks the purchase COMPLETED.
+5. **Authorized.** The single-use contract is **reserved** (atomically marked USED), the Handshake credential grant is created, and the contract's stored card is **unlocked for this checkout only**.
+6. **Release and pay:**
+   - agent-visible mode: at release, Handshake **re-extracts the checkout** (a changed cart stops at `checkout_changed`, and the card stays stored), then decrypts the card, wipes it from the database, and hands it to the agent once;
+   - executor mode: the backend pays the merchant with the card;
+   - either way, it then verifies the merchant order independently, reconciles (an overcharge by even one cent fails the purchase), and marks the purchase COMPLETED.
 
 ## State machines
 
@@ -62,12 +62,19 @@ PENDING ─▶ VALIDATING ─▶ BLOCKED            (a hard FAIL; or the user re
 
 Rejections before evaluation create BLOCKED or FAILED purchases directly, so each one has evidence.
 
-### Payment (the `payments` table; models.py is unchanged)
+### Contract funding (the `contract_funding` table)
 
 ```
-awaiting_approval ─(Link approved)─▶ approved ─▶ revalidating ─┬─ agent_visible ─▶ credential_ready ─(card released once)─▶ paying ─(merchant has an order)─▶ paid ─(order verified)─▶ completed
-                                                              └─ executor ──────────────────────────────────────────────▶ paying ─(backend paid)────────────▶ paid
-side exits:   denied · expired · checkout_changed · failed · unknown (pay outcome uncertain: check the merchant, never retry blindly)
+(sign) ─▶ awaiting_approval ─(user approves in Link)─▶ funded [card stored, encrypted, locked] ─(authorized checkout, released once)─▶ released [wiped] ─(order verified)─▶ used
+side exits: denied · expired (Link's 12-hour card validity) · failed · canceled (on revoke: wiped). The user can "Fund again" after any of them.
+```
+
+### Purchase payment (the `payments` table; models.py is unchanged)
+
+```
+AUTHORIZED ─▶ credential_ready ─(agent collects the card once; checkout re-read first)─▶ paying ─(merchant has an order)─▶ paid ─(order verified)─▶ completed
+executor:  AUTHORIZED ─▶ paying (backend pays with the stored card) ─▶ paid ─▶ completed
+side exits: denied (declined; card stays stored) · checkout_changed (card stays stored) · failed · unknown (pay outcome uncertain: check the merchant, never retry blindly)
 ```
 
 ## Trust boundaries

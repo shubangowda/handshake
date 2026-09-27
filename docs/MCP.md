@@ -8,12 +8,13 @@ Shopping agents use this server to work with Handshake. The core rule is unchang
 
 ## What changed from the original spec
 
-**The agent may now receive a card (agent-visible mode, the default).** The original spec said the agent must never see payment credentials. The team has since decided that this prototype delivers the single-use Stripe Link **TEST** card to the agent, which enters it at the merchant's checkout. The card is released only:
+**The agent may now receive a card (agent-visible mode, the default).** The original spec said the agent must never see payment credentials. The team has since decided that this prototype delivers the single-use Stripe Link **TEST** card to the agent, which enters it at the merchant's checkout. The card is funded **when the user signs**, from the user's own Link account, and stored encrypted on the contract. It is released only:
 
-- after Handshake has authorized the purchase,
-- after the user has approved the payment in Link,
-- after Handshake has re-read the checkout, and
+- after Handshake has authorized a specific checkout,
+- after Handshake has re-read that checkout, and
 - once, to the agent the contract is bound to, for that exact purchase.
+
+Until the contract is funded, `request_purchase` returns `contract_not_funded`.
 
 The card never appears in any other response, log, error, or evidence record.
 
@@ -56,7 +57,6 @@ For scripts and CI, the static `HANDSHAKE_AGENT_TOKEN` still works. If it is set
 | Value | What it means for the agent |
 |---|---|
 | `wait_for_user_decision` | The purchase escalated. Send the user the `review_url` and wait. |
-| `wait_for_user_link_approval` | The user must approve the payment in Link (this is a second, separate consent). Send them the `approval_url`. |
 | `wait_for_revalidation`, `wait_for_merchant_order`, `wait_for_order_verification`, `wait_for_reconciliation` | Keep polling. |
 | `get_payment_credential_and_pay` | Call `get_payment_credential` once, then submit the card to `pay_url` with exactly the amount and currency it gives. |
 | `blocked_no_action`, `request_purchase_again` | Stop. The checks explain why. |
