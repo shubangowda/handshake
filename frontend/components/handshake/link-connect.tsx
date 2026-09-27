@@ -31,9 +31,21 @@ export function useLinkStatus() {
 }
 
 /**
- * Connect the user's OWN Stripe Link account (link_test mode). POST /link/connect returns Link's
+ * Whether signing will be funded by the simulated provider: always in stub mode, and in link_optional
+ * until the user connects their own Link account. null while health or status is still loading.
+ */
+export function signingIsSimulated(health: Health | null, status: LinkStatus | null): boolean | null {
+  if (!health) return null;
+  if (health.payment_mode === "stub") return true;
+  if (health.payment_mode === "link_test") return false;
+  return status ? !status.connected : null;
+}
+
+/**
+ * Connect the user's OWN Stripe Link account (link_test mode; optional in link_optional mode). POST /link/connect returns Link's
  * login link and a phrase at once; the user approves in the Link app while we poll /link/status.
- * In stub mode nothing is needed, so it just says so.
+ * In stub mode nothing is needed, so it just says so. In link_optional it's an unobtrusive offer, never a
+ * blocker: without Link, funding is simulated.
  */
 export function LinkPanel({ className, onConnected }: { className?: string; onConnected?: () => void }) {
   const { health, status, refresh } = useLinkStatus();
@@ -80,14 +92,19 @@ export function LinkPanel({ className, onConnected }: { className?: string; onCo
   const box = cn("rounded-xl border p-4 text-sm", className);
   if (!health || !status) return <div className={cn(box, "h-20 animate-pulse bg-muted")} />;
 
-  if (health.payment_mode === "stub" || status.simulated) {
+  const optional = health.payment_mode === "link_optional";
+  // In link_optional the backend may call an unconnected user "simulated"; that must not hide the offer.
+  if (health.payment_mode === "stub" || (!optional && status.simulated)) {
     return <div className={cn(box, "bg-card")}><p className="flex items-center gap-2 font-medium"><CircleCheck className="size-4 text-pass" />Simulated provider (no Link account needed)</p></div>;
   }
 
   if (status.connected) {
     return (
       <div className={cn(box, "flex flex-wrap items-center justify-between gap-3 bg-card")}>
-        <p className="flex items-center gap-2 font-medium"><CircleCheck className="size-4 text-pass" />Stripe Link connected <span className="font-normal text-muted-foreground">(test mode)</span></p>
+        <div>
+          <p className="flex items-center gap-2 font-medium"><CircleCheck className="size-4 text-pass" />Stripe Link connected <span className="font-normal text-muted-foreground">(test mode)</span></p>
+          {optional && <p className="mt-1 text-muted-foreground">New contracts are funded with Link test-mode cards. Disconnect to go back to simulated funding.</p>}
+        </div>
         <Button variant="outline" size="sm" onClick={disconnect} disabled={busy}>Disconnect</Button>
         {error && <p className="w-full text-fail">{error}</p>}
       </div>
@@ -95,11 +112,18 @@ export function LinkPanel({ className, onConnected }: { className?: string; onCo
   }
 
   return (
-    <div className={cn(box, "space-y-3 border-warn/40 bg-warn-soft")}>
-      <div>
-        <p className="flex items-center gap-2 font-semibold"><Link2 className="size-4" />Connect Stripe Link</p>
-        <p className="mt-1 text-foreground/80">Signing a contract asks your own Link account (test mode) for a single-use card. Connect it once first.</p>
-      </div>
+    <div className={cn(box, "space-y-3", optional ? "bg-card" : "border-warn/40 bg-warn-soft")}>
+      {optional ? (
+        <p className="text-muted-foreground">
+          <span className="font-medium text-foreground">Optional:</span> connect your own Stripe Link account to fund contracts with real Link test-mode cards.
+          Without it, funding is simulated (no real money).
+        </p>
+      ) : (
+        <div>
+          <p className="flex items-center gap-2 font-semibold"><Link2 className="size-4" />Connect Stripe Link</p>
+          <p className="mt-1 text-foreground/80">Signing a contract asks your own Link account (test mode) for a single-use card. Connect it once first.</p>
+        </div>
+      )}
       {waiting && pending ? (
         <div className="space-y-2">
           {pending.verification_url
@@ -109,8 +133,9 @@ export function LinkPanel({ className, onConnected }: { className?: string; onCo
           <p className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" />Waiting for you to approve in the Link app…</p>
         </div>
       ) : (
-        <Button size="sm" onClick={connect} disabled={busy} className="bg-brand text-brand-foreground hover:bg-brand/90">
-          {busy ? <><Loader2 className="animate-spin" />Starting Link login…</> : "Connect Stripe Link"}
+        <Button size="sm" variant={optional ? "outline" : "default"} onClick={connect} disabled={busy}
+          className={optional ? undefined : "bg-brand text-brand-foreground hover:bg-brand/90"}>
+          {busy ? <><Loader2 className="animate-spin" />Starting Link login…</> : optional ? <><Link2 />Connect Stripe Link</> : "Connect Stripe Link"}
         </Button>
       )}
       {error && <p className="text-fail">{error}</p>}

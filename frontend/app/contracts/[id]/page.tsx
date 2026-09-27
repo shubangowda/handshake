@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { AppHeader } from "@/components/handshake/app-header";
 import { SignDialog } from "@/components/handshake/sign-dialog";
 import { FundingCard } from "@/components/handshake/funding";
+import { signingIsSimulated, useLinkStatus } from "@/components/handshake/link-connect";
 import { ContractSheet, contractRows } from "@/components/handshake/contract-sheet";
 import { EditDraftDialog } from "@/components/handshake/edit-draft-dialog";
 import { StatusBadge, SourceTag, SeverityTag } from "@/components/handshake/tags";
@@ -145,6 +146,8 @@ export default function ContractPage() {
   // The last sign attempt returned 409 link_not_connected: show the Connect Stripe Link panel.
   const [needsLink, setNeedsLink] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
+  // Refreshed when Link is connected or disconnected anywhere on the page (header, sign dialog).
+  const { status: linkStatus } = useLinkStatus();
 
   const load = useCallback(async () => {
     try {
@@ -168,6 +171,8 @@ export default function ContractPage() {
   const draft = isDraft(contract) ? contract : null;
   const signed = draft ? null : (contract as SignedContract);
   const blockingIssues = signIssues ?? draft?.blocking_issues ?? [];
+  // Stub mode, or link_optional without the user's Link: signing gets a simulated card, so say so.
+  const simulated = signingIsSimulated(health, linkStatus) ?? health?.payment_mode === "stub";
 
   /** Runs from the review dialog. Errors keep the dialog open; blocking issues and Link connect are shown in it. */
   async function sign() {
@@ -228,7 +233,7 @@ export default function ContractPage() {
           {signed && signed.funding && (
             // Keyed so a reload (e.g. after revoke) resets the card's own polling state.
             <FundingCard key={`${signed.status}:${signed.funding.funding_id ?? ""}:${signed.funding.state}`} contractId={signed.id}
-              active={signed.status === "active"} initial={signed.funding} health={health} />
+              active={signed.status === "active"} initial={signed.funding} />
           )}
           <Legend />
           <ContractSheet contract={contract} />
@@ -272,7 +277,7 @@ export default function ContractPage() {
         <div className="fixed inset-x-0 bottom-0 z-20 border-t bg-background/95 backdrop-blur">
           <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3">
             <p className="text-sm text-muted-foreground">
-              Up to <span className="font-semibold text-foreground tabular-nums">{money(draft.spend.hard_cap_all_in)}</span> all-in · signing asks Link for a single-use card for this amount
+              Up to <span className="font-semibold text-foreground tabular-nums">{money(draft.spend.hard_cap_all_in)}</span> all-in · signing asks {simulated ? "the simulated provider" : "your Link account"} for a single-use card for this amount
             </p>
             <div className="flex gap-2">
               <Button variant="outline" size="lg" onClick={() => setEditing(true)}><PenLine />Edit contract</Button>
@@ -284,7 +289,7 @@ export default function ContractPage() {
 
       {draft && <EditDraftDialog key={draft.id + JSON.stringify(draft.spend)} draft={draft} open={editing} onOpenChange={setEditing} onSave={save} />}
 
-      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} needsLink={needsLink} simulated={health?.payment_mode === "stub"} onLinkConnected={() => setNeedsLink(false)}
+      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} needsLink={needsLink} simulated={simulated} onLinkConnected={() => setNeedsLink(false)}
         open={confirmSign} onOpenChange={setConfirmSign} onSign={sign} />}
 
       <Dialog open={confirmRevoke} onOpenChange={setConfirmRevoke}>

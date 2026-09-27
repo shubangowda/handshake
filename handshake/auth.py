@@ -431,7 +431,10 @@ def _grant_view(grant: Any) -> dict[str, Any]:
         client = object_session(grant).get(db.OAuthClientRow, grant.client_id)
         client_name = client.client_name if client else None
     return {
-        "agent_id": grant.id, "name": grant.name, "kind": grant.kind, "client_name": client_name,
+        # agent_id is the grant (what /agents/{id}/revoke takes); bound_agent_id is what
+        # contracts bind to (a draft's proposed_by_agent), so the UI can name the agent.
+        "agent_id": grant.id, "bound_agent_id": grant.agent_id, "client_id": grant.client_id,
+        "name": grant.name, "kind": grant.kind, "client_name": client_name,
         "created_at": iso(grant.created_at), "last_used_at": iso(grant.last_used_at),
         "expires_at": iso(grant.expires_at), "revoked_at": iso(grant.revoked_at),
     }

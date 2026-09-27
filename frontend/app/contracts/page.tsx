@@ -9,11 +9,11 @@ import { useSession } from "@/components/handshake/user-menu";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { LinkPanel, useLinkStatus } from "@/components/handshake/link-connect";
-import { approveFunding, compileDraft, getHealth, listContracts, USE_MOCKS } from "@/lib/api";
+import { approveFunding, compileDraft, fundingUsesLink, getHealth, listContracts, USE_MOCKS } from "@/lib/api";
 import { DEMO_INTENT } from "@/lib/mock-data";
 import { toast } from "sonner";
 import { displayStatus, fundingOf, type DisplayStatus } from "@/lib/status";
-import type { ContractRecord, Health } from "@/lib/types";
+import type { ContractRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { CircleCheck, OctagonX, CircleHelp, Hourglass, Sparkles } from "lucide-react";
 
@@ -27,12 +27,17 @@ const DEMOS = [
   { href: "/purchases/purchase_escalated", icon: CircleHelp, tone: "text-warn", title: "Unknown seller", body: "SneakerDeals123 · $127.42" },
 ];
 
-/** Link test mode only: until the user's own Link account is connected, signing (= funding) is refused. */
+/**
+ * link_test: until the user's own Link account is connected, signing (= funding) is refused, so it's a banner.
+ * link_optional: the same panel as a quiet offer (funding is simulated without it). stub: nothing.
+ */
 function LinkBanner() {
   const { health, status } = useLinkStatus();
-  if (health?.payment_mode !== "link_test" || !status || status.connected) return null;
+  if (!health || health.payment_mode === "stub" || !status || status.connected) return null;
   return <LinkPanel className="mt-6" />;
 }
+
+const approveLabelFor = (c: ContractRecord) => (fundingUsesLink(fundingOf(c)) ? "Approve funding in Link" : "Simulated provider approval");
 
 /** Compiles a request into a draft right here, so the demo works without an MCP agent. */
 function DescribeBox() {
@@ -70,13 +75,12 @@ export default function ContractsPage() {
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("all");
   const [approving, setApproving] = useState<string | null>(null);
-  const [health, setHealth] = useState<Health | null>(null);
   const session = useSession();
 
   const load = useCallback(() => {
     listContracts().then(setContracts, (e: Error) => setError(e.message));
-    // Health decides the approve button (Link vs. simulated provider); it's cached after the first call.
-    getHealth().then(setHealth, () => {});
+    // Each card's funding.provider decides its approve button; health is only warmed up (cached) here.
+    getHealth().catch(() => {});
   }, []);
   useEffect(load, [load]);
 
@@ -87,7 +91,7 @@ export default function ContractsPage() {
     setApproving(c.id);
     try {
       await approveFunding(c.id, funding);
-      if (health?.payment_mode === "link_test") toast("Approve the card in the Link tab", { description: "The contract shows as funded once you do." });
+      if (fundingUsesLink(funding)) toast("Approve the card in the Link tab", { description: "The contract shows as funded once you do." });
       else toast.success("Simulated provider approval sent", { description: "The card is stored, encrypted, locked until Handshake approves a checkout." });
       load();
     } catch (e) { toast.error((e as Error).message); } finally { setApproving(null); }
@@ -128,7 +132,7 @@ export default function ContractsPage() {
         <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {!contracts && !error && Array.from({ length: 3 }, (_, i) => <div key={i} className="h-48 animate-pulse rounded-xl bg-muted" />)}
           {shown.map((c) => <ContractCard key={c.id} contract={c} status={status(c)} onApproveFunding={approve} approving={approving === c.id}
-            approveLabel={health?.payment_mode === "stub" ? "Simulated provider approval" : "Approve funding in Link"} />)}
+            approveLabel={approveLabelFor(c)} />)}
           {contracts && !shown.length && <p className="col-span-full py-10 text-center text-sm text-muted-foreground">No {tab} contracts.</p>}
         </div>
 

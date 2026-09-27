@@ -286,6 +286,7 @@ def test_agent_keys_are_shown_once_and_revocable(anon_client: TestClient, client
     assert me["role"] == "agent" and me["agent_id"].startswith("key_") and me["email"] == TEST_USER
     listed = client.get("/agents").json()["agents"]
     assert listed[0]["name"] == "Muse custom connector" and "token" not in listed[0]
+    assert listed[0]["bound_agent_id"] == me["agent_id"]  # lets the sign dialog name the proposing agent
     client.post(f"/agents/{key['agent_id']}/revoke")
     assert anon_client.get("/auth/me", headers=bearer(key["token"])).status_code == 401
 

@@ -26,7 +26,7 @@ export function UserMenu() {
       <span title={session.email} className="grid size-7 place-items-center rounded-full bg-brand text-xs font-semibold text-brand-foreground uppercase">
         {session.email[0]}
       </span>
-      <button type="button" className="text-sm text-muted-foreground hover:text-foreground"
+      <button type="button" className="text-sm whitespace-nowrap text-muted-foreground hover:text-foreground"
         onClick={() => { clearSession(); router.push("/login"); }}>
         Sign out
       </button>

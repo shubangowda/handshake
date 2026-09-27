@@ -2,13 +2,15 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useState, type FormEvent } from "react";
+import { Suspense, useCallback, useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
+import { GoogleSignIn } from "@/components/handshake/google-sign-in";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { demoLogin } from "@/lib/api";
+import { demoLogin, getAuthConfig, googleLogin } from "@/lib/api";
 import { readSession, safeNext, writeSession } from "@/lib/session";
+import type { AuthConfig, UserLogin } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
   ArrowLeft, ArrowRight, Check, Footprints, Handshake, Headphones, Home as HomeIcon,
@@ -93,18 +95,22 @@ function LoginForm() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [interests, setInterests] = useState<string[]>([]);
   const [budget, setBudget] = useState<string | null>(null);
+  // Which sign-in methods the backend offers (GET /auth/config): Google, demo email login, both, or neither.
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getAuthConfig().then(setConfig, (e: Error) => setConfigError(e.message));
+  }, []);
 
   const emailError = !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && "Enter a valid email";
 
-  async function submitCredentials(e: FormEvent) {
-    e.preventDefault();
-    setTouched(true);
-    if (emailError) return;
+  /** Google and demo login end the same way: keep the token, then go where the user was headed. */
+  const signIn = useCallback(async (exchange: () => Promise<UserLogin>) => {
     setBusy(true);
     setLoginError(null);
     try {
-      // DEMO AUTH: POST /auth/demo-login trades an email for a token. No password.
-      const login = await demoLogin(email);
+      const login = await exchange();
       // expires_at arrives as Unix seconds; the session keeps an ISO string.
       writeSession({ email: login.email, token: login.token, expires_at: new Date(login.expires_at * 1000).toISOString(), interests: [], budget: null });
     } catch (err) {
@@ -114,7 +120,22 @@ function LoginForm() {
     // Someone mid-task (e.g. connecting an agent) goes straight back; onboarding can wait.
     if (next !== "/contracts") { toast.success("Signed in"); router.replace(next); return; }
     setStep(2);
+  }, [next, router]);
+
+  async function submitCredentials(e: FormEvent) {
+    e.preventDefault();
+    setTouched(true);
+    if (emailError) return;
+    // DEMO AUTH: POST /auth/demo-login trades an email for a token. No password.
+    await signIn(() => demoLogin(email));
   }
+
+  // POST /auth/google with the ID token Google's button returned.
+  const onGoogleCredential = useCallback((credential: string) => { void signIn(() => googleLogin(credential)); }, [signIn]);
+  const onGoogleError = useCallback((message: string) => setLoginError(message), []);
+
+  const google = config?.google_client_id ?? null;
+  const demo = !!config?.demo_login;
 
   function finish(skip = false) {
     const s = readSession();
@@ -137,31 +158,57 @@ function LoginForm() {
                 {mode === "signin" ? "Sign in to see what your agent is allowed to buy." : "Set the rules once. Let your agent do the shopping."}
               </p>
 
-              <p className="mt-6 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm font-medium text-warn">
-                Demo login (no password; to be replaced by passkeys/OAuth)
-              </p>
+              {!config && !configError && <div className="mt-6 h-40 animate-pulse rounded-lg bg-muted" aria-label="Loading sign-in options" />}
+              {configError && <p className="mt-6 rounded-lg bg-fail-soft p-3 text-sm text-fail">Couldn&apos;t load the sign-in options: {configError}</p>}
+              {config && !google && !demo && (
+                <p className="mt-6 rounded-lg border bg-muted p-3 text-sm">
+                  Sign-in isn&apos;t available on this Handshake server right now: Google sign-in isn&apos;t configured and demo login is turned off.
+                  If you run this server, set a Google client id (or enable demo login) and reload.
+                </p>
+              )}
 
-              <div className="mt-6 grid gap-4">
-                <div className="grid gap-1.5">
-                  <Label htmlFor="email">Email</Label>
-                  <Input id="email" type="email" autoComplete="email" placeholder="you@example.com" className="h-10"
-                    value={email} onChange={(e) => setEmail(e.target.value)} aria-invalid={touched && !!emailError} />
-                  {touched && emailError && <p className="text-xs text-fail">{emailError}</p>}
+              {google && (
+                <div className="mt-6">
+                  <GoogleSignIn clientId={google} onCredential={onGoogleCredential} onError={onGoogleError} disabled={busy} />
                 </div>
-              </div>
+              )}
 
-              <Button type="submit" size="lg" disabled={busy} className="mt-6 h-10 w-full bg-brand text-brand-foreground hover:bg-brand/90">
-                {busy ? "One sec…" : mode === "signin" ? "Sign in" : "Create account"}<ArrowRight />
-              </Button>
+              {google && demo && (
+                <div className="mt-6 flex items-center gap-3 text-xs text-muted-foreground" role="separator">
+                  <span className="h-px flex-1 bg-border" />or use the demo login<span className="h-px flex-1 bg-border" />
+                </div>
+              )}
+
+              {demo && (
+                <>
+                  <p className="mt-6 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm font-medium text-warn">
+                    Demo login (demo auth: no password, anyone who types an email gets a session)
+                  </p>
+
+                  <div className="mt-6 grid gap-4">
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="email">Email</Label>
+                      <Input id="email" type="email" autoComplete="email" placeholder="you@example.com" className="h-10"
+                        value={email} onChange={(e) => setEmail(e.target.value)} aria-invalid={touched && !!emailError} />
+                      {touched && emailError && <p className="text-xs text-fail">{emailError}</p>}
+                    </div>
+                  </div>
+
+                  <Button type="submit" size="lg" disabled={busy} className="mt-6 h-10 w-full bg-brand text-brand-foreground hover:bg-brand/90">
+                    {busy ? "One sec…" : mode === "signin" ? "Sign in" : "Create account"}<ArrowRight />
+                  </Button>
+                </>
+              )}
+              {google && !demo && busy && <p className="mt-3 text-center text-sm text-muted-foreground">Signing you in…</p>}
               {loginError && <p className="mt-3 rounded-lg bg-fail-soft p-3 text-sm text-fail">{loginError}</p>}
 
-              <p className="mt-6 text-center text-sm text-muted-foreground">
+              {(google || demo) && <p className="mt-6 text-center text-sm text-muted-foreground">
                 {mode === "signin" ? "New to Handshake? " : "Already have an account? "}
                 <button type="button" className="font-medium text-foreground underline-offset-4 hover:underline"
                   onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setTouched(false); }}>
                   {mode === "signin" ? "Create an account" : "Sign in"}
                 </button>
-              </p>
+              </p>}
             </form>
           ) : (
             <div className="mt-6 animate-in fade-in slide-in-from-right-4 duration-300">
@@ -204,7 +251,10 @@ function LoginForm() {
             </div>
           )}
 
-          <p className="mt-10 text-center text-xs text-muted-foreground">Demo login: anyone who types an email gets a session. No real account is created.</p>
+          {demo && <p className="mt-10 text-center text-xs text-muted-foreground">Demo login: anyone who types an email gets a session. No real account is created.</p>}
+          <p className={cn("text-center text-xs text-muted-foreground", demo ? "mt-2" : "mt-10")}>
+            By signing in you agree to the <Link href="/terms" className="underline underline-offset-4">Terms</Link> and <Link href="/privacy" className="underline underline-offset-4">Privacy</Link> notice.
+          </p>
         </div>
       </section>
   );

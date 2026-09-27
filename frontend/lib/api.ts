@@ -3,14 +3,20 @@
 import * as fixtures from "./mock-data";
 import { clearSession, readSession } from "./session";
 import type {
-  ApiErrorBody, Contract, ContractListItem, ContractRecord, ContractResponse, DemoLogin, DeviceAuthorization,
-  DeviceDecision, DraftPatch, DraftRecord, EvidenceBundle, EvidenceEvent, Funding, Health, LinkLogin, LinkStatus,
-  PaymentState, PurchaseDetail, SignedContract,
+  Agent, ApiErrorBody, AuthConfig, Contract, ContractListItem, ContractRecord, ContractResponse, CreatedAgentKey,
+  DeviceAuthorization, DeviceDecision, DraftPatch, DraftRecord, EvidenceBundle, EvidenceEvent, Funding, Health, LinkLogin,
+  LinkStatus, OAuthAuthorizationRequest, OAuthDecision, PaymentState, PurchaseDetail, SignedContract, UserLogin,
 } from "./types";
 
 export const USE_MOCKS = process.env.NEXT_PUBLIC_USE_MOCKS !== "false";
 // No fallback host on purpose: a missing setting should fail loudly, not quietly call some default address.
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/+$/, "");
+
+/**
+ * The public MCP server URL (e.g. the Fly deployment's /mcp), for the "Connect Muse" help on /agents.
+ * Optional: when unset the help box is hidden rather than showing a guessed address.
+ */
+export const MCP_URL: string | null = (process.env.NEXT_PUBLIC_MCP_URL ?? "").trim() || null;
 
 /** Shown by pages (and the header) when the app is pointed at the backend but doesn't know where it is. */
 export const CONFIG_ERROR: string | null = !USE_MOCKS && !API_URL
@@ -54,7 +60,8 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as ApiErrorBody | null;
-    if (res.status === 401 && path !== "/auth/demo-login") { clearSession(); redirectToLogin(); }
+    // A 401 from a login call is a failed sign-in (bad Google token), not an expired session.
+    if (res.status === 401 && !path.startsWith("/auth/")) { clearSession(); redirectToLogin(); }
     throw new ApiError(
       body?.message ?? body?.error_description ?? `${init?.method ?? "GET"} ${path} failed (${res.status})`,
       res.status, body?.error ?? "http_error", body?.details ?? {},
@@ -75,7 +82,11 @@ const store = {
   purchases: clone(fixtures.purchases),
   evidence: clone(fixtures.evidence),
   fundings: clone(fixtures.fundings),
+  agents: clone(fixtures.agents),
 };
+// Whether the mock user's own Link account is connected. Read lazily: the knobs live in localStorage.
+let mockLinkConnected: boolean | null = null;
+const mockLinked = () => (mockLinkConnected ??= fixtures.mockSettings().link_connected);
 const delay = (ms = 250) => new Promise((r) => setTimeout(r, ms));
 const iso = () => new Date().toISOString();
 const newId = (prefix: string) => `${prefix}_${Math.random().toString(16).slice(2, 14)}`;
@@ -150,11 +161,36 @@ function openExternal(url: string | null | undefined, what: string) {
 
 // ---------- Auth ----------
 
-/** DEMO AUTH: exchanges an email for a user token. No password. To be replaced by passkeys/OAuth. */
-export async function demoLogin(email: string): Promise<DemoLogin> {
-  if (!USE_MOCKS) return post<DemoLogin>("/auth/demo-login", { email });
+/** GET /auth/config (public): whether Google sign-in and/or demo login are offered. Decides the login page. */
+export async function getAuthConfig(): Promise<AuthConfig> {
+  if (!USE_MOCKS) return http<AuthConfig>("/auth/config");
+  await delay(100);
+  const { google_client_id, demo_login } = fixtures.mockSettings();
+  return { google_client_id, demo_login };
+}
+
+const mockLogin = (email: string, demo: boolean): UserLogin => ({
+  token: "mock-token", token_type: "bearer", email, role: "user", expires_at: Math.floor(Date.now() / 1000) + 86_400, demo_auth: demo,
+});
+
+/** DEMO AUTH: exchanges an email for a user token. No password. Off in production (404 demo_login_disabled). */
+export async function demoLogin(email: string): Promise<UserLogin> {
+  if (!USE_MOCKS) return post<UserLogin>("/auth/demo-login", { email });
   await delay(300);
-  return { token: "mock-token", token_type: "bearer", email: email.trim().toLowerCase(), role: "user", expires_at: Math.floor(Date.now() / 1000) + 86_400, demo_auth: true };
+  if (!fixtures.mockSettings().demo_login) throw new ApiError("Demo login is turned off on this server.", 404, "demo_login_disabled");
+  return mockLogin(email.trim().toLowerCase(), true);
+}
+
+/**
+ * POST /auth/google: trades the ID token Google Identity Services handed the page for a Handshake user
+ * token. The backend verifies the token's signature, audience and expiry; the page never inspects it.
+ */
+export async function googleLogin(credential: string): Promise<UserLogin> {
+  if (!USE_MOCKS) return post<UserLogin>("/auth/google", { credential });
+  await delay(300);
+  if (!fixtures.mockSettings().google_client_id) throw new ApiError("Google sign-in isn't configured on this server.", 404, "google_login_disabled");
+  if (!credential) throw new ApiError("Google didn't return a valid sign-in. Try again.", 401, "google_token_invalid");
+  return mockLogin("google-user@example.com", false);
 }
 
 // ---------- Health (cached: the payment mode doesn't change while the backend runs) ----------
@@ -162,15 +198,20 @@ export async function demoLogin(email: string): Promise<DemoLogin> {
 let healthValue: Health | null = null;
 let healthPromise: Promise<Health> | null = null;
 
+function mockHealth(): Health {
+  const mode = fixtures.mockSettings().payment_mode;
+  return { ...fixtures.health, payment_mode: mode, payment_label: fixtures.PAYMENT_LABELS[mode] };
+}
+
 export function getHealth(): Promise<Health> {
-  if (USE_MOCKS) return Promise.resolve(clone(fixtures.health));
+  if (USE_MOCKS) return Promise.resolve(mockHealth());
   healthPromise ??= http<Health>("/health").then((h) => (healthValue = h), (e) => { healthPromise = null; throw e; });
   return healthPromise;
 }
 
 /** The cached health, if already fetched. Lets approveFunding open Link's tab synchronously. */
 export function cachedHealth(): Health | null {
-  return USE_MOCKS ? fixtures.health : healthValue;
+  return USE_MOCKS ? mockHealth() : healthValue;
 }
 
 // ---------- Drafts and contracts ----------
@@ -237,9 +278,11 @@ export async function signContract(draftId: string): Promise<Contract> {
   if (draft.blocking_issues.length) {
     throw new ApiError("This draft has problems that must be fixed before it can be signed.", 409, "draft_has_blocking_issues", { blocking_issues: draft.blocking_issues });
   }
-  const { status: _s, assumptions: _a, clarifications_needed: _c, compiler_notes: _n, signed_contract_id: _i, review_url: _r, blocking_issues: _b, compiler_source: _cs, ...body } = draft;
+  const provider = mockFundingProvider();
+  const { status: _s, assumptions: _a, clarifications_needed: _c, compiler_notes: _n, signed_contract_id: _i, review_url: _r, blocking_issues: _b, compiler_source: _cs, proposed_by_agent: proposer, ...body } = draft;
   const contract: Contract = {
-    ...body, id: newId("contract"), status: "active", agent_key: "agent_demo",
+    // Like the backend: the contract is bound to the agent that drafted it, else the default agent.
+    ...body, id: newId("contract"), status: "active", agent_key: proposer ?? "agent_demo",
     signed_at: iso(), contract_hash: `sha256:${newId("h").slice(2)}`, signature: "hmac:demo",
     previous_contract_id: draft.previous_contract_id,
   };
@@ -250,9 +293,9 @@ export async function signContract(draftId: string): Promise<Contract> {
   }
   draft.signed_contract_id = contract.id;
   store.contracts.unshift(contract);
-  store.fundings[contract.id] = fixtures.mockFunding(contract.id, contract.spend.hard_cap_all_in, "awaiting_approval");
+  store.fundings[contract.id] = mockPendingFunding(contract, provider);
   pushEvent({ purchase_id: null, contract_id: contract.id, event_type: "contract_signed", message: "Contract signed", data: {} });
-  pushEvent({ purchase_id: null, contract_id: contract.id, event_type: "contract_signed", message: "Asked the simulated provider for a single-use card for the all-in cap", data: { kind: "funding_requested" } });
+  pushEvent({ purchase_id: null, contract_id: contract.id, event_type: "contract_signed", message: fundingRequestedMessage(provider), data: { kind: "funding_requested" } });
   return clone(contract);
 }
 
@@ -266,6 +309,30 @@ export async function revokeContract(id: string): Promise<Contract> {
   pushEvent({ purchase_id: null, contract_id: id, event_type: "contract_revoked", message: "Contract revoked", data: {} });
   return clone(c);
 }
+
+/**
+ * Which provider a new mock funding uses, mirroring the backend: stub always simulates; link_test needs the
+ * user's Link (409 link_not_connected otherwise); link_optional uses Link only if the user connected it.
+ */
+function mockFundingProvider(): "stub" | "link_test" {
+  const mode = fixtures.mockSettings().payment_mode;
+  if (mode === "stub") return "stub";
+  if (mode === "link_test" && !mockLinked()) {
+    throw new ApiError("Connect your Stripe Link account before signing: signing asks it for the contract's card.", 409, "link_not_connected");
+  }
+  return mockLinked() ? "link_test" : "stub";
+}
+
+/** A pending mock funding. A Link one "approves" in a stand-in tab of this app (there is no Link in mock mode). */
+function mockPendingFunding(c: Contract, provider: "stub" | "link_test"): Funding {
+  const f = fixtures.mockFunding(c.id, c.spend.hard_cap_all_in, "awaiting_approval");
+  if (provider === "stub") return f;
+  return { ...f, provider, provider_label: fixtures.PAYMENT_LABELS.link_test, approval_url: `${window.location.origin}/contracts/${c.id}` };
+}
+
+const fundingRequestedMessage = (provider: "stub" | "link_test") => provider === "stub"
+  ? "Asked the simulated provider for a single-use card for the all-in cap"
+  : "Asked your Stripe Link account (test mode) for a single-use card for the all-in cap";
 
 /** Revoking cancels a pending funding request and wipes a stored card. */
 function cancelMockFunding(contractId: string) {
@@ -288,26 +355,46 @@ export async function restartFunding(contractId: string): Promise<Funding> {
   await delay(400);
   const c = store.contracts.find((x) => x.id === contractId);
   if (!c || c.status !== "active") throw new ApiError(`Only an active contract can be funded; this one is ${c?.status ?? "missing"}.`, 409, "contract_not_active");
-  store.fundings[contractId] = fixtures.mockFunding(contractId, c.spend.hard_cap_all_in, "awaiting_approval");
-  pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: "Asked the simulated provider for a single-use card for the all-in cap", data: { kind: "funding_requested" } });
+  const provider = mockFundingProvider();
+  store.fundings[contractId] = mockPendingFunding(c, provider);
+  pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: fundingRequestedMessage(provider), data: { kind: "funding_requested" } });
   return clone(store.fundings[contractId]);
 }
 
 /**
- * The user's approval of the contract's funding card.
+ * The user's approval of the contract's funding card, decided by the card's own provider (not the backend's
+ * payment mode: in link_optional one user's cards are simulated and another's are real Link test cards).
  * - link_test: opens Link's approval page (funding.approval_url) in a new tab; polling getFunding picks it up.
  * - stub: POST /contracts/{id}/funding/simulate-approval, "Simulated provider approval".
- * The tab opens before any await when health is cached, so pop-up blockers allow it.
+ * The tab opens before any await, so pop-up blockers allow it.
  */
 export async function approveFunding(contractId: string, funding: Funding): Promise<Funding> {
-  const health = cachedHealth() ?? (await getHealth());
-  if (health.payment_mode === "link_test") { openExternal(funding.approval_url, "an approval page for this card"); return funding; }
+  if (fundingUsesLink(funding)) {
+    openExternal(funding.approval_url, "an approval page for this card");
+    // Mock mode has no Link: the stand-in approval lands a moment after the tab opens.
+    if (USE_MOCKS) setTimeout(() => { try { mockApproveFunding(contractId, null); } catch { /* revoked meanwhile */ } }, 1500);
+    return funding;
+  }
   if (!USE_MOCKS) return post<Funding>(`/contracts/${encodeURIComponent(contractId)}/funding/simulate-approval`);
   await delay(400);
+  return mockApproveFunding(contractId, "Simulated provider approval: you approved the (simulated) funding.");
+}
+
+/**
+ * Whether a funding card is approved in Stripe Link (vs. the simulated provider). Older responses without
+ * `provider` fall back to the backend's mode, which is only unambiguous outside link_optional.
+ */
+export function fundingUsesLink(funding: Funding | null | undefined): boolean {
+  if (funding?.provider) return funding.provider === "link_test";
+  return cachedHealth()?.payment_mode === "link_test";
+}
+
+function mockApproveFunding(contractId: string, message: string | null): Funding {
   const f = store.fundings[contractId];
   if (f?.state !== "awaiting_approval") throw new ApiError(`The funding is ${f?.state ?? "not_funded"}, not waiting for approval.`, 409, "funding_not_awaiting_approval");
   Object.assign(f, { state: "funded", card_stored: true, card_last4: "4242", valid_until: new Date(Date.now() + 12 * 3_600_000).toISOString() });
-  pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: "Simulated provider approval: you approved the (simulated) funding.", data: { kind: "simulated_provider_approval" } });
+  // Link approvals happen in Link, so (like the backend) only the stored card is recorded for them.
+  if (message) pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message, data: { kind: "simulated_provider_approval" } });
   pushEvent({ purchase_id: null, contract_id: contractId, event_type: "contract_signed", message: "Card ending 4242 stored encrypted on the contract, locked", data: { kind: "card_stored" } });
   return clone(f);
 }
@@ -318,19 +405,28 @@ export async function approveFunding(contractId: string, funding: Funding): Prom
 export async function connectLink(): Promise<LinkLogin> {
   if (!USE_MOCKS) return post<LinkLogin>("/link/connect");
   await delay(300);
-  return { state: "connected", simulated: true, provider_label: "Simulated provider" };
+  if (fixtures.mockSettings().payment_mode === "stub") return { state: "connected", simulated: true, provider_label: "Simulated provider" };
+  // Mock mode has no Link app to approve in, so the connection lands at once.
+  mockLinkConnected = true;
+  return { state: "connected", simulated: false, provider_label: fixtures.PAYMENT_LABELS.link_test };
+}
+
+function mockLinkStatus(): LinkStatus {
+  if (fixtures.mockSettings().payment_mode === "stub") return { connected: true, simulated: true, provider_label: "Simulated provider", login: null };
+  return { connected: mockLinked(), simulated: false, provider_label: fixtures.PAYMENT_LABELS.link_test, login: null };
 }
 
 export async function getLinkStatus(): Promise<LinkStatus> {
   if (!USE_MOCKS) return http<LinkStatus>("/link/status");
   await delay(100);
-  return { connected: true, simulated: true, provider_label: "Simulated provider", login: null };
+  return mockLinkStatus();
 }
 
 export async function disconnectLink(): Promise<LinkStatus> {
   if (!USE_MOCKS) return post<LinkStatus>("/link/disconnect");
   await delay(200);
-  return { connected: true, simulated: true, provider_label: "Simulated provider", login: null };
+  if (fixtures.mockSettings().payment_mode !== "stub") mockLinkConnected = false;
+  return mockLinkStatus();
 }
 
 /** Opens Link's login page for connecting the account (from POST /link/connect). Not a backend call. */
@@ -507,3 +603,74 @@ async function decideDevice(userCode: string, decision: "approve" | "deny"): Pro
 
 export const approveDevice = (userCode: string) => decideDevice(userCode, "approve");
 export const denyDevice = (userCode: string) => decideDevice(userCode, "deny");
+
+// ---------- OAuth 2.1 authorization code flow (Muse and other MCP clients land on /authorize) ----------
+
+// Mock decisions per request id, so a decided request can't be decided twice (like the backend).
+const mockAuthorizations = new Map<string, boolean>();
+
+/** GET /oauth/authorize/request: the pending request the backend's /oauth/authorize redirected here with. */
+export async function getAuthorizationRequest(requestId: string): Promise<OAuthAuthorizationRequest> {
+  if (!USE_MOCKS) return http<OAuthAuthorizationRequest>(`/oauth/authorize/request?request_id=${encodeURIComponent(requestId)}`);
+  await delay();
+  // Mock: ids containing "expired" / "unknown" show the two error screens.
+  if (/expired/i.test(requestId)) throw new ApiError("This sign-in request expired. Start connecting again from your agent.", 410, "authorization_request_expired");
+  if (/unknown/i.test(requestId) || mockAuthorizations.has(requestId)) {
+    throw new ApiError("This sign-in request wasn't found. It may have been used already.", 404, "authorization_request_not_found");
+  }
+  return {
+    request_id: requestId, client_name: "Muse (mock)", client_id: "client_mock_muse", redirect_host: window.location.host,
+    scopes: ["handshake.agent"], expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+  };
+}
+
+/**
+ * POST /oauth/authorize/decision (user only). Returns where to send the browser: the client's registered
+ * redirect_uri with a code (approve) or error=access_denied (deny). The caller checks it's http(s).
+ */
+export async function decideAuthorization(requestId: string, approve: boolean): Promise<OAuthDecision> {
+  if (!USE_MOCKS) return post<OAuthDecision>("/oauth/authorize/decision", { request_id: requestId, approve });
+  await delay(400);
+  if (mockAuthorizations.has(requestId)) throw new ApiError("This sign-in request was already decided.", 404, "authorization_request_not_found");
+  mockAuthorizations.set(requestId, approve);
+  if (approve) {
+    store.agents.unshift({
+      agent_id: newId("agt"), bound_agent_id: "hsc_muse", client_id: "hsc_muse", name: "Muse (mock)", kind: "oauth", client_name: "Muse (mock)", created_at: iso(),
+      last_used_at: null, expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(), revoked_at: null,
+    });
+  }
+  // Mock: there is no real client, so "the client's redirect" is this app's Agents page.
+  const back = new URL("/agents", window.location.origin);
+  back.searchParams.set(approve ? "code" : "error", approve ? "mock-code" : "access_denied");
+  return { redirect_to: back.href };
+}
+
+// ---------- Agents and agent keys (user only) ----------
+
+export async function listAgents(): Promise<Agent[]> {
+  if (!USE_MOCKS) return (await http<{ agents: Agent[] }>("/agents")).agents;
+  await delay(150);
+  return clone(store.agents);
+}
+
+/** POST /agents/keys. The token in the answer is shown once and never stored (not even in localStorage). */
+export async function createAgentKey(name: string): Promise<CreatedAgentKey> {
+  if (!USE_MOCKS) return post<CreatedAgentKey>("/agents/keys", { name });
+  await delay(400);
+  const agent: Agent = {
+    agent_id: newId("agt"), bound_agent_id: newId("key"), client_id: null, name, kind: "key", client_name: null, created_at: iso(), last_used_at: null,
+    expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(), revoked_at: null,
+  };
+  store.agents.unshift(agent);
+  // Obviously fake, like every fake secret in this repo.
+  return { agent_id: agent.agent_id, name, token: `hs_agent_FAKE-TOK-${Math.random().toString(36).slice(2, 14)}`, expires_at: agent.expires_at };
+}
+
+export async function revokeAgent(agentId: string): Promise<Agent> {
+  if (!USE_MOCKS) return post<Agent>(`/agents/${encodeURIComponent(agentId)}/revoke`);
+  await delay(300);
+  const a = store.agents.find((x) => x.agent_id === agentId);
+  if (!a) throw new ApiError(`No agent with id '${agentId}'.`, 404, "agent_not_found");
+  a.revoked_at ??= iso();
+  return clone(a);
+}

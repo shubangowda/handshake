@@ -334,6 +334,11 @@ export interface DraftRecord extends ContractDraft {
   review_url: string;
   /** Lint errors that prevent signing (without the "lint: " prefix). */
   blocking_issues: string[];
+  /**
+   * The agent id that drafted this (via MCP), or null when the user drafted it here. The signed contract is
+   * bound to that agent: only it can buy under it. Null binds to the server's default agent.
+   */
+  proposed_by_agent?: string | null;
   /** Only on the POST /drafts/compile response. */
   compiler_source?: "openai" | "fixture";
 }
@@ -493,22 +498,85 @@ export interface EvidenceBundle {
 export interface Health {
   status: string;
   database: string;
-  payment_mode: "stub" | "link_test";
+  /**
+   * stub: every card is simulated. link_test: every card is a real Link TEST card (the user must connect Link).
+   * link_optional: simulated unless the user connected their own Link account, then Link TEST cards.
+   * Per-funding decisions (which approve button) use Funding.provider, not this.
+   */
+  payment_mode: PaymentMode;
   payment_label: string;
   /** agent_visible: the agent collects the released card and pays. executor: Handshake pays at authorization. */
   credential_mode: "agent_visible" | "executor";
   compiler_mode: "fixture" | "openai";
 }
 
-/** API-only: POST /auth/demo-login. */
-export interface DemoLogin {
+export type PaymentMode = "stub" | "link_test" | "link_optional";
+
+/** API-only: GET /auth/config (public). Which sign-in methods this backend offers. */
+export interface AuthConfig {
+  /** Set when Google sign-in is configured; the Google Identity Services client id (public, not a secret). */
+  google_client_id: string | null;
+  /** Demo email login (no password). Off in production: POST /auth/demo-login then answers 404 demo_login_disabled. */
+  demo_login: boolean;
+}
+
+/** API-only: POST /auth/google and POST /auth/demo-login. Both return the same user-token shape. */
+export interface UserLogin {
   token: string;
   token_type: "bearer";
   email: string;
   role: "user";
   /** Unix time in SECONDS (unlike the ISO strings elsewhere in the API). */
   expires_at: number;
-  demo_auth: true;
+  /** true for demo login, false for Google. */
+  demo_auth: boolean;
+}
+
+/** Kept for existing imports: demo login returns the same shape as Google login. */
+export type DemoLogin = UserLogin;
+
+/** API-only: GET /oauth/authorize/request?request_id= (the /authorize consent screen, OAuth 2.1 code flow). */
+export interface OAuthAuthorizationRequest {
+  request_id: string;
+  client_name: string;
+  client_id: string;
+  /** Host of the redirect_uri the backend already validated for this client; where the user goes back to. */
+  redirect_host: string;
+  scopes: string[];
+  expires_at: string;
+}
+
+/** API-only: POST /oauth/authorize/decision. The client's redirect_uri with the code (approve) or an error (deny). */
+export interface OAuthDecision {
+  redirect_to: string;
+}
+
+/** How an agent got its token: the OAuth code flow (e.g. Muse), the device flow (/connect), or a user-created key. */
+export type AgentKind = "oauth" | "device" | "key";
+
+/** API-only: one row of GET /agents (and POST /agents/{id}/revoke). Never contains the token. */
+export interface Agent {
+  /** The grant id ("agt_…"): what POST /agents/{agent_id}/revoke takes. */
+  agent_id: string;
+  /** The id contracts bind to (a draft's proposed_by_agent): the OAuth client id, or "key_…" for an agent key. */
+  bound_agent_id: string;
+  /** The OAuth client id (oauth and device grants); null for agent keys. */
+  client_id: string | null;
+  name: string;
+  kind: AgentKind;
+  client_name: string | null;
+  created_at: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+/** API-only: POST /agents/keys. `token` is returned exactly once and is never stored by the frontend. */
+export interface CreatedAgentKey {
+  agent_id: string;
+  name: string;
+  token: string;
+  expires_at: string | null;
 }
 
 /** API-only: an in-progress "connect your Link account" login (POST /link/connect, GET /link/status .login). */

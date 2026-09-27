@@ -1,5 +1,5 @@
-// DEMO session: the token from POST /auth/demo-login (no password), stored in this browser only.
-// To be replaced by passkeys/OAuth. Never holds a password or card data.
+// The user session: the token from POST /auth/google (or, where enabled, the demo POST /auth/demo-login),
+// stored in this browser only. Never holds a password, card data, or an agent key.
 export interface Session {
   email: string;
   /** Bearer token for the backend. In mock mode it's a placeholder that is never sent anywhere. */

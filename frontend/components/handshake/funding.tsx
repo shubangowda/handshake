@@ -3,10 +3,10 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { ApiError, approveFunding, getFunding, restartFunding } from "@/lib/api";
+import { ApiError, approveFunding, fundingUsesLink, getFunding, restartFunding } from "@/lib/api";
 import { formatDate, formatTime, money, shortId } from "@/lib/format";
 import { FUND_AGAIN_STATES, fundingStateLabel } from "@/lib/status";
-import type { Funding, Health } from "@/lib/types";
+import type { Funding } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Check, CreditCard, ExternalLink, Loader2, Lock } from "lucide-react";
 import { LinkPanel } from "./link-connect";
@@ -20,7 +20,7 @@ function sentence(f: Funding, active: boolean): string {
   // Suggest funding again only where the backend allows it (active contracts).
   const again = active ? " Fund again to buy under this contract again." : "";
   const card = f.card_last4 ? `Card ending ${f.card_last4}` : "The card";
-  const simulated = f.provider === "stub";
+  const simulated = !fundingUsesLink(f);
   switch (f.state) {
     case "not_funded": return "Not funded yet. Your agent can't buy anything until this contract has a card.";
     case "awaiting_approval": return simulated
@@ -41,12 +41,11 @@ function sentence(f: Funding, active: boolean): string {
  * ("Approve in Link", or "Simulated provider approval" in stub mode) and fund again after a
  * denied, expired, failed, or used card. Polls while the card waits for approval.
  */
-export function FundingCard({ contractId, active, initial, health, onChange }: {
+export function FundingCard({ contractId, active, initial, onChange }: {
   contractId: string;
   /** Only an active contract can be funded again. */
   active: boolean;
   initial: Funding;
-  health: Health | null;
   onChange?: (f: Funding) => void;
 }) {
   const [funding, setFunding] = useState(initial);
@@ -89,7 +88,8 @@ export function FundingCard({ contractId, active, initial, health, onChange }: {
   const tone = funding.state === "funded" || funding.state === "released" ? "border-pass/40 bg-pass-soft"
     : awaiting ? "border-brand/40 bg-card ring-1 ring-brand/20"
     : funding.state === "denied" || funding.state === "failed" || funding.state === "expired" ? "border-fail/30 bg-fail-soft/60" : "bg-card";
-  const stub = health?.payment_mode === "stub";
+  // This card's own provider decides: in link_optional mode a user can hold both simulated and Link cards.
+  const stub = !fundingUsesLink(funding);
 
   return (
     <div className={cn("space-y-3 rounded-xl border p-4 text-sm sm:p-5", tone)}>

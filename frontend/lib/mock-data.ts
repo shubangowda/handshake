@@ -1,8 +1,8 @@
 // Demo fixtures for NEXT_PUBLIC_USE_MOCKS=true. Shapes match docs/API.md so UI work runs with no backend.
 // Times are relative to page load so "expires tomorrow" stays true.
 import type {
-  Constraint, Contract, DraftRecord, EvidenceEvent, Funding, FundingState, Health, NextAction, PaymentInfo, PaymentState,
-  Purchase, PurchaseDetail, TransactionProposal, ValidationDecision,
+  Agent, Constraint, Contract, DraftRecord, EvidenceEvent, Funding, FundingState, Health, NextAction, PaymentInfo, PaymentMode,
+  PaymentState, Purchase, PurchaseDetail, TransactionProposal, ValidationDecision,
 } from "./types";
 
 const now = Date.now();
@@ -23,6 +23,39 @@ export const health: Health = {
   status: "ok", database: "mock", payment_mode: "stub", payment_label: "Simulated provider",
   credential_mode: "agent_visible", compiler_mode: "fixture",
 };
+
+export const PAYMENT_LABELS: Record<PaymentMode, string> = {
+  stub: "Simulated provider",
+  link_test: "Stripe Link (test mode)",
+  link_optional: "Simulated provider, or your Stripe Link (TEST MODE)",
+};
+
+/**
+ * Mock-mode knobs, so backend configurations can be tried without a backend (and set by browser tests).
+ * Set them in the browser console, then reload:
+ *   localStorage.setItem("handshake.mock", JSON.stringify({ payment_mode: "link_optional", google_client_id: "…" }))
+ * Unset keys keep today's defaults: stub payments, demo login on, no Google sign-in, Link not connected.
+ * Only ever read in mock mode; the real app gets all of this from the backend.
+ */
+export interface MockSettings {
+  payment_mode: PaymentMode;
+  /** Non-null shows "Sign in with Google" (the real Google script loads; tests stub it). */
+  google_client_id: string | null;
+  demo_login: boolean;
+  /** Whether the user's own Stripe Link account starts out connected (link_test / link_optional). */
+  link_connected: boolean;
+}
+
+const MOCK_DEFAULTS: MockSettings = { payment_mode: "stub", google_client_id: null, demo_login: true, link_connected: false };
+
+export function mockSettings(): MockSettings {
+  try {
+    const raw = typeof window === "undefined" ? null : localStorage.getItem("handshake.mock");
+    return { ...MOCK_DEFAULTS, ...(raw ? (JSON.parse(raw) as Partial<MockSettings>) : {}) };
+  } catch {
+    return MOCK_DEFAULTS;
+  }
+}
 
 /** The one request the offline (fixture) compiler understands, same as the backend's. */
 export const DEMO_INTENT = "Buy me Nike Pegasus 41 running shoes, size 10, new. Around $120, but no more than $135 all-in including tax and shipping. Delivered within 3 days. From Amazon.com. No subscriptions, memberships, or add-ons.";
@@ -72,6 +105,8 @@ export const drafts: DraftRecord[] = [
     signed_contract_id: null,
     review_url: "/contracts/draft_shoes01",
     blocking_issues: [],
+    // Drafted by the mock Muse agent (see `agents` below), so signing shows who may use it.
+    proposed_by_agent: "hsc_muse",
     assumptions: [
       "You said \"around $120\". Handshake set a $135 all-in maximum to leave room for tax and shipping.",
       "Shipping capped at $8 — Handshake's default for footwear.",
@@ -404,3 +439,12 @@ export const evidence: Record<string, EvidenceEvent[]> = {
   purchase_blocked: events("purchase_blocked", "contract_shoes_b", "fail", 149.72, 8, 10),
   purchase_escalated: events("purchase_escalated", "contract_shoes_c", "unverifiable", 127.42, 8, 10),
 };
+
+// ---------- Agents connected to the account (GET /agents) ----------
+
+/** One of each kind, plus a revoked key, so the Agents page shows every state. Never includes a token. */
+export const agents: Agent[] = [
+  { agent_id: "agt_muse", bound_agent_id: "hsc_muse", client_id: "hsc_muse", name: "Muse", kind: "oauth", client_name: "Muse", created_at: at(-2 * DAY), last_used_at: at(-20 * MIN), expires_at: at(28 * DAY), revoked_at: null },
+  { agent_id: "agt_demo", bound_agent_id: "agent_demo", client_id: "agent_demo", name: "Handshake MCP (demo agent)", kind: "device", client_name: "Handshake MCP (demo agent)", created_at: at(-5 * DAY), last_used_at: at(-3 * DAY), expires_at: at(25 * DAY), revoked_at: null },
+  { agent_id: "agt_oldkey", bound_agent_id: "key_oldkey", client_id: null, name: "Laptop script", kind: "key", client_name: null, created_at: at(-9 * DAY), last_used_at: null, expires_at: at(21 * DAY), revoked_at: at(-8 * DAY) },
+];

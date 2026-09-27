@@ -1,14 +1,41 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { FIELD_LABELS, SELLER_LABELS, describeConstraint, formatDate, money } from "@/lib/format";
+import { listAgents } from "@/lib/api";
 import type { DraftRecord } from "@/lib/types";
-import { CreditCard, OctagonX, ShieldCheck, Sparkles } from "lucide-react";
+import { Bot, CreditCard, OctagonX, ShieldCheck, Sparkles } from "lucide-react";
 import { LinkPanel } from "./link-connect";
 
 const NEW_MERCHANT = { escalate: "Ask me first", deny: "Blocked", allow: "Allowed" } as const;
+
+/**
+ * Which agent the signed contract will be bound to (only it may buy under it). The draft carries the
+ * agent's id; GET /agents may let us show its friendly name, otherwise the id is shown as is.
+ */
+function BoundAgent({ proposer, open }: { proposer: string | null | undefined; open: boolean }) {
+  const [name, setName] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open || !proposer) return;
+    let live = true;
+    listAgents().then((agents) => {
+      const match = agents.find((a) => !a.revoked_at && (a.bound_agent_id === proposer || a.client_id === proposer));
+      if (live) setName(match ? match.client_name ?? match.name : null);
+    }, () => {});
+    return () => { live = false; };
+  }, [open, proposer]);
+  const who = !proposer ? <b>your default agent</b>
+    : name ? <b>{name}</b>
+    : <>the agent that drafted it (<code className="font-mono text-xs break-all">{proposer}</code>)</>;
+  return (
+    <p className="flex items-start gap-2 rounded-lg border p-3 text-sm">
+      <Bot className="mt-0.5 size-4 shrink-0" />
+      <span>This contract will be usable only by: {who}</span>
+    </p>
+  );
+}
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -81,6 +108,8 @@ export function SignDialog({ draft: d, blockingIssues, needsLink, simulated = fa
             Handshake stores it encrypted on this contract and releases it only for a checkout Handshake approves.
           </span>
         </p>
+
+        <BoundAgent proposer={d.proposed_by_agent} open={open} />
 
         {needsLink && <LinkPanel onConnected={onLinkConnected} />}
 
