@@ -64,6 +64,13 @@ export function paymentLabel(d: PurchaseDetail): string | null {
   return PAYMENT_STATE_LABELS[s];
 }
 
+/** The funding label, worded for the simulated provider when that's what issued the card (no Link involved). */
+export function fundingStateLabel(f: { state: FundingState; provider?: string | null }): string {
+  if (f.provider === "stub" && f.state === "awaiting_approval") return "Waiting for simulated approval";
+  if (f.provider === "stub" && f.state === "denied") return "Simulated card declined";
+  return FUNDING_STATE_LABELS[f.state];
+}
+
 export const FUNDING_STATE_LABELS: Record<FundingState, string> = {
   not_funded: "Not funded",
   awaiting_approval: "Waiting for your approval in Link",

@@ -2,7 +2,7 @@ import Link from "next/link";
 import { cn } from "@/lib/utils";
 import type { ContractRecord } from "@/lib/types";
 import { isDraft, money, relativeExpiry } from "@/lib/format";
-import { FUNDING_STATE_LABELS, fundingOf, rejectionReason, type DisplayStatus } from "@/lib/status";
+import { fundingOf, fundingStateLabel, rejectionReason, type DisplayStatus } from "@/lib/status";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "./tags";
 import { Ban, Check, Clock, CreditCard, GitBranch, Sparkles } from "lucide-react";
@@ -53,7 +53,7 @@ export function ContractCard({ contract: c, status, onApproveFunding, approving,
       {status === "pending" ? (
         <div className="mt-auto space-y-3">
           <div className="rounded-lg bg-muted/60 p-3 text-sm">
-            <p className="font-medium">Approve funding in Link</p>
+            <p className="font-medium">{approveLabel === "Simulated provider approval" ? "Approve funding (simulated)" : "Approve funding in Link"}</p>
             <p className="text-muted-foreground">Signed. Approve the single-use card for up to {money(c.spend.hard_cap_all_in, c.spend.currency)} so your agent can buy.</p>
           </div>
           <Button className="relative z-10 w-full bg-brand text-brand-foreground hover:bg-brand/90" size="lg" disabled={approving} onClick={() => onApproveFunding?.(c)}>
@@ -65,7 +65,7 @@ export function ContractCard({ contract: c, status, onApproveFunding, approving,
           {!rejected && c.status !== "used" && <p>{relativeExpiry(c.expires_at)}</p>}
           {funding && !rejected && (
             <p className="flex items-center gap-1.5 text-foreground">
-              <CreditCard className="size-3.5" />{funding.card_last4 && funding.state === "funded" ? `Card ending ${funding.card_last4} · locked` : FUNDING_STATE_LABELS[funding.state]}
+              <CreditCard className="size-3.5" />{funding.card_last4 && funding.state === "funded" ? `Card ending ${funding.card_last4} · locked` : fundingStateLabel(funding)}
             </p>
           )}
           <p>{c.single_use ? "Single use" : "Reusable"} · {c.constraints.filter((k) => k.severity === "hard").length} hard rules</p>

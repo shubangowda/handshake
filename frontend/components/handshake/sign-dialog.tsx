@@ -25,12 +25,14 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
  * Blocking issues (lint errors from the backend) disable signing until the draft is edited, and a
  * 409 link_not_connected shows the Connect Stripe Link panel.
  */
-export function SignDialog({ draft: d, blockingIssues, needsLink, onLinkConnected, open, onOpenChange, onSign }: {
+export function SignDialog({ draft: d, blockingIssues, needsLink, simulated = false, onLinkConnected, open, onOpenChange, onSign }: {
   draft: DraftRecord;
   /** The draft's blocking_issues, or the ones a 409 draft_has_blocking_issues returned. */
   blockingIssues: string[];
   /** The last sign attempt returned link_not_connected. */
   needsLink: boolean;
+  /** The backend runs the simulated provider: say so instead of naming Link. */
+  simulated?: boolean;
   onLinkConnected: () => void;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -73,7 +75,9 @@ export function SignDialog({ draft: d, blockingIssues, needsLink, onLinkConnecte
         <p className="flex items-start gap-2 rounded-lg border p-3 text-sm">
           <CreditCard className="mt-0.5 size-4 shrink-0" />
           <span>
-            Signing asks your Link account for a <b>single-use test card for up to {money(d.spend.hard_cap_all_in, cur)}</b>. You approve it in Link.
+            {simulated
+              ? <>Signing asks the <b>simulated provider</b> (standing in for Stripe Link; no real money) for a <b>single-use test card for up to {money(d.spend.hard_cap_all_in, cur)}</b>. You approve it with &ldquo;Simulated provider approval&rdquo;.</>
+              : <>Signing asks your Link account for a <b>single-use test card for up to {money(d.spend.hard_cap_all_in, cur)}</b>. You approve it in Link.</>}{" "}
             Handshake stores it encrypted on this contract and releases it only for a checkout Handshake approves.
           </span>
         </p>

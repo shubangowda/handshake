@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ApiError, approveFunding, getFunding, restartFunding } from "@/lib/api";
 import { formatDate, formatTime, money, shortId } from "@/lib/format";
-import { FUND_AGAIN_STATES, FUNDING_STATE_LABELS } from "@/lib/status";
+import { FUND_AGAIN_STATES, fundingStateLabel } from "@/lib/status";
 import type { Funding, Health } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Check, CreditCard, ExternalLink, Loader2, Lock } from "lucide-react";
@@ -20,13 +20,16 @@ function sentence(f: Funding, active: boolean): string {
   // Suggest funding again only where the backend allows it (active contracts).
   const again = active ? " Fund again to buy under this contract again." : "";
   const card = f.card_last4 ? `Card ending ${f.card_last4}` : "The card";
+  const simulated = f.provider === "stub";
   switch (f.state) {
     case "not_funded": return "Not funded yet. Your agent can't buy anything until this contract has a card.";
-    case "awaiting_approval": return `Signing asked your Link account for a single-use test card for up to ${money(f.amount, f.currency)}. Approve it to fund the contract.`;
+    case "awaiting_approval": return simulated
+      ? `Signing asked the simulated provider (standing in for Stripe Link) for a single-use test card for up to ${money(f.amount, f.currency)}. Approve it to fund the contract.`
+      : `Signing asked your Link account for a single-use test card for up to ${money(f.amount, f.currency)}. Approve it to fund the contract.`;
     case "funded": return `${card} stored, encrypted, locked until Handshake approves a checkout.`;
     case "released": return `${card} was released once to your agent for an approved checkout, and the stored copy was wiped.`;
     case "used": return `${card} was used for a purchase.${again}`;
-    case "denied": return `You declined the card in Link. Nothing was stored.${again}`;
+    case "denied": return `${simulated ? "The simulated card was declined" : "You declined the card in Link"}. Nothing was stored.${again}`;
     case "expired": return `The funded card expired unused (Link test cards are valid for 12 hours).${again}`;
     case "failed": return f.last_error ?? "Link couldn't provide a card.";
     case "canceled": return "Funding was canceled when the contract was revoked. The stored card was wiped.";
@@ -92,7 +95,7 @@ export function FundingCard({ contractId, active, initial, health, onChange }: {
     <div className={cn("space-y-3 rounded-xl border p-4 text-sm sm:p-5", tone)}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="flex items-center gap-2 font-semibold">{funding.state === "funded" ? <Lock className="size-4 text-pass" /> : <CreditCard className="size-4" />}Funding</h2>
-        <span className="font-mono text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{FUNDING_STATE_LABELS[funding.state]}</span>
+        <span className="font-mono text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{fundingStateLabel(funding)}</span>
       </div>
       <p>{sentence(funding, active)}</p>
       {funding.state === "funded" && validUntil(funding.valid_until) && <p className="text-muted-foreground">Valid until {validUntil(funding.valid_until)}</p>}
@@ -129,7 +132,7 @@ export function FundingSummary({ funding: f, contractId }: { funding: Funding; c
     <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border bg-card px-4 py-2.5 text-sm">
       <CreditCard className="size-4 text-muted-foreground" />
       <span className="text-muted-foreground">Contract funding:</span>
-      <span className="font-medium">{f.card_last4 ? `card ending ${f.card_last4}` : "no card"} · {FUNDING_STATE_LABELS[f.state]}</span>
+      <span className="font-medium">{f.card_last4 ? `card ending ${f.card_last4}` : "no card"} · {fundingStateLabel(f)}</span>
       <Link href={`/contracts/${contractId}`} className="ml-auto text-xs underline underline-offset-4">View contract</Link>
     </p>
   );

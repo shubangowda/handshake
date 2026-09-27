@@ -284,7 +284,7 @@ export default function ContractPage() {
 
       {draft && <EditDraftDialog key={draft.id + JSON.stringify(draft.spend)} draft={draft} open={editing} onOpenChange={setEditing} onSave={save} />}
 
-      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} needsLink={needsLink} onLinkConnected={() => setNeedsLink(false)}
+      {draft && <SignDialog draft={draft} blockingIssues={blockingIssues} needsLink={needsLink} simulated={health?.payment_mode === "stub"} onLinkConnected={() => setNeedsLink(false)}
         open={confirmSign} onOpenChange={setConfirmSign} onSign={sign} />}
 
       <Dialog open={confirmRevoke} onOpenChange={setConfirmRevoke}>
