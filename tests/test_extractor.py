@@ -513,6 +513,23 @@ def test_selection_price_differs_is_unverifiable() -> None:
     assert verdicts(results)["checkout_link_selection"] == "unverifiable"
 
 
+@pytest.mark.parametrize("reported", [119.99, 239.98, 128.39])  # unit price, line total (2 pairs), all-in total
+def test_selection_price_may_be_the_item_price_or_the_checkout_total(reported: float) -> None:
+    """Regression (first live Muse run): the agent reported the all-in total, not the unit price. Both agree with the checkout."""
+    contract = amazon_contract()
+    checkout = {**page(), "line_items": [{"name": "Pegasus 41", "unit_price": 119.99, "quantity": 2 if reported == 239.98 else 1}], "item_subtotal": 119.99, "total": 128.39}
+    results = checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), checkout, selection(contract.id, price=reported))
+    assert verdicts(results)["checkout_link_selection"] == "pass"
+
+
+def test_selection_price_matching_nothing_is_still_unverifiable() -> None:
+    """A reported price that is neither the item's price nor any checkout total still goes to the user."""
+    contract = amazon_contract()
+    checkout = {**page(), "item_subtotal": 119.99, "total": 128.39}
+    results = checkout_link_results(contract, link_for(f"{MERCHANT}/checkout/cs_abc123"), checkout, selection(contract.id, price=99.00))
+    assert verdicts(results)["checkout_link_selection"] == "unverifiable"
+
+
 def test_link_mismatch_blocks_a_purchase_end_to_end(client: TestClient, agent_client: TestClient, merchant_env: TestClient) -> None:
     """Through the API: the agent claims it picked a different product than the checkout it links to -> BLOCKED."""
     from handshake import compiler as compiler_module

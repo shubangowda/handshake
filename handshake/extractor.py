@@ -601,8 +601,21 @@ def checkout_link_results(
         wanted = _norm(candidate.name)
         if wanted and not any(wanted in name or name in wanted for name in names if name):
             problems.append(f"the checkout doesn't contain the product the agent says it picked ({candidate.name!r})")
-        prices = [item.get("unit_price") for item in proposal.get("line_items") or [] if _norm(item.get("name")) and (wanted in _norm(item.get("name")) or _norm(item.get("name")) in wanted)]
-        if prices and all(abs(to_cents(p) - to_cents(candidate.price)) > 1 for p in prices if p is not None):
+        # CandidateProduct.price (models.py) doesn't say WHICH price, and agents fairly
+        # report either the item's price or the all-in total they saw at checkout (Muse
+        # reported the total on the first live run and was escalated for it). Every
+        # number compared here is one Handshake read from the store itself, so matching
+        # any of them means the agent's account agrees with the checkout.
+        matched = [item for item in proposal.get("line_items") or []
+                   if _norm(item.get("name")) and (wanted in _norm(item.get("name")) or _norm(item.get("name")) in wanted)]
+        seen: list[Any] = []
+        for item in matched:
+            if item.get("unit_price") is not None:
+                seen.append(item["unit_price"])
+                seen.append(to_cents(item["unit_price"]) * int(item.get("quantity") or 1) / 100)
+        seen += [proposal.get(key) for key in ("item_subtotal", "total")]
+        seen = [value for value in seen if value is not None]
+        if matched and seen and all(abs(to_cents(value) - to_cents(candidate.price)) > 1 for value in seen):
             uncertain.append(f"the checkout price differs from the {candidate.price:.2f} the agent reported")
         ev = {"source": "selection_report.selected_candidate", "candidate": candidate.model_dump(mode="json")}
         if problems:
